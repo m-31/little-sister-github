@@ -1,0 +1,111 @@
+# The `github` check — one file per team.
+#
+# This is the *shape*: every key the type accepts, with placeholder values and a
+# comment per knob saying what it decides. Copy it into your deployment's
+# `config/checks/` as `<team>_github.yaml`, and give each copy its own `path:`,
+# `team:` and token reference.
+#
+# What lives here is this installation's decision. What is true of the check type
+# — the aspect labels and their explanatory text — ships with the package.
+
+type: github
+path: /platform/github                  # the node this check owns
+title: GitHub — platform
+about: |
+  Overview of the **platform** team's repositories. Each child aspect lists the
+  repositories it flags.
+frequency: 15m
+timeout: 60s
+
+# --- Credentials --------------------------------------------------------------
+# Where the secret lives, never the secret itself (little-sister ADR-0023).
+# `env://NAME` reads that variable from `.env`; another `scheme://address` goes to
+# a resolver your deployment registers in its own code. Required — so two checks
+# of this type can each carry their own team's credential.
+#
+# The token needs: read:org, repo, security_events, and dependency-graph read.
+secrets:
+  token: env://PLATFORM_GITHUB_TOKEN
+
+# --- Discovery: which repositories are in scope --------------------------------
+org: example-org         # GitHub org / owner (required)
+team: platform           # team slug or name; omit to take every repo in the org
+name_prefix: platform    # keep only repos whose name starts with this (optional)
+include_archived: false
+# include_forks: true
+# api_url: https://api.github.com     # set for GitHub Enterprise Server
+
+# The coverage backstop: if discovery finds fewer than this, the check's own node
+# goes WARN rather than reporting a quiet green over an empty scope. Defaults to
+# 1 and cannot be 0 — a filter that matches nothing is a finding, not a state.
+# expect_min_repos: 20
+
+# Only run when the remaining API budget exceeds factor × (repos × aspects);
+# otherwise skip this run with a WARN rather than exhaust the rate limit.
+rate_limit_safety_factor: 4
+
+# --- Aspect: pull requests -----------------------------------------------------
+pull_requests:
+  # Open PRs whose title starts with one of these are not listed (case-insensitive)
+  # — e.g. the ticket prefix your own automation opens PRs with.
+  ignore_title_prefixes:
+    - "[PLATFORM-"
+
+# --- Aspect: Dependabot advisories ---------------------------------------------
+security_advisories:
+  # Which source severities to report at all …
+  severities: [critical, high]
+  # … and what each one means for the dashboard. Grading is a deployment's call.
+  severity_map:
+    critical: ERROR
+    high: ERROR
+    medium: WARN
+    low: WARN
+
+# --- Aspect: code-scanning alerts ----------------------------------------------
+# Same band shape. A repository with the feature not enabled is skipped; a
+# permission error is surfaced on the aspect container rather than read as "none".
+code_scanning_alerts:
+  severity_map:
+    critical: ERROR
+    high: ERROR
+    medium: ERROR
+    low: ERROR
+    none: ERROR
+
+# --- Aspect: secret-scanning alerts --------------------------------------------
+secret_scanning:
+  # A repository with secret scanning *disabled* is flagged too: the alerts
+  # endpoint 404s when it is off, which would otherwise read as "no alerts".
+  # Set false when forks or public repos make that noisy.
+  require_enabled: true
+
+# --- Aspect: SBOM presence -----------------------------------------------------
+sbom_check:
+  ignore:                 # repositories exempt from the SBOM requirement
+    - platform-docs
+    - platform-templates
+
+# --- Aspect: workflow runs -----------------------------------------------------
+actions:
+  # all_branches: false   # true watches every branch, not just the default one
+  # show_healthy: false   # true also lists workflows that passed and are idle
+  ignore_workflow_name_patterns: []    # regexes, case-insensitive
+
+# --- Aspect: open issues -------------------------------------------------------
+issues:
+  ignore: []              # repositories exempt from the issues check
+
+# --- Display text (optional) ---------------------------------------------------
+# The type ships a title and an `about` per aspect, with `{org}` / `{team}`
+# expanded from the keys above — so this block is only for what is true of *this*
+# installation. Your text replaces the shipped one, or extends it where you write
+# `{default}`:
+#
+# subnodes:
+#   security_advisories:
+#     about: |
+#       {default}
+#
+#       Critical advisories are fixed within 48 hours; the rest are cleared at the
+#       next dependency-bump session.

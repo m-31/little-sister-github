@@ -1,0 +1,125 @@
+[project]
+name = "little-sister-github"
+version = "0.1.0"
+description = "GitHub overview check type for little-sister."
+authors = [
+    { name = "Michael Meyling" }
+]
+readme = {file = "README.md", content-type = "text/markdown"}
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["monitoring", "status", "github", "little-sister"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
+# The **library's floor**, not the interpreter this is developed on
+# (little-sister ADR-0054). Asking for more than the library asks would mean
+# somebody installs little-sister on 3.12 and then cannot install the package
+# that was the reason they came — and metadata is frozen per artifact, so
+# correcting it afterwards costs a version. The classifiers above repeat the
+# same claim for a human reading the index rather than a resolver, which is why
+# they start at the floor and run contiguously; the release check refuses a
+# disagreement between the two.
+requires-python = ">=3.11"
+# A **floor, and never a pin.** A deployment pins little-sister; two plugins that
+# each pinned an exact version could not be installed together at all. The floor
+# names the release that promised the check-authoring surface this module imports
+# (little-sister architecture.md §11) — a statement about that surface, not about
+# a release. The upgrade a floor cannot see, the library moving *past* the
+# surface, is caught by `require_api()` in `__init__.py`.
+#
+# **0.3.11 rather than 0.3.0**, which is where the surface was first promised:
+# 0.3.0 was tagged but never uploaded, so it names no version a resolver can
+# actually fetch, and it is 0.3.11 that lowered the library's own floor to 3.11 —
+# the floor this package promises above. A lower number would ask the index for
+# something it does not have, on an interpreter the answer could not run.
+dependencies = [
+    "little-sister>=0.3.11",
+]
+
+# The public home, and the reason it was absent until now: metadata pointing at a
+# URL that does not resolve is worse than metadata that says nothing.
+#
+# `repository` is **load-bearing, not a duplicate of `homepage`**: the release
+# refuses without it, and the published README's absolute links are built from it at
+# build time — `blob/v<version>`, so a link is immutable and cannot outlive the
+# artifact that carries it. Relocating the forge is then an edit to this one line.
+#
+# No `documentation` key: for a package this size the README *is* the documentation,
+# and it arrives with the artifact. A key pointing at a directory that holds one
+# design record would promise a manual that does not exist.
+[project.urls]
+homepage = "https://github.com/m-31/little-sister-github"
+repository = "https://github.com/m-31/little-sister-github"
+issues = "https://github.com/m-31/little-sister-github/issues"
+changelog = "https://github.com/m-31/little-sister-github/blob/main/CHANGELOG.md"
+
+# The one line that differs from a deployment's pyproject.toml: a plugin is a
+# **built** package, so a consumer can install it from a tag (and later an index).
+[tool.uv]
+package = true
+
+# **No `[tool.uv.sources]`, deliberately.** little-sister is on the index, so the
+# floor above resolves like any other dependency and there is nothing left to
+# redirect. The table is not merely unnecessary now, it is harmful: uv reads the
+# sources table of a dependency it resolves from a path or a git checkout, so a
+# committed line here would be imposed on **every deployment that installs this
+# package** (little-sister `plugin-repository.md` §3).
+#
+# To develop against a local library checkout, add the redirect and do not commit
+# it:
+#
+#     [tool.uv.sources]
+#     little-sister = { path = "../little-sister" }
+#
+# It leaves a second trace: the next `uv run` rewrites the committed `uv.lock` to
+# `source = { directory = … }`, and the pre-commit gate is a `uv run`. Restore both
+# files before committing, or the path this table exists to keep out of the package
+# arrives in the lock instead.
+
+[dependency-groups]
+# Floors match little-sister's dev group, so every repository in the family runs
+# one gate and a contributor moving between them meets one set of rules.
+dev = [
+    "mypy>=2.1.0",
+    "pytest>=9.0.3",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.16.1",
+    "types-PyYAML",
+]
+
+[tool.ruff]
+target-version = "py311"
+
+[tool.ruff.lint]
+# Copied from little-sister as it stands. Beyond ruff's default (E, F): import
+# sorting (I), pyupgrade (UP), bugbear (B), comprehensions (C4) and Ruff's own
+# rules (RUF). The ambiguous-unicode rules are off: reason and subnode text use
+# typographic "—", "…" and "×" on purpose.
+select = ["E", "F", "W", "I", "UP", "B", "C4", "RUF"]
+ignore = ["RUF001", "RUF002", "RUF003"]
+
+[tool.mypy]
+files = ["src"]
+strict = true
+
+[tool.pytest.ini_options]
+# Adapted, not copied: little-sister's own `addopts` names `--cov=little_sister`,
+# which from here would measure somebody else's code.
+addopts = "--cov=little_sister_github --cov-report=term-missing"
+
+[build-system]
+# One **major** line, not the `<0.12.0` uv generates: that pins the minor uv shipped
+# with and turns every uv upgrade into a release-blocking edit in every repository of
+# the family. The backend's contract here is one sentence long — a
+# `src/<import package>` layout — so a minor bump has nothing to break, and what
+# would notice one that changed the artifact anyway is not vigilance but the publish
+# step, which opens the wheel and the sdist and refuses anything the release tree
+# drops. Same bound as little-sister, verified there against both minors.
+requires = ["uv_build>=0.11.14,<1.0.0"]
+build-backend = "uv_build"

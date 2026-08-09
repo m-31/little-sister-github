@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+#
+# little-sister-github pre-commit hook: run lint and tests before a commit is
+# allowed.
+#
+# This hook is version-controlled in hooks/ rather than .git/hooks/ so it can be
+# shared. Enable it once per clone with:
+#
+#     git config core.hooksPath hooks
+#
+# It is the quality gate: ruff, mypy twice — once on the interpreter you develop on
+# and once against the floor `requires-python` promises — and the test suite. There
+# is no forge workflow running it as well, deliberately.
+
+set -euo pipefail
+
+# `uv` by name, unless release/hooks/pre-commit already found it somewhere a GUI
+# git client's PATH does not reach and passed it down.
+uv="${UV:-uv}"
+
+echo "pre-commit: ruff check"
+"$uv" run ruff check
+
+echo "pre-commit: mypy"
+"$uv" run mypy
+
+# Against the floor `requires-python` promises, not against the interpreter this is
+# developed on (little-sister ADR-0054). Static and about a second, so it belongs on
+# every commit; the floor *test* run is heavier and rides the release gate instead.
+echo "pre-commit: mypy (floor 3.11)"
+"$uv" run mypy --python-version 3.11
+
+echo "pre-commit: pytest"
+"$uv" run pytest -q
+
+echo "pre-commit: all checks passed"
