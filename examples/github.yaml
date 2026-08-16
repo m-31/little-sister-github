@@ -1,9 +1,9 @@
-# The `github` check — one file per team.
+# The `github` check — one file per account (or per team within one).
 #
 # This is the *shape*: every key the type accepts, with placeholder values and a
 # comment per knob saying what it decides. Copy it into your deployment's
-# `config/checks/` as `<team>_github.yaml`, and give each copy its own `path:`,
-# `team:` and token reference.
+# `config/checks/` as `<account>_github.yaml`, and give each copy its own `path:`,
+# `owner:`, `kind:` and token reference.
 #
 # What lives here is this installation's decision. What is true of the check type
 # — the aspect labels and their explanatory text — ships with the package.
@@ -15,7 +15,27 @@ about: |
   Overview of the **platform** team's repositories. Each child aspect lists the
   repositories it flags.
 frequency: 15m
+# **The whole run's budget**, and the check honors it: when it runs out, the
+# aspects that finished are reported, the rest are absent, and the node says the run
+# was cut short. Size it for the scope — a run makes at least one request per
+# repository per aspect (`actions` makes two) and pages on top of that.
 timeout: 60s
+# **One request's budget**, which is a different number and must be well under the
+# one above; 15s when unset. It is what stops a single slow endpoint from spending
+# the whole run, and a request is additionally clamped to whatever is left of
+# `timeout:`. This one is the socket-level bound — `timeout:` is checked between
+# requests — so together they stop a slow or a dead server, and neither stops one
+# that dribbles bytes forever.
+# request_timeout: 15s
+
+# **How much of the run may be spent asleep**, waiting out a GitHub rate limit;
+# half of `timeout:` when unset. `timeout:` alone does not bound this — a run that
+# sleeps through its whole budget never overruns it and reports nothing at all.
+# A wait this cannot afford is refused whole rather than trimmed (a short wait does
+# not satisfy the service) and ends the run the way an exhausted `timeout:` does:
+# the aspects that finished are kept and the node says which wait it refused. Must
+# be less than `timeout:`, or the deadline would always end the run first.
+# max_pause: 30s
 
 # --- Credentials --------------------------------------------------------------
 # Where the secret lives, never the secret itself (little-sister ADR-0023).
@@ -28,12 +48,35 @@ secrets:
   token: env://PLATFORM_GITHUB_TOKEN
 
 # --- Discovery: which repositories are in scope --------------------------------
-org: example-org         # GitHub org / owner (required)
-team: platform           # team slug or name; omit to take every repo in the org
+# `owner:` is an account **login**, and GitHub's account namespace holds two kinds:
+# an organization and a personal account. `kind:` says which — the same question
+# GitHub asks when you pick an owner for a new repository, in the same two words.
+#
+# **It is declared, not guessed, and it is verified.** Declared, because it is what
+# every load-time decision is taken from: whether `team:` is legal, what
+# `advanced_security_on_private` below defaults to, whether the security aspects
+# may link to an organization page. Verified, because a claim nobody checks decays
+# — GitHub lets a personal account convert to an organization — so the check reads
+# the account on every run and refuses a disagreement by name.
+owner: example-org       # the account login (required)
+kind: organization       # `organization` or `user` (required)
+team: platform           # team slug or name; organizations only, omit for every repo
 name_prefix: platform    # keep only repos whose name starts with this (optional)
 include_archived: false
 # include_forks: true
 # api_url: https://api.github.com     # set for GitHub Enterprise Server
+
+# Does this account have GitHub Advanced Security on its **private** repositories?
+# Code scanning and secret scanning are free on a public repository and paid on a
+# private one — for organizations and personal accounts alike, which is why this is
+# a question about visibility and not about `kind:`. When it is off, private
+# repositories drop out of those two aspects entirely (and are named on the aspect's
+# node), rather than every one of them being reported as "scanning not enabled".
+#
+# Defaults to true for `kind: organization` and false for `kind: user`. Set it when
+# your account is the other way round: a personal account that pays for Advanced
+# Security, or a free organization that does not have it.
+# advanced_security_on_private: true
 
 # The coverage backstop: if discovery finds fewer than this, the check's own node
 # goes WARN rather than reporting a quiet green over an empty scope. Defaults to
@@ -44,8 +87,25 @@ include_archived: false
 # otherwise skip this run with a WARN rather than exhaust the rate limit.
 rate_limit_safety_factor: 4
 
+# --- Switching an aspect off ---------------------------------------------------
+# Every aspect runs unless its own block says `enabled: false`. A switched-off
+# aspect is skipped whole — no node, none of its API calls, and the rate-limit
+# estimate below shrinks with it. It is not a hidden node: a node that existed and
+# was merely not drawn would still be in the JSON and would still hold maintenance
+# pins.
+#
+# The switch lives in the aspect's own block, so a config is read top to bottom —
+# and an aspect that says nothing is on, which is what every config written before
+# a future aspect existed says about it. Switching *every* aspect off is a config
+# error: the check would report no finding about any repository while looking, from
+# the dashboard, exactly like one that does.
+#
+# The one block not named after its aspect: `secret_scanning:` switches
+# `secret_scanning_alerts`.
+
 # --- Aspect: pull requests -----------------------------------------------------
 pull_requests:
+  # enabled: false
   # Open PRs whose title starts with one of these are not listed (case-insensitive)
   # — e.g. the ticket prefix your own automation opens PRs with.
   ignore_title_prefixes:
@@ -62,19 +122,34 @@ security_advisories:
     medium: WARN
     low: WARN
 
-# --- Aspect: code-scanning alerts ----------------------------------------------
-# Same band shape. A repository with the feature not enabled is skipped; a
-# permission error is surfaced on the aspect container rather than read as "none".
-code_scanning_alerts:
+# --- Aspects: code-scanning alerts, in two -------------------------------------
+# GitHub gives a code-scanning alert two severities and files them under two
+# headings of its own: a *security* severity where the rule is a security rule, and
+# the rule's own *analysis* severity otherwise. This check reads one field per
+# alert, so the two aspects partition the alerts rather than counting them twice.
+# A repository with the feature not enabled is skipped; a permission error is
+# surfaced on the aspect container rather than read as "none". Both aspects come
+# from one request per repository.
+code_scanning_security:
+  # enabled: false
   severity_map:
     critical: ERROR
     high: ERROR
     medium: ERROR
     low: ERROR
-    none: ERROR
+
+# The other half, graded more gently on purpose: red on a status dashboard means
+# act now, and a non-security finding is not that however CodeQL grades its rule.
+code_scanning_quality:
+  # enabled: false
+  severity_map:
+    error: WARN
+    warning: WARN
+    note: OK
 
 # --- Aspect: secret-scanning alerts --------------------------------------------
 secret_scanning:
+  # enabled: false   # switches off the `secret_scanning_alerts` aspect
   # A repository with secret scanning *disabled* is flagged too: the alerts
   # endpoint 404s when it is off, which would otherwise read as "no alerts".
   # Set false when forks or public repos make that noisy.
@@ -97,9 +172,12 @@ issues:
   ignore: []              # repositories exempt from the issues check
 
 # --- Display text (optional) ---------------------------------------------------
-# The type ships a title and an `about` per aspect, with `{org}` / `{team}`
-# expanded from the keys above — so this block is only for what is true of *this*
-# installation. Your text replaces the shipped one, or extends it where you write
+# The type ships a title and an `about` per aspect, with `{owner}` (also spelled
+# `{org}`) and `{team}` expanded from the keys above — so this block is only for
+# what is true of *this* installation. The security aspects' link to the
+# organization security overview is a token too (`{advisories_link}`,
+# `{code_scanning_link}`, `{secret_scanning_link}`) and expands to **nothing** on a
+# personal account, which has no such page. Your text replaces the shipped one, or extends it where you write
 # `{default}`:
 #
 # subnodes:
@@ -109,3 +187,8 @@ issues:
 #
 #       Critical advisories are fixed within 48 hours; the rest are cleared at the
 #       next dependency-bump session.
+#
+# The keys are **aspect** names, and one that names nothing is refused at load —
+# a paragraph that quietly never renders is worse than a config error. In
+# particular `subnodes:` does not reach the severity **bands** beneath an aspect:
+# set a band's own title or about per node path in the deployment's `nodes.yaml`.

@@ -1,0 +1,92 @@
+# The `github-rate-limit` check — one file per **token**.
+#
+# This is the *shape*: every key the type accepts, with placeholder values and a
+# comment per knob saying what it decides. Copy it into your deployment's
+# `config/checks/` as `<account>_github_rate_limit.yaml`.
+#
+# The scope of this check is the credential, not an account: a rate limit is
+# GitHub's budget for the token that spends it. Point this at the same token a
+# `github` check uses and it explains that check's skipped runs; point it at a
+# second token and that is a second check file.
+
+type: github-rate-limit
+path: /platform/github-rate-limit        # the node this check owns
+title: GitHub API budget — platform
+about: |
+  What is left of the **platform** token's GitHub API budget, one line per
+  resource. A red line here is why the `github` check may be skipping runs.
+# Cheap to run: reading the rate-limit endpoint does not count against the budget
+# it reports, so this can watch far more closely than the check it explains.
+frequency: 1m
+timeout: 30s
+
+# --- Credentials --------------------------------------------------------------
+# Where the secret lives, never the secret itself (little-sister ADR-0023).
+# Required. The token needs **no scopes at all** for this endpoint — what matters
+# is that it is the *same* token whose budget you want to know about.
+#
+# A reference that resolves to nothing pins this check to a visible ERROR before it
+# runs, and a token GitHub rejects is reported as a failed read — so a broken
+# reference is loud. What stays silent is a token that authenticates as somebody
+# else: the budget on the line is then perfectly plausible and belongs to the wrong
+# credential. The `limit` is the only tell.
+secrets:
+  token: env://PLATFORM_GITHUB_TOKEN
+
+# api_url: https://api.github.com     # set for GitHub Enterprise Server
+
+# --- Grading ------------------------------------------------------------------
+# Two thresholds, in calls (GraphQL: in points), each read as "below this". They
+# are the default for every resource below; a resource may name its own.
+#
+# `error_below` is the lower number. The other way round, no budget could ever
+# land in the warning band, and the config is refused rather than silently meaning
+# something else — including when the two came from different places, in which case
+# the refusal names the key you actually wrote.
+#
+# Equal is allowed and says "no warning band". `error_below: 0` says "never red".
+# Switching only the amber band off means zeroing *both*, since the error threshold
+# may not sit above the warning one.
+#
+# Grading is on what is left, and **only** on that: the reset time is on the line
+# so you can see that a red budget is about to refill, but it does not soften the
+# verdict — a check that went green because relief was minutes away would be
+# silent for the run that is failing right now.
+warn_below: 1000
+error_below: 500
+
+# --- Which budgets are watched -------------------------------------------------
+# **Leave the key out entirely** to watch `core` and `graphql` with the thresholds
+# above. Naming it replaces that set — write a resource with nothing under it to
+# take the defaults, or give it its own two numbers. A `resources:` that is present
+# but empty (every entry commented out) is refused rather than quietly falling back
+# to the default set, because YAML parses it as nothing rather than as an empty
+# mapping and the two would otherwise be impossible to tell apart.
+#
+# These are GitHub's own resource names, and the list below is **not exhaustive**:
+# the set is open and has grown several times. So nothing here validates a name at
+# load — a name this installation does not have becomes a warning line at run time,
+# which is the only place that can tell a typo from a resource GitHub added last
+# week.
+#
+#   core                          the general REST budget — most of what `github`
+#                                 spends, though not all: some endpoints it calls
+#                                 draw on their own budgets below
+#   graphql                       the GraphQL budget, counted in points
+#   search / code_search          the search endpoints, on their own small budgets
+#   dependency_snapshots          dependency-graph submissions
+#   code_scanning_upload          SARIF uploads
+#   integration_manifest          GitHub App manifest conversions
+#   actions_runner_registration   self-hosted runner registration
+#   dependency_sbom               SBOM requests
+#   scim                          SCIM provisioning
+#
+# resources:
+#   core:
+#     warn_below: 2000            # this deployment spends core faster than most
+#     error_below: 800
+#   graphql:                      # nothing under it: the thresholds above apply
+#   search:
+#     warn_below: 10              # a small budget wants **both** of its own
+#     error_below: 3              # numbers — inheriting one of the two above
+#                                 # would put error_below over warn_below
