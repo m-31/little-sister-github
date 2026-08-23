@@ -19,7 +19,7 @@ an ``ImportError`` from inside this package, which reads like our bug.
 """
 from little_sister.checks import require_api
 
-require_api(1)
+require_api(2)
 
 from little_sister_github import (  # noqa: E402  both register their type
     github,

@@ -14,7 +14,7 @@ and a maintenance pin on ``core`` survives a config that starts watching
 ``search`` next year.
 
 Everything imported from little-sister below is part of its **check-authoring
-surface** (architecture.md §11), which is what the ``require_api(1)`` in this
+surface** (architecture.md §11), which is what the ``require_api(2)`` in this
 package's ``__init__`` pins.
 """
 from __future__ import annotations

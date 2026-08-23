@@ -1,88 +1,16 @@
 # ADR-0002 — A read failure is not a finding about the repository
 
 - **Status:** Accepted
-- **Date:** 2026-08-13
+- **Date:** 2026-08-23 (accepted 2026-08-15)
 - **Related:** [ADR-0001](0001-a-second-check-type-in-this-package.md) (which
   applied the *wording* half of this — "could not ask" — to `github-rate-limit`,
-  and left the grading half open for this type by name),
+  and named this type's grading half as the question this record answers),
   little-sister ADR-0042 (an entry carries its own code), little-sister ADR-0036
   (a keyed reason is a member), little-sister ADR-0040 (a failing check is
   all-or-nothing — the shape this record works around), little-sister ADR-0050
   (a slug is an identifier, never a position), little-sister **ADR-0058** (one
   transport policy, and any client — the vocabulary this record's machinery moved
   into)
-
-> **Update (2026-08-15):** the machinery below is the library's now, and one of the
-> classifications was **wrong in a way that mattered**. Every reading this record
-> decided still holds; what changed is where the code lives, and that a throttle is
-> no longer read as a refusal.
->
-> **1. A rate limit is *not now*, and this shipped as *no*.** §2 sets `transient` to
-> `500 <= code < 600`. GitHub answers a rate limit — primary or secondary — with
-> **403 or 429**, so every throttle landed in the *answer* column: an amber
-> `could not read` line naming a repository that was in perfect health, and no retry.
-> ADR-0001's own Update predicted the shape of this
-> ("the signature of a secondary limit") and closed on *GitHub's answer may carry a
-> `retry-after` header, which nothing here reads yet*. It is read now.
->
-> The status cannot decide it and never could, which is the whole reason this reading
-> is **ours** rather than the library's: GitHub documents both 403 and 429 for both of
-> its limits, and a bare 403 equally means *this token may not see it*. So the headers
-> decide, in GitHub's own precedence — `retry-after` first, then
-> `x-ratelimit-remaining: 0` with `x-ratelimit-reset` (an epoch stamp, read against
-> the wall clock and not the run's monotonic one), and otherwise a 60-second floor.
-> A **bare 429** takes that floor, because a rate limit is the only thing GitHub sends
-> that status for. A **bare 403 does not**: with no throttle header on it, it is still
-> the permission answer, and reading it as *not now* would retry every unreadable
-> repository in the scope and turn a real permission problem grey.
->
-> **Never from the body**, though GitHub's throttle bodies say so in prose. That is
-> §2's rule, on the one classification most tempting to break it for.
->
-> A throttle is `TRANSIENT` and carries the number GitHub named. What is done with the
-> number is bounded by the run: a two-second secondary limit is absorbed, and a
-> twenty-minute primary limit is **refused and re-raised**, because a wait outliving
-> the check's budget is not a request layer's to take. The floor is deliberately
-> longer than a normal run's remaining budget, so it mostly *prevents* a retry rather
-> than scheduling one — pressing a service that has just complained about volume is
-> how an integration gets itself blocked.
->
-> **2. Three faults, not two, and the third is new information on a line.** The
-> library's `Fault` is *transient* / *answered* / *malformed*, and §2's last row —
-> "a malformed payload (no status)" — now has a name of its own instead of sharing the
-> not-transient column with a 404. It still grades WARN, which is the same reading
-> this record made; what changes is that a line can say *could not read* about an
-> answer that arrived unusable and mean something distinct from *the thing is absent*.
-> One case moved to it: a body that is not JSON used to be reported as transient and
-> **retried**, spending a second request to be handed the same bytes.
->
-> **3. §1's stated caveat is closed.** This record named a hole it did not take on —
-> both budgets "hold against a slow or dead server and neither holds against a
-> deliberately dribbling one", closing which "needs a read loop with a clock of its
-> own". The library has that loop: a response body is read in bounded chunks against
-> a byte cap *and* the run's deadline. This client passes its deadline in, so the hole
-> is shut here.
->
-> **4. What is left of this client is GitHub.** The request, the two budgets and the
-> retry are all named by little-sister ADR-0058 and imported:
-> `Deadline` replaces our `_Deadline`, `DeadlineExceeded` replaces
-> `RunDeadlineExceeded` — still deliberately outside the error hierarchy, for exactly
-> the reason §7 gives — `GitHubError` becomes a `RemoteError` subclass keeping its own
-> messages and every `except` clause, `fetch` replaces the hand-rolled `urlopen` call,
-> and `ask` replaces the retry loop with the same veto §3 describes. What stays is what
-> only a GitHub client can know: the auth and API-version headers, the `Link` walk, and
-> the throttle reader above.
->
-> Two side effects worth naming. Requests now identify as `little-sister/<version>`
-> rather than `Python-urllib/<x.y>` — a name a support thread can do something with,
-> and one an outbound filter is less likely to answer with an uninterpretable 403. And
-> the per-request clamp is the library's `Deadline.budget` rather than our `_budget`,
-> so it is one implementation for every check in the family instead of one per package.
->
-> **5. This raises the install floor.** The names above are promised by a
-> little-sister release, and the floor in `pyproject.toml` has to name it — a floor
-> that does not is an `ImportError` at startup for anybody who installs this package
-> against an older library. The two releases go out together.
 
 ## Context
 
@@ -139,25 +67,56 @@ deadline *"because `REQUEST_TIMEOUT` bounds one socket operation and not one
 request: a server that dribbles a byte every four seconds never times out"*.
 
 **That caveat applies here too, and neither budget repeals it.** `request_timeout`
-is handed to `urlopen`, which bounds a socket operation; a response trickling bytes
-below that rate is not cut off by it, and the run deadline is only consulted
-*between* requests. So both bounds hold against a slow or dead server and neither
-holds against a deliberately dribbling one. Closing that needs a read loop with a
-clock of its own, which is a larger change than this record takes on — it is named
-here so the next person does not have to rediscover it.
+becomes the socket timeout beneath the request, and a socket timeout bounds one
+operation; a response trickling bytes below that rate is not cut off by it, and the run
+deadline is only consulted *between* requests. So both bounds hold against a slow or
+dead server and neither holds against a deliberately dribbling one. Closing that needs a
+read loop with a clock of its own, and the library has one: a response body is read in
+bounded chunks against a byte cap *and* the run's deadline. This client passes its
+deadline in, so the hole is shut.
 
-### 2. A failure is transient or it is an answer, and the status decides
+### 2. A failure is transient, an answer or malformed, and the status and headers decide
 
-Set on `GitHubError` at the point it is raised, **by status, never by message text**:
+Set on `GitHubError` at the point it is raised, **by status and response headers,
+never by message text**:
 
-| what came back | transient | what it means |
+| what came back | fault | what it means |
 |---|---|---|
-| **5xx**, or a transport failure | yes | we could not ask |
-| **404** | no | GitHub answered: the thing is absent |
-| **401**, **403** | no | GitHub answered: this token may not see it |
-| a malformed payload (no status) | no | asking again cannot change a shape |
+| **5xx**, or a transport failure | transient | we could not ask |
+| **403** or **429** carrying a throttle header, and a bare **429** | transient | GitHub answered: not now |
+| **404** | answered | GitHub answered: the thing is absent |
+| **401**, and a bare **403** | answered | GitHub answered: this token may not see it |
+| a body that is not JSON | malformed | asking again is handed the same bytes |
+| a malformed payload (no status) | malformed | asking again cannot change a shape |
 
 The last row is why this cannot be inferred from `status is None`.
+
+**Three faults, not two, and the third is new information on a line.** The library's
+`Fault` is *transient* / *answered* / *malformed*, and a malformed payload carries a
+name of its own rather than being lumped in with a 404 as merely not transient. It
+grades WARN, and a line can say *could not read* about an answer that arrived
+unusable and mean something distinct from *the thing is absent*. A body that is not
+JSON is malformed too, and is therefore not **retried**: a second request would be
+spent to be handed the same bytes.
+
+**A rate limit is *not now*, and the status alone cannot say so.** GitHub answers a rate
+limit — primary or secondary — with **403 or 429**. The status cannot decide it, which
+is the whole reason this reading is **ours** rather than the library's: GitHub documents
+both 403 and 429 for both of its limits, and a bare 403 equally means *this token may
+not see it*. So the headers decide, in GitHub's own precedence — `retry-after` first,
+then `x-ratelimit-remaining: 0` with `x-ratelimit-reset` (an epoch stamp, read against
+the wall clock and not the run's monotonic one), and otherwise a 60-second floor. A
+**bare 429** takes that floor, because a rate limit is the only thing GitHub sends that
+status for. A **bare 403 does not**: with no throttle header on it, it is still the
+permission answer, and reading it as *not now* would retry every unreadable repository
+in the scope and turn a real permission problem grey.
+
+**Never from the body**, though GitHub's throttle bodies say so in prose. That is this
+section's rule, on the one classification most tempting to break it for.
+
+A throttle is `TRANSIENT` and carries the number GitHub named; ADR-0001's Consequences
+reads the same event from the other node, where it is "the signature of a secondary
+limit".
 
 ### 3. Only a transient failure is retried, once
 
@@ -176,6 +135,13 @@ ask: a run too short to afford the backoff skips the retry, and a request clampe
 the run's last fraction of a second times out on a budget of our own making. That is
 why the node's sentence in §6 says *GitHub did not answer* and stops there; the
 stronger claim would be false exactly when the run is already in trouble.
+
+What is done with a throttle's number is bounded by the run: a two-second secondary
+limit is absorbed, and a twenty-minute primary limit is **refused and re-raised**,
+because a wait outliving the check's budget is not a request layer's to take. The
+floor is deliberately longer than a normal run's remaining budget, so it mostly
+*prevents* a retry rather than scheduling one — pressing a service that has just
+complained about volume is how an integration gets itself blocked.
 
 ### 4. A transient failure is a line that grades nothing
 
@@ -291,6 +257,23 @@ is marked; the aspects simply are not written this run, and freshness
 (little-sister ADR-0005) is what eventually says the readings are old. Re-publishing
 half a scope is a different question and is not decided here.
 
+### 10. What is left of this client is GitHub
+
+The request, the two budgets and the retry are all named by little-sister ADR-0058
+and imported: `Deadline` rather than a local `_Deadline`, `DeadlineExceeded` rather
+than `RunDeadlineExceeded` — still deliberately outside the error hierarchy, for
+exactly the reason §7 gives — `GitHubError` a `RemoteError` subclass keeping its own
+messages and every `except` clause, `fetch` in place of a hand-rolled `urlopen` call,
+and `ask` carrying the retry loop with the same veto §3 describes. What stays is what
+only a GitHub client can know: the auth and API-version headers, the `Link` walk, and
+§2's throttle reader.
+
+Two side effects worth naming. Requests identify as `little-sister/<version>` rather
+than `Python-urllib/<x.y>` — a name a support thread can do something with, and one
+an outbound filter is less likely to answer with an uninterpretable 403. And the
+per-request clamp is the library's `Deadline.budget` rather than a local `_budget`,
+so it is one implementation for every check in the family instead of one per package.
+
 ## Consequences
 
 - **No config file needs editing, but one existing key changed meaning.**
@@ -315,3 +298,7 @@ half a scope is a different question and is not decided here.
   Proposing it there is the follow-up this record leaves open — with the caveat that
   the library would also have to say something about `UNDEFINED` on an aspect, which
   is the one piece of this that a check author would not guess.
+- **This raises the install floor.** The names in decision 10 are promised by a
+  little-sister release, and the floor in `pyproject.toml` has to name it — a floor
+  that does not is an `ImportError` at startup for anybody who installs this package
+  against an older library. The two releases go out together.

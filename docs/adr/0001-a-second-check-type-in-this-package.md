@@ -1,7 +1,7 @@
 # ADR-0001 — The API budget is a check type of its own, not an eighth aspect
 
 - **Status:** Accepted
-- **Date:** 2026-08-13
+- **Date:** 2026-08-09 (accepted 2026-08-15)
 - **Related:** [`../../README.md`](../../README.md) (how both types are configured),
   little-sister ADR-0042 (an entry carries its own code), little-sister ADR-0050 (a
   slug is an identifier, never a position), little-sister ADR-0051 (one bare type
@@ -14,54 +14,6 @@ little-sister's is always written `little-sister ADR-00NN`; a bare number here i
 > deliberately changed — is a working note on the development branch, not part of
 > what this package ships. This record carries the decision; that note carries the
 > lineage.
-
-> **Update (2026-08-15):** two limits this record left unstated, both of them things
-> an operator meets while looking at these two nodes side by side. Nothing below
-> changes; this names what the decision does **not** cover.
->
-> **1. This is the *primary* budget, and the one a burst actually trips is
-> unwatchable.** GitHub enforces *secondary* rate limits in addition to the primary
-> ones — on concurrency and on request bursts — and its documentation is explicit
-> that there is no way to check the status of a secondary rate limit: no header
-> carries it, and `GET /rate_limit` does not report it. So this check cannot grow a
-> line for it, and the gap is the API's rather than a decision taken here. What a
-> deployment sees instead is worth knowing: GitHub answers a secondary limit with
-> **403 or 429**, and ADR-0002 classifies a 4xx as an *answer* — not transient, so
-> not retried — which means a burst throttle reaches a dashboard as `could not read`
-> lines on the `github` check's aspects, at WARN, while this check's node typically
-> stays green with plenty of budget left. **That combination — an untroubled budget
-> beside a rash of unreadable repositories — is the signature of a secondary limit**,
-> and reading it as a permission problem is the mistake this paragraph exists to
-> prevent. GitHub's answer may carry a `retry-after` header, which nothing here reads
-> yet.
->
-> **2. The `github` check's guard reads `core`, and only `core`.** Its pre-run
-> estimate consults `resources.core` from the same endpoint this check reads, which
-> is the budget every REST call that check makes is charged to — so the guard is
-> right today, and a `graphql` or `search` resource going red beside it correctly
-> does not stop a `github` run, because that type issues neither kind of request.
-> Two consequences follow. The number on this check's `core` line and the number the
-> guard acted on are the **same reading taken at different moments**, so a dashboard
-> can legitimately show a skipped run beside a budget that has since refilled. And if
-> GitHub ever meters one of the endpoints those aspects call under a resource of its
-> own, the guard would go on reading a budget that is no longer the one being spent —
-> worth naming, because that failure would look like the guard not working rather
-> than like the guard watching the wrong number.
-
-> **Update (2026-08-15), later the same day:** the last sentence of point 1 above —
-> *GitHub's answer may carry a `retry-after` header, which nothing here reads yet* —
-> is no longer true. It is read, along with `x-ratelimit-remaining` /
-> `x-ratelimit-reset`; see [ADR-0002](0002-a-read-failure-is-not-a-finding.md)'s own
-> Update for the precedence and for why the reading has to live in this package.
->
-> **The rest of point 1 stands, and it is the part that matters here.** A secondary
-> limit is still unwatchable from `GET /rate_limit`, so this check still cannot grow a
-> line for one. What changed is only the *other* node's reading: a burst throttle now
-> reaches a dashboard as `could not ask GitHub` lines that grade nothing, rather than
-> as amber `could not read` lines blaming the repositories. So the signature that
-> paragraph describes has changed shape — an untroubled budget here beside a rash of
-> **grey** lines on the `github` check, with the check's own node saying how many reads
-> could not be completed.
 
 ## Context
 
@@ -165,11 +117,11 @@ right now; the reader who wants to know whether to wait can see the clause and d
 ### 5. Four readings the check refuses to fake
 
 - **A failed read says the asking failed.** `could not ask GitHub for the rate limit: …`
-  at ERROR, never a claim about a budget nobody read. The same distinction is an open
-  question for the `github` type, where a 5xx from one endpoint currently puts a
-  repository's name in amber; it is easy here only because this check has exactly one
-  source and no other finding to protect, so there is nothing for the failure to be
-  mistaken for.
+  at ERROR, never a claim about a budget nobody read. The same distinction is settled
+  for the `github` type by [ADR-0002](0002-a-read-failure-is-not-a-finding.md), where
+  a read that failed is a line that grades nothing rather than a repository's name in
+  amber; it was easy here only because this check has exactly one source and no other
+  finding to protect, so there is nothing for the failure to be mistaken for.
 - **A watched resource GitHub did not report is a WARN line naming it**, not a missing
   line. A line that simply vanished would read as a budget that is fine. This is also
   where a mistyped resource name surfaces: the resource set is GitHub's and it is
@@ -201,3 +153,38 @@ right now; the reader who wants to know whether to wait can see the clause and d
 - The package's rulebook now describes two types, and a third would have to argue
   against this record rather than beside it: what makes these two one package is a
   shared API, client and credential — not a shared vendor.
+
+Two limits this decision does not cover, both of them things an operator meets while
+looking at these two nodes side by side.
+
+**1. This is the *primary* budget, and the one a burst actually trips is
+unwatchable.** GitHub enforces *secondary* rate limits in addition to the primary
+ones — on concurrency and on request bursts — and its documentation is explicit that
+there is no way to check the status of a secondary rate limit: no header carries it,
+and `GET /rate_limit` does not report it. So this check cannot grow a line for it, and
+the gap is the API's rather than a decision taken here. What a deployment sees instead
+is worth knowing: GitHub answers a secondary limit with **403 or 429**, and ADR-0002
+reads a throttle header on either as *not now* — transient, and a transient failure is
+a line that grades nothing — which means a burst throttle reaches a dashboard as
+**grey** `could not ask GitHub` lines on the `github` check's aspects, while this
+check's node typically stays green with plenty of budget left. **That combination — an
+untroubled budget here beside a rash of grey lines on the `github` check, with that
+check's own node saying how many reads could not be completed — is the signature of a
+secondary limit**, and reading it as a permission problem is the mistake this paragraph
+exists to prevent. GitHub's answer may carry a `retry-after` header, and it is read,
+along with `x-ratelimit-remaining` / `x-ratelimit-reset`; see
+[ADR-0002](0002-a-read-failure-is-not-a-finding.md) decision 2 for the precedence and
+for why the reading has to live in this package.
+
+**2. The `github` check's guard reads `core`, and only `core`.** Its pre-run estimate
+consults `resources.core` from the same endpoint this check reads, which is the budget
+every REST call that check makes is charged to — so the guard is right today, and a
+`graphql` or `search` resource going red beside it correctly does not stop a `github`
+run, because that type issues neither kind of request. Two consequences follow. The
+number on this check's `core` line and the number the guard acted on are the **same
+reading taken at different moments**, so a dashboard can legitimately show a skipped
+run beside a budget that has since refilled. And if GitHub ever meters one of the
+endpoints those aspects call under a resource of its own, the guard would go on reading
+a budget that is no longer the one being spent — worth naming, because that failure
+would look like the guard not working rather than like the guard watching the wrong
+number.

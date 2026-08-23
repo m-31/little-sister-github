@@ -20,7 +20,7 @@ Registered in little-sister's ``CHECK_TYPES`` on import — importing
 check configs.
 
 Everything imported from little-sister below is part of its **check-authoring
-surface** (architecture.md §11), which is what the ``require_api(1)`` in this
+surface** (architecture.md §11), which is what the ``require_api(2)`` in this
 package's ``__init__`` pins.
 """
 from __future__ import annotations
@@ -45,10 +45,8 @@ from little_sister.checks import (
     config_markdown,
     parse_duration,
     parse_secret_refs,
-    parse_subnodes,
     plain,
     register,
-    resolve_text,
 )
 from little_sister.fetch import Response, fault_for, fetch, retry_after
 from little_sister.reasons import slug
@@ -292,11 +290,13 @@ PIN_NOTE = ("Each line is one finding and can be put into maintenance on its own
 #: Built-in display text for the aspect leaves this check emits (little-sister
 #: ADR-0025) — **type-inherent**, so it is written once here rather than copied into
 #: every deployment config, which matters as soon as the type runs more than once
-#: (one check per team). `{owner}` / `{team}` and the three
-#: `{…_link}` sentences expand from the check's own config and from the account
-#: kind discovery resolved (`_subnode_tokens`). A check config's `subnodes:` block
-#: replaces any of these, or extends one by writing `{default}` into its own text;
-#: `nodes.yaml` still wins over both, per node path.
+#: (one check per team). It is **declared, not applied**: little-sister takes this
+#: map as `subnode_defaults` and `_subnode_tokens()` as `label_tokens`, resolves a
+#: deployment's `subnodes:` block over it — replacing any of these, or extending
+#: one where the config writes `{default}` — and the engine writes the result per
+#: aspect name. `nodes.yaml` still wins over both, per node path. `{owner}` /
+#: `{team}` and the three `{…_link}` sentences expand from this check's own
+#: configuration, the declared account kind included.
 #:
 #: What is written here is what is true of the **type** — what the aspect reads
 #: and what the reader is looking at. What an installation *does about it* — a
@@ -406,6 +406,97 @@ run → ERROR, a run awaiting approval → WARN. Workflows matching
 """,
     },
 }
+
+
+def _grading_sentence(severity_map: dict[str, StatusCode],
+                      watched: tuple[str, ...] | None = None) -> str:
+    """The grading **in force**, as a sentence for the aspect's `about`.
+
+    The shipped text used to name the key that sets the mapping, which is the
+    one place a reader on a dashboard cannot look — the defaults live in this
+    package's source. This renders the map the check is actually using, so a
+    deployment that overrode it sees *its* answer and not ours.
+    """
+    names = watched if watched is not None else tuple(severity_map)
+    if not names:
+        return "Findings are grouped into severity-band children."
+    codes = [severity_map.get(name, StatusCode.WARN) for name in names]
+    if len(set(codes)) == 1:
+        # One answer for every band is worth saying once. Eight identical
+        # arrows are a wall a reader skips, and skipping is how the setting
+        # stays invisible — which is the whole complaint this text answers.
+        graded = f"**{codes[0].name}** for every band"
+    else:
+        graded = ", ".join(f"`{name}` → **{code.name}**"
+                           for name, code in zip(names, codes, strict=True))
+    return ("Findings are grouped into severity-band children, graded "
+            f"{graded}. A band with no findings reads `OK`, so a watched "
+            "band's silence is visible.")
+
+
+def _security_overview_link(owner: str, team: str, is_org: bool,
+                            family: str, text: str) -> str:
+    """One aspect's link to the organization-wide security overview — or
+    **nothing at all**.
+
+    `https://github.com/orgs/<login>/security/alerts/…` is an organization page:
+    a personal account does not have one, and GitHub answers 404. So for a
+    personal account this expands to the empty string and the aspect ships its
+    text without a link rather than with a dead one — which is the whole reason
+    the sentence is a token instead of a line in `SUBNODES`.
+
+    The team clause is written **only when there is a team**. `team:` with an
+    empty value is a filter that matches nothing, not an absent filter, so the
+    no-team form of this link used to lead to an empty overview page.
+    """
+    if not is_org:
+        return ""
+    terms = ["is:open"]
+    if team:
+        terms.append(f"team:{team}")
+    query = urllib.parse.urlencode({"query": " ".join(terms)})
+    return (f"[{text}](https://github.com/orgs/{_path(owner)}"
+            f"/security/alerts/{family}?{query}).")
+
+
+def _subnode_tokens(*, owner: str, team: str, is_org: bool,
+                    advisory_severity_map: dict[str, StatusCode],
+                    dependabot_severities: tuple[str, ...],
+                    code_scanning_security_map: dict[str, StatusCode],
+                    code_scanning_quality_map: dict[str, StatusCode],
+                    ) -> dict[str, str]:
+    """Values a `subnodes:` `about` may reference as `{token}` — this check's
+    own `owner` / `team`, the three security-overview link sentences, and the
+    shared `{pin_note}` sentence. little-sister takes this map as
+    `label_tokens` and expands it wherever the text ends up coming from (its
+    ADR-0025).
+
+    A **function of its arguments rather than of a check**, because the base
+    constructor is where the library resolves these and a check has no
+    attributes yet when it calls it. Every value here was a load-time fact
+    already — the account kind is declared, not discovered — so nothing is lost
+    by computing it a few lines earlier.
+
+    There is no `{org}`: it was renamed with the key it named, and a config
+    still writing it is refused at load rather than rendering the literal
+    token on a dashboard (`_extra_from_config`)."""
+    return {
+        "owner": owner,
+        "team": team,
+        "pin_note": PIN_NOTE,
+        "advisories_link": _security_overview_link(
+            owner, team, is_org, "dependabot", "All open advisories"),
+        "code_scanning_link": _security_overview_link(
+            owner, team, is_org, "code-scanning", "All open alerts"),
+        "secret_scanning_link": _security_overview_link(
+            owner, team, is_org, "secret-scanning", "All open alerts"),
+        "advisories_grading": _grading_sentence(
+            advisory_severity_map, dependabot_severities),
+        "code_scanning_security_grading": _grading_sentence(
+            code_scanning_security_map),
+        "code_scanning_quality_grading": _grading_sentence(
+            code_scanning_quality_map),
+    }
 
 
 def _is_pull_request(row: object) -> bool:
@@ -1016,9 +1107,30 @@ class GitHubCheck(Check):
                  actions_show_healthy: bool = False,
                  issues_ignore: tuple[str, ...] = (),
                  disabled_aspects: tuple[str, ...] = (),
-                 subnodes: dict[str, dict[str, str]] | None = None,
                  token_ref: str, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
+        # The two declarations this type makes about its subnodes, computed
+        # **before** the base constructor because that is where little-sister
+        # resolves them against the deployment's `subnodes:` block (its
+        # ADR-0025). They are functions of the arguments rather than of
+        # `self` for the same reason — and can be, because every value in them is
+        # a load-time fact: `kind` is declared, and the severity maps are the
+        # defaults with the config's overrides on top, exactly as the attributes
+        # below take them.
+        advisories = {**DEFAULT_ADVISORY_SEVERITY_MAP,
+                      **(advisory_severity_map or {})}
+        scanning_security = {**DEFAULT_CODE_SCANNING_SECURITY_MAP,
+                             **(code_scanning_security_map or {})}
+        scanning_quality = {**DEFAULT_CODE_SCANNING_QUALITY_MAP,
+                            **(code_scanning_quality_map or {})}
+        super().__init__(
+            subnode_defaults=SUBNODES,
+            label_tokens=_subnode_tokens(
+                owner=owner, team=team, is_org=kind == "organization",
+                advisory_severity_map=advisories,
+                dependabot_severities=dependabot_severities,
+                code_scanning_security_map=scanning_security,
+                code_scanning_quality_map=scanning_quality),
+            **kwargs)
         # The API token, resolved **once here** from the reference the config
         # names in its `secrets:` block — `env://GITHUB_TOKEN`, or an
         # `aws-sm://…` address (little-sister ADR-0023) — never re-read
@@ -1066,18 +1178,9 @@ class GitHubCheck(Check):
         self.expect_min_repos = _positive_int(expect_min_repos, "expect_min_repos")
         self.pr_ignore_prefixes = pr_ignore_prefixes
         self.dependabot_severities = dependabot_severities
-        self.advisory_severity_map = {
-            **DEFAULT_ADVISORY_SEVERITY_MAP,
-            **(advisory_severity_map or {}),
-        }
-        self.code_scanning_security_map = {
-            **DEFAULT_CODE_SCANNING_SECURITY_MAP,
-            **(code_scanning_security_map or {}),
-        }
-        self.code_scanning_quality_map = {
-            **DEFAULT_CODE_SCANNING_QUALITY_MAP,
-            **(code_scanning_quality_map or {}),
-        }
+        self.advisory_severity_map = advisories
+        self.code_scanning_security_map = scanning_security
+        self.code_scanning_quality_map = scanning_quality
         self.secret_scanning_require_enabled = secret_scanning_require_enabled
         self.sbom_ignore = sbom_ignore
         self.actions_ignore_patterns = actions_ignore_patterns
@@ -1089,10 +1192,6 @@ class GitHubCheck(Check):
         # default in every config written before it existed — the opposite of what
         # an allow-list would do, which is to exclude it silently.
         self.disabled_aspects = frozenset(disabled_aspects)
-        # Per-aspect display text (title/about) declared in this check's own config
-        # (`subnodes:`), carried onto each aspect child (little-sister
-        # ADR-0025). nodes.yaml still overrides per path.
-        self.subnodes = subnodes or {}
         # What kind of account `org` names, filled by `_discover` from GitHub
         # itself. `None` means "not asked yet": every reader of it runs during a
         # run, after discovery, and the organization answer is the one that keeps
@@ -1222,8 +1321,14 @@ class GitHubCheck(Check):
             raise CheckError(
                 "github check has every aspect disabled — it would report no "
                 "finding about any repository. Remove the check instead.")
-        subnodes = parse_subnodes(config)
-        for aspect, texts in subnodes.items():
+        # The block's **shape** is little-sister's to validate, and it already
+        # has: `_parse_common` reads `subnodes:` for every check type now, and
+        # resolves the labels against what this type declares (its
+        # ADR-0025). What is left here is what only this type knows —
+        # which names it answers to, and which token it retired.
+        block = config.get("subnodes")
+        for raw_name, texts in (block.items() if isinstance(block, dict) else ()):
+            aspect = str(raw_name)
             if aspect not in cls.ASPECTS:
                 # A key naming nothing was accepted and did nothing — a paragraph a
                 # deployment wrote, loaded without complaint, and never drawn. The
@@ -1242,8 +1347,9 @@ class GitHubCheck(Check):
                     f"{', '.join(sorted(cls.ASPECTS))} — and not the severity "
                     f"bands beneath them; a band's own title or about is set per "
                     f"node path in the deployment's nodes.yaml")
-            for field_name, text in texts.items():
-                if "{org}" in text:
+            for field_name, text in (texts.items()
+                                     if isinstance(texts, dict) else ()):
+                if "{org}" in str(text):
                     # An unknown token is left as-is rather than raising, so this
                     # would otherwise reach a dashboard as a literal `{org}`. The
                     # key's rename can refuse; the token has to be refused here or
@@ -1292,7 +1398,6 @@ class GitHubCheck(Check):
             "actions_show_healthy": bool(actions.get("show_healthy", False)),
             "issues_ignore": tuple(str(r) for r in issues_ignore),
             "disabled_aspects": disabled,
-            "subnodes": subnodes,
             # `secrets: {token: …}` — required, so two checks of this type can
             # each carry their own team's credential (little-sister ADR-0023).
             "token_ref": parse_secret_refs(config, "token")["token"],
@@ -1336,94 +1441,6 @@ class GitHubCheck(Check):
         node that is not there, and nothing sorts into it.
         """
         return cls.ASPECTS.index(name) + 1
-
-    @staticmethod
-    def _grading_sentence(severity_map: dict[str, StatusCode],
-                          watched: tuple[str, ...] | None = None) -> str:
-        """The grading **in force**, as a sentence for the aspect's `about`.
-
-        The shipped text used to name the key that sets the mapping, which is the
-        one place a reader on a dashboard cannot look — the defaults live in this
-        package's source. This renders the map the check is actually using, so a
-        deployment that overrode it sees *its* answer and not ours.
-        """
-        names = watched if watched is not None else tuple(severity_map)
-        if not names:
-            return "Findings are grouped into severity-band children."
-        codes = [severity_map.get(name, StatusCode.WARN) for name in names]
-        if len(set(codes)) == 1:
-            # One answer for every band is worth saying once. Eight identical
-            # arrows are a wall a reader skips, and skipping is how the setting
-            # stays invisible — which is the whole complaint this text answers.
-            graded = f"**{codes[0].name}** for every band"
-        else:
-            graded = ", ".join(f"`{name}` → **{code.name}**"
-                               for name, code in zip(names, codes, strict=True))
-        return ("Findings are grouped into severity-band children, graded "
-                f"{graded}. A band with no findings reads `OK`, so a watched "
-                "band's silence is visible.")
-
-    def _subnode_tokens(self) -> dict[str, str]:
-        """Values a `subnodes:` `about` may reference as `{token}` — this check's
-        own `owner` / `team`, the three security-overview link sentences, and the
-        shared `{pin_note}` sentence.
-
-        There is no `{org}`: it was renamed with the key it named, and a config
-        still writing it is refused at load rather than rendering the literal
-        token on a dashboard (`_extra_from_config`)."""
-        return {
-            "owner": self.owner,
-            "team": self.team,
-            "pin_note": PIN_NOTE,
-            "advisories_link": self._security_overview_link(
-                "dependabot", "All open advisories"),
-            "code_scanning_link": self._security_overview_link(
-                "code-scanning", "All open alerts"),
-            "secret_scanning_link": self._security_overview_link(
-                "secret-scanning", "All open alerts"),
-            "advisories_grading": self._grading_sentence(
-                self.advisory_severity_map, self.dependabot_severities),
-            "code_scanning_security_grading": self._grading_sentence(
-                self.code_scanning_security_map),
-            "code_scanning_quality_grading": self._grading_sentence(
-                self.code_scanning_quality_map),
-        }
-
-    def _security_overview_link(self, family: str, text: str) -> str:
-        """One aspect's link to the organization-wide security overview — or
-        **nothing at all**.
-
-        `https://github.com/orgs/<login>/security/alerts/…` is an organization page:
-        a personal account does not have one, and GitHub answers 404. So for a
-        personal account this expands to the empty string and the aspect ships its
-        text without a link rather than with a dead one — which is the whole reason
-        the sentence is a token instead of a line in `SUBNODES`.
-
-        The team clause is written **only when there is a team**. `team:` with an
-        empty value is a filter that matches nothing, not an absent filter, so the
-        no-team form of this link used to lead to an empty overview page.
-        """
-        if not self.is_org:
-            return ""
-        terms = ["is:open"]
-        if self.team:
-            terms.append(f"team:{self.team}")
-        query = urllib.parse.urlencode({"query": " ".join(terms)})
-        return (f"[{text}](https://github.com/orgs/{_path(self.owner)}"
-                f"/security/alerts/{family}?{query}).")
-
-    def _meta(self, name: str) -> tuple[str, str]:
-        """The (title, about) for aspect `name`: this check type's built-in
-        `SUBNODES` text, which the config's `subnodes:` block replaces — or extends,
-        where it writes `{default}` into its own text (little-sister ADR-0025).
-        Tokens expand in either case."""
-        configured = self.subnodes.get(name, {})
-        default = SUBNODES.get(name, {})
-        tokens = self._subnode_tokens()
-        return (resolve_text(configured.get("title", ""),
-                             default.get("title", ""), tokens),
-                resolve_text(configured.get("about", ""),
-                             default.get("about", ""), tokens))
 
     # --- helpers -------------------------------------------------------------
 
@@ -1698,12 +1715,10 @@ class GitHubCheck(Check):
         if not coverage.counted:
             coverage.counted = True
             self._unreachable += coverage.unreachable
-        title, about = self._meta(name)
         return CheckResult(
             reason=(*entries, *coverage.lines()),
             entries=True,
-            name=name, description=description,
-            title=title, about=about, report=report)
+            name=name, description=description, report=report)
 
     def _severity_bands(
         self, name: str, description: str,
@@ -1763,15 +1778,12 @@ class GitHubCheck(Check):
         if not coverage.counted:
             coverage.counted = True
             self._unreachable += coverage.unreachable
-        title, about = self._meta(name)
         return CheckResult(
             reason=coverage.lines(),
             entries=True,
             name=name,
             description=description,
             children=tuple(children),
-            title=title,
-            about=about,
             report=report,
         )
 

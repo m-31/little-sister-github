@@ -1,6 +1,6 @@
 [project]
 name = "little-sister-github"
-version = "0.1.1"
+version = "0.1.2"
 description = "GitHub check types for little-sister: repository overview, and API rate limit."
 authors = [
     { name = "Michael Meyling" }
@@ -35,25 +35,30 @@ requires-python = ">=3.11"
 # a release. The upgrade a floor cannot see, the library moving *past* the
 # surface, is caught by `require_api()` in `__init__.py`.
 #
-# **0.3.12 rather than 0.3.11**, which is what this package shipped against until now.
-# 0.3.11 does not have `little_sister.transport` or `little_sister.fetch`, and this
-# package imports both (ADR-0002's Update). A floor still naming it would let a
-# deployment install this against a library with none of the names it needs, and the
-# failure would be an `ImportError` at startup — the one mismatch `require_api()`
-# cannot catch, because an epoch says what was *removed* and nothing about what was
-# added. The epoch is still **1**, correctly: adding names does not move it.
+# **0.3.13 rather than 0.3.12**, which is what this package shipped against until now.
+# 0.3.13 is the release that speaks **check API epoch 2**, and the epoch moved because
+# three names *left* the surface: little-sister reads the whole `subnodes:` block
+# itself now and a type only declares (its ADR-0025, 2026-08-19 update). `require_api()`
+# catches that direction — but only at startup, and a floor naming an older release
+# would let a resolver install the very library that call is about to reject.
+#
+# The floor's other job is unchanged, and is why it has always named a real release
+# rather than the first one with the surface: 0.3.11 has neither
+# `little_sister.transport` nor `little_sister.fetch`, and this package imports both
+# (ADR-0002's Update). An *added* name is the mismatch an epoch cannot catch, because
+# it says what was removed and nothing about what arrived.
 #
 # The older history is kept because it explains why the previous number was not the
 # obvious one. 0.3.0 is where the check-authoring surface was first promised, but it
 # was tagged and never uploaded, so it names no version a resolver can fetch; 0.3.11 is
 # what lowered the library's own Python floor to the 3.11 promised above.
 #
-# **Until 0.3.12 is uploaded, this floor resolves from nowhere.** The two releases go
+# **Until 0.3.13 is uploaded, this floor resolves from nowhere.** The releases go
 # out together, library first. Until that upload a local checkout needs the redirect
 # further down — and `uv.lock` cannot be regenerated honestly, because the only
 # resolution available names a path. See `### Requires` in the CHANGELOG.
 dependencies = [
-    "little-sister>=0.3.12",
+    "little-sister>=0.3.13",
 ]
 
 # public-urls:begin

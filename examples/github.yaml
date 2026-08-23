@@ -172,13 +172,12 @@ issues:
   ignore: []              # repositories exempt from the issues check
 
 # --- Display text (optional) ---------------------------------------------------
-# The type ships a title and an `about` per aspect, with `{owner}` (also spelled
-# `{org}`) and `{team}` expanded from the keys above — so this block is only for
-# what is true of *this* installation. The security aspects' link to the
-# organization security overview is a token too (`{advisories_link}`,
-# `{code_scanning_link}`, `{secret_scanning_link}`) and expands to **nothing** on a
-# personal account, which has no such page. Your text replaces the shipped one, or extends it where you write
-# `{default}`:
+# The type ships a title and an `about` per aspect, with `{owner}` and `{team}`
+# expanded from the keys above — so this block is only for what is true of *this*
+# installation. The security aspects' link to the organization security overview is
+# a token too (`{advisories_link}`, `{code_scanning_link}`, `{secret_scanning_link}`)
+# and expands to **nothing** on a personal account, which has no such page. Your
+# text replaces the shipped one, or extends it where you write `{default}`:
 #
 # subnodes:
 #   security_advisories:

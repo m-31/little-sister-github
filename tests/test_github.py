@@ -173,6 +173,16 @@ class FakeClient:
         return self._rate
 
 
+def _about(check, aspect):
+    """One aspect's resolved `about` — what the engine will write onto its node.
+
+    The labels are declared by this type and resolved by little-sister at
+    construction (its ADR-0025), so this reads the check
+    rather than a result: a result carries no label for a name that was
+    declared."""
+    return check.subnode_labels[aspect]["about"]
+
+
 def _check(**over):
     cfg = {"path": "/github", "owner": "example-org", "kind": "organization",
            "team": "platform",
@@ -506,18 +516,19 @@ def test_the_retired_org_token_is_refused_rather_than_rendered():
             tmp_path_stub())
     assert "{org}" in str(caught.value)
     assert "{owner}" in str(caught.value)
-    # and the same text with the new token is accepted
+    # and the same text with the new token is accepted — the block itself is
+    # little-sister's to read now, so nothing comes back here but the absence of
+    # a refusal (little-sister ADR-0025).
     extra = GitHubCheck._extra_from_config(
         {"owner": "example-org", "kind": "organization", "secrets": {"token": "env://GITHUB_TOKEN"},
          "subnodes": {"issues": {"about": "Filed under {owner}."}}},
         tmp_path_stub())
-    assert extra["subnodes"]["issues"]["about"] == "Filed under {owner}."
+    assert "subnodes" not in extra
 
 
 def test_owner_expands_in_the_aspect_text():
-    about = _check(subnodes={"issues": {"about": "Owned by {owner}."}})._meta(
-        "issues")[1]
-    assert about == "Owned by example-org."
+    check = _check(subnode_labels={"issues": {"about": "Owned by {owner}."}})
+    assert check.subnode_labels["issues"]["about"] == "Owned by example-org."
 
 
 # --- switching an aspect off -------------------------------------------------
@@ -1360,8 +1371,10 @@ def test_every_aspect_this_check_reports_is_a_usable_subnodes_key():
     """The other half of a refusal: nothing that should work may stop working. The
     roster is closed, which is what makes refusing safe — so the roster is what the
     test iterates, not a list written out beside it."""
-    extra = _with_subnodes(**dict.fromkeys(GitHubCheck.ASPECTS, 1))
-    assert sorted(extra["subnodes"]) == sorted(GitHubCheck.ASPECTS)
+    _with_subnodes(**dict.fromkeys(GitHubCheck.ASPECTS, 1))   # refuses nothing
+    # …and every one of them is a name this type declares text for, so a config
+    # writing `{default}` against any aspect has something to extend.
+    assert sorted(_check().subnode_labels) == sorted(GitHubCheck.ASPECTS)
 
 
 def test_a_switched_off_aspect_may_still_carry_its_text():
@@ -1374,7 +1387,11 @@ def test_a_switched_off_aspect_may_still_carry_its_text():
          "subnodes": {"issues": {"about": "ours"}}},
         tmp_path_stub())
     assert extra["disabled_aspects"] == ("issues",)
-    assert extra["subnodes"]["issues"]["about"] == "ours"
+    # …and the text still resolves for that aspect: what is switched off is the
+    # reading, not the paragraph.
+    check = _check(disabled_aspects=("issues",),
+                   subnode_labels={"issues": {"about": "ours"}})
+    assert check.subnode_labels["issues"]["about"] == "ours"
 
 
 def test_every_band_wears_the_colour_its_severity_is_named_with(monkeypatch):
@@ -1824,53 +1841,53 @@ def test_issues_other_error_is_surfaced_as_a_note():
     assert "could not read" in result.reason_texts[0]
 
 
-def test_issues_leaf_carries_its_built_in_text():
+def test_issues_leaf_declares_its_built_in_text():
     check = _check()
     fake = FakeClient([_repo("platform-a")])
     result = check._issues(fake, check._discover(fake))
     assert result.name == "issues"
-    assert result.title == SUBNODES["issues"]["title"]
+    # Declared, not stamped: the label is resolved once at construction and the
+    # engine writes it per aspect name (little-sister ADR-0025, 2026-08-19
+    # update), so the result hands back none of its own.
+    assert check.subnode_labels["issues"]["title"] == SUBNODES["issues"]["title"]
+    assert (result.title, result.about) == ("", "")
 
 
 # --- subnode metadata (title / about) ----------------------------------------
 
-def test_aspect_carries_expanded_title_and_about():
-    # the check provides each aspect's label from its own `subnodes:` config,
-    # expanding {owner} / {team} (little-sister ADR-0025).
-    check = _check(subnodes={
+def test_a_configured_aspect_text_has_its_tokens_expanded():
+    # a deployment's own text goes through the same token expansion as the
+    # shipped one — the library's, over the map this type declares
+    # (little-sister ADR-0025).
+    check = _check(subnode_labels={
         "security_advisories": {
             "title": "Dependabot advisories",
             "about": "See https://github.com/orgs/{owner}/security/alerts/dependabot"
                      "?q=is:open+team:{team}.",
         }})
-    fake = FakeClient([_repo("platform-a")],
-                      data={("example-org/platform-a", "dependabot"): []})
-    result = check._security_advisories(fake, check._discover(fake))
-    assert result.title == "Dependabot advisories"
-    assert "orgs/example-org/" in result.about                     # {owner}
-    assert "team:platform" in result.about                        # {team}
+    labels = check.subnode_labels["security_advisories"]
+    assert labels["title"] == "Dependabot advisories"
+    assert "orgs/example-org/" in labels["about"]                   # {owner}
+    assert "team:platform" in labels["about"]                       # {team}
 
 
 def test_aspect_without_config_uses_the_built_in_text():
     """The type ships the labels, so a per-team config carries none of this prose."""
-    check = _check()   # no subnodes configured
-    fake = FakeClient([_repo("platform-a")],
-                      data={("example-org/platform-a", "pulls"): []})
-    result = check._pull_requests(fake, check._discover(fake))
-    assert result.title == SUBNODES["pull_requests"]["title"]
-    assert "Open pull requests" in result.about
-    assert "repositories in scope" in result.about
-    assert "{" not in result.about                  # no token left behind
+    labels = _check().subnode_labels["pull_requests"]   # no subnodes configured
+    assert labels["title"] == SUBNODES["pull_requests"]["title"]
+    assert "Open pull requests" in labels["about"]
+    assert "repositories in scope" in labels["about"]
+    assert "{" not in labels["about"]               # no token left behind
 
 
 def test_built_in_text_leaves_no_token_behind():
     """Whatever the config, every `{token}` in the shipped text resolves."""
-    assert "{" not in _check()._meta("pull_requests")[1]
-    assert "{" not in _check(team="payments")._meta("pull_requests")[1]
-    assert "{" not in _check()._meta("security_advisories")[1]
+    assert "{" not in _about(_check(), "pull_requests")
+    assert "{" not in _about(_check(team="payments"), "pull_requests")
+    assert "{" not in _about(_check(), "security_advisories")
     # the token that does differ per team is in the security aspects' links
-    assert "team%3Apayments" in _check(team="payments")._meta(
-        "security_advisories")[1]
+    assert "team%3Apayments" in _about(_check(team="payments"),
+                                       "security_advisories")
 
 
 def test_the_security_overview_link_is_dropped_for_a_user_account():
@@ -1878,15 +1895,13 @@ def test_the_security_overview_link_is_dropped_for_a_user_account():
     personal account, so the aspect ships without a link rather than with a dead
     one. The org form is the "before" that proves the user form changed."""
     org = _check(team="", name_prefix="")
-    org._discover(FakeClient([]))
     assert "github.com/orgs/example-org/security/alerts/dependabot" in (
-        org._meta("security_advisories")[1])
+        _about(org, "security_advisories"))
 
     user = _check(owner="m-31", kind="user", team="", name_prefix="")
-    user._discover(FakeClient([], owner_type="User", auth_login="m-31"))
     for aspect in ("security_advisories", "code_scanning_security",
                    "secret_scanning_alerts"):
-        about = user._meta(aspect)[1]
+        about = _about(user, aspect)
         assert "github.com/orgs/" not in about
         assert "{" not in about            # and no unexpanded token in its place
 
@@ -1894,31 +1909,26 @@ def test_the_security_overview_link_is_dropped_for_a_user_account():
 def test_the_security_overview_link_omits_an_absent_team():
     """`team:` with an empty value is a filter that matches nothing, not an absent
     filter — so a check with no team must not write the clause at all."""
-    with_team = _check(team="platform")._meta("code_scanning_security")[1]
-    without_team = _check(team="")._meta("code_scanning_security")[1]
+    with_team = _about(_check(team="platform"), "code_scanning_security")
+    without_team = _about(_check(team=""), "code_scanning_security")
     assert "team%3Aplatform" in with_team
     assert "team" not in without_team.split("security/alerts/")[1].split(")")[0]
 
 
 def test_config_replaces_the_built_in_text():
-    check = _check(subnodes={"sbom_check": {"title": "SBOMs",
-                                            "about": "Tracked in the catalog."}})
-    fake = FakeClient([_repo("platform-a")],
-                      sboms={"example-org/platform-a": _SBOM_PRESENT})
-    result = check._sbom_check(fake, check._discover(fake))
-    assert result.title == "SBOMs"
-    assert result.about == "Tracked in the catalog."
+    check = _check(subnode_labels={"sbom_check": {
+        "title": "SBOMs", "about": "Tracked in the catalog."}})
+    assert check.subnode_labels["sbom_check"] == {
+        "title": "SBOMs", "about": "Tracked in the catalog."}
 
 
 def test_config_extends_the_built_in_text_with_the_default_token():
-    check = _check(subnodes={"sbom_check": {
+    check = _check(subnode_labels={"sbom_check": {
         "about": "{default}\n\nAsk {team} before adding an exemption."}})
-    fake = FakeClient([_repo("platform-a")],
-                      sboms={"example-org/platform-a": _SBOM_PRESENT})
-    result = check._sbom_check(fake, check._discover(fake))
-    assert "dependency graph (SBOM)" in result.about          # the built-in text
-    assert result.about.endswith("Ask platform before adding an exemption.")
-    assert result.title == SUBNODES["sbom_check"]["title"]    # title still default
+    labels = check.subnode_labels["sbom_check"]
+    assert "dependency graph (SBOM)" in labels["about"]       # the built-in text
+    assert labels["about"].endswith("Ask platform before adding an exemption.")
+    assert labels["title"] == SUBNODES["sbom_check"]["title"]  # title still default
 
 
 def test_config_loads_subnodes_via_loader(tmp_path):
@@ -1939,7 +1949,7 @@ def test_config_loads_subnodes_via_loader(tmp_path):
     )
     checks = load_checks(str(tmp_path))
     assert isinstance(checks[0], GitHubCheck)
-    assert checks[0].subnodes["actions"] == {
+    assert checks[0].subnode_labels["actions"] == {
         "title": "Workflow runs", "about": "Latest run per workflow."}
 
 
@@ -2059,8 +2069,7 @@ def test_the_about_text_carries_the_grading_in_force_not_the_key():
     """The knob's *name* is no use to a reader on a dashboard — the value lives in
     this package's source, which is exactly where they cannot look. So the shipped
     text states the mapping the check is actually using."""
-    check = _check()
-    about = check._meta("security_advisories")[1]
+    about = _about(_check(), "security_advisories")
     assert "graded **ERROR** for every band" in about
     assert "severity_map" not in about          # the key, withheld on purpose
 
@@ -2068,16 +2077,15 @@ def test_the_about_text_carries_the_grading_in_force_not_the_key():
 def test_a_deployments_own_map_is_what_its_about_text_shows():
     """The reason it is a token and not a sentence: an override has to reach the
     text, or the package would be publishing somebody else's grading as theirs."""
-    check = _check(advisory_severity_map={"critical": StatusCode.WARN})
-    about = check._meta("security_advisories")[1]
+    about = _about(_check(advisory_severity_map={"critical": StatusCode.WARN}),
+                   "security_advisories")
     assert "`critical` → **WARN**" in about
 
 
 def test_one_answer_for_every_band_is_said_once():
     """Eight identical arrows are a wall a reader skips, and skipping is how the
     setting stays invisible — which is the complaint this text answers."""
-    check = _check()
-    about = check._meta("code_scanning_security")[1]
+    about = _about(_check(), "code_scanning_security")
     assert "**ERROR** for every band" in about
     assert "`note` → " not in about
 
@@ -2118,14 +2126,18 @@ def test_a_run_that_did_not_pause_says_nothing():
 
 def test_the_pull_request_leaf_keeps_its_own_title():
     """The leaf's label is `Pull requests`, not the subject of the last PR read —
-    the loop used to rebind the name holding it."""
+    the loop used to rebind the name holding it. It is a declaration now, which is
+    a shape that cannot be rebound by a loop at all; the result carries no label,
+    and the aspect it names is what the declaration is keyed on."""
     check = _check()
     fake = FakeClient(
         [_repo("platform-a")],
         data={("example-org/platform-a", "pulls"): [
             {"title": "Fix bug", "number": 1, "html_url": "https://gh/pr/1"}]})
     result = check._pull_requests(fake, check._discover(fake))
-    assert result.title == "Pull requests"
+    assert result.name == "pull_requests"
+    assert result.title == ""
+    assert check.subnode_labels["pull_requests"]["title"] == "Pull requests"
 
 
 def test_issue_lines_are_keyed_by_repo_and_issue_number():

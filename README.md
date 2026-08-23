@@ -17,7 +17,7 @@ aspect keeps reporting.
 
 ## The contract
 
-- **Requires** `little-sister >= 0.3.12` — a floor, never a pin.
+- **Requires** `little-sister >= 0.3.13` — a floor, never a pin.
 - **Runs on** Python **3.11 or newer** — the library's floor, not a higher
   one of its own.
 - **Registers** two check types: **`github`** and **`github-rate-limit`**. One
@@ -31,7 +31,7 @@ aspect keeps reporting.
 # Pin them. A deployment names exact versions so an upgrade is a deliberate edit
 # rather than drift; a plugin is the one that declares a floor, because two plugins
 # that each pinned could not be installed together.
-dependencies = ["little-sister==0.3.12", "little-sister-github==0.1.0"]
+dependencies = ["little-sister==0.3.13", "little-sister-github==0.1.0"]
 ```
 
 ```python
@@ -129,7 +129,8 @@ decisions 5 and 7).
 The per-aspect display text ships **with the type** and expands `{owner}` /
 `{team}` from the config, so it is not copied per team. Your deployment's own policy — a
 remediation deadline, who to notify — goes in that config's `subnodes:` block,
-appended to the shipped text with `{default}`.
+appended to the shipped text with `{default}`. little-sister reads that block itself,
+so it works the same way for every branch check type you install.
 
 ## What it reads
 
