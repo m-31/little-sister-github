@@ -39,7 +39,13 @@ from little_sister.checks import (
 from little_sister.reasons import slug
 from little_sister.status import StatusCode
 
-from little_sister_github.github import GITHUB_API, GitHubClient, GitHubError
+from little_sister_github.github import (
+    GITHUB_API,
+    GitHubClient,
+    GitHubError,
+    _resets_in,
+    budget_said,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -128,15 +134,6 @@ class Budget:
         if remaining < self.warn_below:
             return StatusCode.WARN
         return StatusCode.OK
-
-
-def _resets_in(reset_epoch: int, now: float) -> str:
-    """How long this window has left, in the words the source dashboard used."""
-    seconds = reset_epoch - now
-    if seconds <= 0:
-        return "resetting now"
-    minutes = int(seconds // 60)
-    return f"resets in {minutes}min" if minutes else "resets in under a minute"
 
 
 @register("github-rate-limit")
@@ -341,8 +338,17 @@ class GitHubRateLimitCheck(Check):
                     code=StatusCode.WARN))
                 continue
             entries.append(self._entry(budget, row, now))
-        logger.info("%s: %s", self.path,
-                    "; ".join(entry.text for entry in entries))
+        # The reading, and then the **same response's** own budget headers. This
+        # check reads a bucket GitHub looked up by identity; the headers say which
+        # bucket it charged for that very lookup and what is left of *that* one.
+        # They normally restate each other, which is why the second half is in the
+        # log and not on the node: it is worth nothing until it disagrees, and then
+        # it is worth everything, because a node reporting a full budget while the
+        # `github` check beside it spends hundreds of calls an hour is otherwise a
+        # contradiction with no third number to settle it.
+        logger.info("%s: %s | that response's own headers: %s", self.path,
+                    "; ".join(entry.text for entry in entries),
+                    budget_said(client.last_rate_limit, now))
         # No `code`: every line carries its own, so the node's is the worst of
         # them (little-sister ADR-0042). Declaring both is refused.
         return CheckResult(reason=tuple(entries), entries=True)

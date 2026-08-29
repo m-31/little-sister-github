@@ -18,6 +18,7 @@ from little_sister_github import github as mod_github
 from little_sister_github.github import (
     BAND_GLYPHS,
     DEFAULT_REQUEST_TIMEOUT,
+    NO_BUDGET_HEADERS,
     RETRY_BACKOFF_SECONDS,
     SECURITY_SEVERITY_ORDER,
     SUBNODES,
@@ -25,12 +26,19 @@ from little_sister_github.github import (
     GitHubCheck,
     GitHubClient,
     GitHubError,
+    RateLimitHeaders,
     Repo,
     _throttle_wait,
+    budget_said,
 )
 
 _SBOM_PRESENT = {"sbom": {"relationships": [{"spdxElementId": "root"}]}}
 _SBOM_EMPTY = {"sbom": {"relationships": []}}
+
+#: `FakeClient(last_rate_limit=...)` left unset — the headers agree with whatever
+#: that double's `rate_limit()` answers. A sentinel and not `None`, because `None`
+#: is a **reading** here (GitHub sent no budget headers) and a test asks for it.
+_AGREEING = object()
 
 
 # Every fixture failure names its fault, because `GitHubError` requires one: the
@@ -73,7 +81,7 @@ class FakeClient:
                  workflows=None, rate=(5000, 5000, 0),
                  owner_type="Organization", auth_login=None,
                  private_repos=None, paused_seconds=0.0, read_seconds=0.0,
-                 slowest_read=0.0, slowest_path=""):
+                 slowest_read=0.0, slowest_path="", last_rate_limit=_AGREEING):
         self._repos = repos
         # The real client counts what it slept on a throttle and the check reads it
         # for the node's sentence — so the double carries it too, and a test that
@@ -98,6 +106,15 @@ class FakeClient:
         self._runs = runs or {}
         self._workflows = workflows or {}
         self._rate = rate
+        # What GitHub last said on a response's own headers. The default is
+        # `_AGREEING`: the headers restating what `rate_limit()` answers is the
+        # ordinary case, and a double whose two answers contradicted each other by
+        # default would put a disagreement into every trace line in the suite. The
+        # tests about a disagreement pass their own.
+        self.last_rate_limit = (
+            RateLimitHeaders(resource="core", limit=rate[0], remaining=rate[1],
+                             used=rate[0] - rate[1], reset=rate[2])
+            if last_rate_limit is _AGREEING else last_rate_limit)
         self.calls: list[str] = []
         self.get_calls: list[tuple[str, dict]] = []
         self.paginated_calls: list[str] = []
@@ -2761,17 +2778,20 @@ def test_the_run_states_the_budgets_it_is_about_to_spend(caplog):
 
 
 def test_every_aspect_says_what_it_cost_and_what_was_left(caplog):
-    """One line per aspect, and the four numbers a starving run is diagnosed from:
-    which aspect, how long it took, how many requests that was, and the budget
-    afterwards. `code_scanning_quality` costs **zero** reads, which is the
-    single-payload claim the CHANGELOG makes for the code-scanning split and which
-    nothing else in a running deployment shows."""
+    """One line per aspect, and the numbers a starving run is diagnosed from: which
+    aspect, how long it took, how many requests that was, the budget afterwards —
+    and what GitHub itself says those requests cost, which is the only one of them
+    this side did not count. `code_scanning_quality` costs **zero** reads, which is
+    the single-payload claim the CHANGELOG makes for the code-scanning split and
+    which nothing else in a running deployment shows."""
     check = _check()
     _result, lines = _traced_run(caplog, check, FakeClient(_two_repos()))
     assert ("/github: aspect 3/8 code_scanning_security took 0.0s in 2 read(s) "
-            "— 30s of the run left") in lines
+            "— 30s of the run left; GitHub says core: 5000 of 5000 left, 0 used"
+            ) in lines
     assert ("/github: aspect 6/8 code_scanning_quality took 0.0s in 0 read(s) "
-            "— 30s of the run left") in lines
+            "— 30s of the run left; GitHub says core: 5000 of 5000 left, 0 used"
+            ) in lines
     assert len([line for line in lines if ": aspect " in line]) == 8
 
 
@@ -2802,9 +2822,9 @@ def test_an_aspect_line_times_the_aspect_and_not_the_run(caplog):
     check._new_deadline = lambda: Deadline(60.0, clock=clock)
     _result, lines = _traced_run(caplog, check, FakeClient(_two_repos()))
     assert (f"/github: aspect 1/8 {first} took 5.0s in 2 read(s) — 55s of the "
-            f"run left") in lines
+            f"run left; GitHub says core: 5000 of 5000 left, 0 used") in lines
     assert (f"/github: aspect 2/8 {second} took 7.0s in 2 read(s) — 48s of the "
-            f"run left") in lines
+            f"run left; GitHub says core: 5000 of 5000 left, 0 used") in lines
 
 
 def test_the_cut_short_log_names_the_aspect_and_the_starving_tail(caplog):
@@ -2926,6 +2946,35 @@ def test_the_rate_limit_headroom_is_logged_even_when_it_does_not_stop_the_run(
     _result, lines = _traced_run(caplog, check,
                                  FakeClient(_two_repos(), rate=(5000, 900, 0)))
     assert "/github: 900 API calls left, this run needs 4×14 = 56" in lines
+
+
+def test_the_body_and_that_same_responses_headers_are_logged_side_by_side(caplog):
+    """The two answers to one question, from one response, on consecutive lines.
+    Fixed apart on purpose: the body says 5000 left and the headers on the very
+    response that carried it say 4841 of 5000 with 159 used. That is the shape of
+    the observation this line was added for — an identity whose reads are charged
+    to a bucket `/rate_limit` does not report — and a run's trace has to be able to
+    state it rather than leave a reader comparing two logs an hour apart."""
+    disagreeing = RateLimitHeaders(resource="core", limit=5000, remaining=4841,
+                                   used=159, reset=0)
+    fake = FakeClient(_two_repos(), rate=(5000, 5000, 0),
+                      last_rate_limit=disagreeing)
+    _result, lines = _traced_run(caplog, _check(), fake)
+    assert "/github: 5000 API calls left, this run needs 4×14 = 56" in lines
+    assert ("/github: the same response's own headers say core: 4841 of 5000 "
+            "left, 159 used") in lines
+
+
+def test_a_run_told_no_budget_at_all_says_that_rather_than_reading_a_zero(caplog):
+    """`None` is *GitHub said nothing about the budget* — a proxy that strips the
+    headers, or an Enterprise Server that never sends them. The trace says so in
+    words. Rendered as numbers it would read `0 of 0 left`, which is the alarm this
+    check exists to raise and would be raising about our own network path."""
+    fake = FakeClient(_two_repos(), last_rate_limit=None)
+    _result, lines = _traced_run(caplog, _check(), fake)
+    assert f"/github: the same response's own headers say {NO_BUDGET_HEADERS}" \
+        in lines
+    assert not [line for line in lines if "0 of 0" in line]
 
 
 def test_discovery_is_on_the_trace_because_it_spends_the_same_budget(caplog):
@@ -3288,6 +3337,83 @@ def test_a_403_with_budget_left_is_a_permission_answer_and_not_a_throttle():
             build(retries=0).get("/x")
     assert caught.value.fault is Fault.ANSWERED
     assert caught.value.retry_after is None
+
+
+def test_every_answer_leaves_its_budget_headers_on_the_client():
+    """GitHub puts them on **every** response, and the client keeps the last one:
+    what the reads of this run are actually being charged to, which no amount of
+    reading `/rate_limit` can establish for an identity where the two disagree.
+    `x-ratelimit-resource` is the half a body cannot supply — it *names* the bucket
+    — so it is asserted here rather than the numbers alone."""
+    answer = _Answer(body=b"{}", headers={"x-ratelimit-limit": "5000",
+                                          "x-ratelimit-remaining": "4841",
+                                          "x-ratelimit-used": "159",
+                                          "x-ratelimit-reset": "1700000060",
+                                          "x-ratelimit-resource": "core"})
+    with _through(answer) as (build, _opener):
+        client = build()
+        client.get("/x")
+    assert client.last_rate_limit == RateLimitHeaders(
+        resource="core", limit=5000, remaining=4841, used=159,
+        reset=1_700_000_060)
+    assert client.last_rate_limit.text(1_700_000_060 - 2280) == (
+        "core: 4841 of 5000 left, 159 used, resets in 38min")
+
+
+def test_a_refusal_carries_the_budget_too_and_is_kept():
+    """Read **before** the status, because the refusal is the response whose budget
+    a reader wants most: a throttled 403 says whether the run stopped because the
+    budget was gone or for some other reason. Recorded after the status check, this
+    would be the one response whose headers were thrown away."""
+    exhausted = _http_error(403, b'{"message":"API rate limit exceeded"}',
+                            {"x-ratelimit-remaining": "0",
+                             "x-ratelimit-reset": "1700000060",
+                             "x-ratelimit-resource": "core"})
+    with _through(exhausted) as (build, _opener):
+        client = build(retries=0)
+        with pytest.raises(GitHubError):
+            client.get("/x")
+    assert client.last_rate_limit is not None
+    assert client.last_rate_limit.remaining == 0
+    assert client.last_rate_limit.resource == "core"
+
+
+def test_a_response_with_no_budget_headers_is_absent_and_not_a_zero():
+    """The distinction the whole type turns on: *GitHub did not say* is `None`, and
+    every field being `None` is different from every field being `0`. A zero here
+    would be an exhausted budget, which is the loudest thing this package can say
+    and would be said about a header nobody sent."""
+    with _through(_Answer(body=b"{}")) as (build, _opener):
+        client = build()
+        client.get("/x")
+    assert client.last_rate_limit is None
+    assert budget_said(None) == NO_BUDGET_HEADERS
+
+
+def test_a_header_that_is_not_a_number_is_absent_rather_than_guessed():
+    """An unreadable value is the same finding as a missing one and takes the same
+    answer. The resource still stands on its own: a bucket GitHub named is worth
+    logging even when every number beside it is unreadable."""
+    odd = _Answer(body=b"{}", headers={"x-ratelimit-remaining": "many",
+                                       "x-ratelimit-resource": "graphql"})
+    with _through(odd) as (build, _opener):
+        client = build()
+        client.get("/x")
+    assert client.last_rate_limit == RateLimitHeaders(resource="graphql")
+    assert client.last_rate_limit.text() == "graphql: no numbers stated"
+
+
+def test_a_partial_reading_leaves_the_parts_it_does_not_have_out():
+    """Absent parts are omitted, not rendered as zeros or as "unknown": this clause
+    is read beside the budget check's own line, and a number that is not there must
+    not look like a number that is. A reset of `0` is the same case — the epoch is
+    not a time GitHub ever means — and takes the same silence the node's own line
+    gives it."""
+    assert RateLimitHeaders(resource="core", remaining=4841).text() == (
+        "core: 4841 left")
+    assert RateLimitHeaders(resource="core", limit=5000, used=159,
+                            reset=0).text() == "core: limit 5000, 159 used"
+    assert RateLimitHeaders(remaining=1, limit=2).text() == "budget: 1 of 2 left"
 
 
 def test_a_bare_429_is_a_throttle_because_that_is_all_github_sends_it_for():

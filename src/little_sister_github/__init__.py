@@ -17,6 +17,8 @@ surface below — the upgrade an install-time floor cannot see, because a floor 
 no ceiling (little-sister ADR-0051). Without it the same mismatch would surface as
 an ``ImportError`` from inside this package, which reads like our bug.
 """
+from importlib.metadata import PackageNotFoundError, version
+
 from little_sister.checks import require_api
 
 require_api(2)
@@ -26,6 +28,9 @@ from little_sister_github import (  # noqa: E402  both register their type
     rate_limit,
 )
 
-__version__ = "0.1.0"
+try:
+    __version__ = version("little-sister-github")
+except PackageNotFoundError:  # running from a source tree with no install
+    __version__ = "0+unknown"
 
 __all__ = ["github", "rate_limit"]

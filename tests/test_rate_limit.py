@@ -6,6 +6,7 @@ rather than from the branch that implements it.
 """
 from __future__ import annotations
 
+import logging
 import re
 
 import pytest
@@ -13,7 +14,11 @@ from little_sister.checks import CHECK_TYPES, CheckError
 from little_sister.status import StatusCode
 from little_sister.transport import Fault
 
-from little_sister_github.github import GitHubError
+from little_sister_github.github import (
+    NO_BUDGET_HEADERS,
+    GitHubError,
+    RateLimitHeaders,
+)
 from little_sister_github.rate_limit import (
     DEFAULT_ERROR_BELOW,
     DEFAULT_RESOURCES,
@@ -25,6 +30,13 @@ from little_sister_github.rate_limit import (
 #: Far enough ahead that `_resets_in` renders whole minutes on any test machine.
 _RESET = 4_000_000_000
 _ONE_HOUR = 3600
+_LOGGER = "little_sister_github.rate_limit"
+
+
+def _logged(caplog):
+    """Every message this check logged, formatted as it would be written."""
+    return [record.getMessage() for record in caplog.records
+            if record.name == _LOGGER]
 
 
 class FakeClient:
@@ -34,9 +46,14 @@ class FakeClient:
     "could not ask" path is exercised without a network.
     """
 
-    def __init__(self, payload):
+    def __init__(self, payload, last_rate_limit=None):
         self._payload = payload
         self.calls: list[str] = []
+        # What the real client keeps from the answering response's own headers.
+        # `None` — *GitHub sent no budget headers* — is this double's default
+        # because these fixtures are payloads and nothing else; the test about the
+        # two answers gives it a reading of its own.
+        self.last_rate_limit = last_rate_limit
 
     def get(self, path, params=None):
         self.calls.append(path)
@@ -66,8 +83,8 @@ def _check(**over):
     return GitHubRateLimitCheck(**cfg)
 
 
-def _run(check, payload):
-    fake = FakeClient(payload)
+def _run(check, payload, last_rate_limit=None):
+    fake = FakeClient(payload, last_rate_limit)
     check._make_client = lambda token: fake        # type: ignore[method-assign]
     return check.run(), fake
 
@@ -279,6 +296,33 @@ def test_a_payload_without_a_resources_object_is_an_error_not_an_empty_reading()
         result, _ = _run(_check(), payload)
         assert result.stored_code is StatusCode.ERROR
         assert "without a 'resources' object" in result.reason_entries[0].text
+
+
+def test_the_reading_and_that_same_responses_headers_go_in_one_line(caplog):
+    """The node reports the bucket GitHub looked up by identity; the headers on the
+    very response that carried it report the bucket that lookup was **charged** to.
+    Held apart here — a body saying the budget is untouched beside headers saying
+    159 of it is gone — because that is the case the line exists for: the node
+    reads green while the `github` check next to it spends hundreds of calls an
+    hour, and without both numbers in one place there is no third fact to settle
+    which of them is about the budget being spent."""
+    caplog.set_level(logging.INFO, logger=_LOGGER)
+    _run(_check(), _resources(core=(5000, 5000), graphql=(5000, 5000)),
+         RateLimitHeaders(resource="core", limit=5000, remaining=4841, used=159))
+    line = _logged(caplog)[-1]
+    assert "core: 5000 of 5000 requests left" in line
+    assert ("| that response's own headers: core: 4841 of 5000 left, 159 used"
+            in line)
+
+
+def test_a_response_that_stated_no_budget_headers_says_so_in_the_line(caplog):
+    """The absent case is worded, not blank. A line that simply stopped after the
+    reading would be read as *the two agreed*, which is the one thing it does not
+    say."""
+    caplog.set_level(logging.INFO, logger=_LOGGER)
+    _run(_check(), _resources(core=(5000, 4000), graphql=(5000, 4000)))
+    assert _logged(caplog)[-1].endswith(
+        f"| that response's own headers: {NO_BUDGET_HEADERS}")
 
 
 def test_the_check_spends_nothing_but_the_one_call():

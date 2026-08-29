@@ -1,6 +1,6 @@
 [project]
 name = "little-sister-github"
-version = "0.1.2"
+version = "0.1.3"
 description = "GitHub check types for little-sister: repository overview, and API rate limit."
 authors = [
     { name = "Michael Meyling" }

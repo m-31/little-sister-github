@@ -801,6 +801,118 @@ def _seconds_until_reset(response: Response, *,
     return max(0.0, when - (now or time.time)())
 
 
+def _resets_in(reset_epoch: int, now: float) -> str:
+    """How long this window has left, in the words the source dashboard used.
+
+    Lives here rather than beside the check that renders it because both check
+    types say this sentence now — the budget check about the window it polled, and
+    the client below about the window GitHub named on a response it had in its
+    hand. One formatter, so the two lines a reader is comparing cannot drift into
+    two vocabularies for the same minute.
+    """
+    seconds = reset_epoch - now
+    if seconds <= 0:
+        return "resetting now"
+    minutes = int(seconds // 60)
+    return f"resets in {minutes}min" if minutes else "resets in under a minute"
+
+
+def _header_int(response: Response, name: str) -> int | None:
+    """One integer budget header, or ``None`` when it is absent or unreadable.
+
+    ``None`` and not ``0``: *GitHub did not say* and *nothing left* are opposite
+    readings, and the zero would be the alarming one.
+    """
+    value = response.headers.get(name)
+    if not isinstance(value, str):
+        return None
+    try:
+        return int(value.strip())
+    except ValueError:
+        return None
+
+
+@dataclass(frozen=True)
+class RateLimitHeaders:
+    """What GitHub said about the budget **on one response**.
+
+    Every REST answer carries these, so a run making a hundred reads is told a
+    hundred times what its own requests cost — and this package read them only when
+    deciding whether a refusal was a throttle (:func:`_throttle_wait`), throwing the
+    rest away. The ``/rate_limit`` endpoint was then the only budget anything here
+    could see, and it answers a **different question**: the body reports a bucket
+    looked up by identity, these headers report the bucket *the request in your hand*
+    was charged to. Where an identity makes those two disagree, the endpoint reads a
+    pristine budget while every response says otherwise, and nothing in a log can
+    show it — which is the observation this class exists to make loggable.
+
+    ``resource`` is the half no body can supply: ``x-ratelimit-resource`` **names**
+    the bucket GitHub charged — ``core``, ``graphql``, ``search`` — so a read landing
+    somewhere nobody expected says so itself.
+
+    Every field is optional because every header is: an Enterprise Server
+    installation, or anything sitting between us and the API, may send none of them.
+    """
+
+    resource: str = ""
+    limit: int | None = None
+    remaining: int | None = None
+    used: int | None = None
+    reset: int | None = None
+
+    @classmethod
+    def from_response(cls, response: Response) -> RateLimitHeaders | None:
+        """This response's budget headers, or ``None`` when it carried none.
+
+        ``None`` for *nothing was stated* rather than an instance of five absent
+        fields, so the one caller that matters — the log line — can say **GitHub
+        sent no budget headers**, which is itself a finding: a proxy that strips
+        them reads exactly like a run that spends nothing.
+        """
+        numbers = {name: _header_int(response, f"x-ratelimit-{name}")
+                   for name in ("limit", "remaining", "used", "reset")}
+        stated = response.headers.get("x-ratelimit-resource")
+        resource = stated.strip() if isinstance(stated, str) else ""
+        if not resource and all(value is None for value in numbers.values()):
+            return None
+        return cls(resource=resource, **numbers)
+
+    def text(self, now: float | None = None) -> str:
+        """This reading as one clause, in the budget check's own vocabulary.
+
+        Absent parts are **left out** rather than rendered as zeros or as "unknown":
+        the line is read beside the budget check's, and a number that is not there
+        must not look like a number that is.
+        """
+        parts: list[str] = []
+        if self.remaining is not None and self.limit is not None:
+            parts.append(f"{self.remaining} of {self.limit} left")
+        elif self.remaining is not None:
+            parts.append(f"{self.remaining} left")
+        elif self.limit is not None:
+            parts.append(f"limit {self.limit}")
+        if self.used is not None:
+            parts.append(f"{self.used} used")
+        if self.reset:
+            parts.append(_resets_in(self.reset,
+                                    time.time() if now is None else now))
+        return (f"{self.resource or 'budget'}: "
+                f"{', '.join(parts) or 'no numbers stated'}")
+
+
+#: What the trace says when GitHub sent no budget headers at all. A sentence and
+#: not a blank, for the reason :meth:`RateLimitHeaders.from_response` returns
+#: ``None``: a missing header is a finding about the path to GitHub, and a line
+#: that simply ended early would be read as a run that made no requests.
+NO_BUDGET_HEADERS = "no budget headers on that read"
+
+
+def budget_said(headers: RateLimitHeaders | None,
+                now: float | None = None) -> str:
+    """One log-ready clause for the last budget GitHub stated, or its absence."""
+    return NO_BUDGET_HEADERS if headers is None else headers.text(now)
+
+
 def _next_link(link_header: str) -> str | None:
     """The ``rel="next"`` URL from a GitHub ``Link`` header, if present."""
     for part in link_header.split(","):
@@ -868,6 +980,13 @@ class GitHubClient:
         #: `ASPECT_ENDPOINT`, and it is stable across `api_url`.
         self.slowest_read = 0.0
         self.slowest_path = ""
+        #: What GitHub said the budget was on the **most recent response**, or
+        #: ``None`` when that response carried no budget headers. Overwritten by
+        #: every answer rather than accumulated: the question it exists for is
+        #: *what is GitHub charging these reads to, right now*, and a remembered
+        #: older reading would answer it with a number nothing is spending
+        #: against any more. Read by both check types for their trace lines.
+        self.last_rate_limit: RateLimitHeaders | None = None
 
     def _now(self) -> float:
         """The clock this run measures with.
@@ -926,6 +1045,12 @@ class GitHubClient:
                               status=error.status, fault=error.fault) from error
         finally:
             self._counted(url, self._now() - started)
+        # **Before** the status is read, so a refusal is recorded too — and the
+        # refusal is the one that matters most: a throttled 403 or 429 carries the
+        # numbers that say whether the budget ran out or something else did. Not in
+        # the `finally` above, where a request that never reached a status has no
+        # response to read.
+        self.last_rate_limit = RateLimitHeaders.from_response(response)
         if not 200 <= response.status < 300:
             raise self._refusal(response, url)
         try:
@@ -2256,6 +2381,15 @@ class GitHubCheck(Check):
             logger.info("%s: %d API calls left, this run needs %d×%d = %d",
                         self.path, remaining, self.rate_limit_safety_factor,
                         needed, self.rate_limit_safety_factor * needed)
+            # **The same response, read twice.** The line above is `/rate_limit`'s
+            # body; this one is the `x-ratelimit-*` headers on the very response
+            # that carried it. They are supposed to agree, and where they do not,
+            # the budget this run is about to reason about is not the budget it is
+            # spending. Nothing else in a log can show that: two readings taken
+            # apart could always be blamed on the seconds between them, and one
+            # response has no seconds between them.
+            logger.info("%s: the same response's own headers say %s", self.path,
+                        budget_said(client.last_rate_limit))
             if remaining < self.rate_limit_safety_factor * needed:
                 return CheckResult(
                     StatusCode.WARN,
@@ -2353,14 +2487,19 @@ class GitHubCheck(Check):
                                    client.reads_made - reads_before),
                                self._never_reached(roster, position))
                 break
-            # One line per aspect that finished, and the four numbers that say
-            # where a run's budget went: which aspect, how long it took, how many
-            # requests that cost, and what was left afterwards. A run that always
-            # stops at the same aspect is answered by reading this column.
+            # One line per aspect that finished, and the numbers that say where a
+            # run's budget went: which aspect, how long it took, how many requests
+            # that cost, what was left afterwards — and, last, what **GitHub** says
+            # those same requests cost. Our count and theirs on one line and in one
+            # column, once per aspect, so a budget that moves by the reads we made,
+            # moves by something else, or does not move at all is a column to read
+            # down rather than an arithmetic exercise across two logs. A run that
+            # always stops at the same aspect is answered here too.
             logger.info("%s: aspect %d/%d %s took %.1fs in %d read(s) — %.0fs of "
-                        "the run left", self.path, position, len(roster), name,
-                        deadline.elapsed() - entered,
-                        client.reads_made - reads_before, deadline.remaining())
+                        "the run left; GitHub says %s", self.path, position,
+                        len(roster), name, deadline.elapsed() - entered,
+                        client.reads_made - reads_before, deadline.remaining(),
+                        budget_said(client.last_rate_limit))
         # The run's own receipt, and the line that answers *why* it ran out: how
         # many requests it made, how much of the budget those requests were, and
         # whether one endpoint sat at the request timeout or everything was merely

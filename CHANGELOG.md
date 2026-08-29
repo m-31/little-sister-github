@@ -11,6 +11,39 @@ the code says so.
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-08-29
+
+### Added
+
+- **Both checks now log the budget GitHub states on its own responses.** Every REST
+  answer carries `x-ratelimit-remaining`, `-limit`, `-used`, `-reset` and
+  `-resource`, and this package read them only when deciding whether a refusal was a
+  throttle. They are on the trace now, at `INFO`, in three places: the `github`
+  check's per-aspect line ends with what GitHub says the run has spent, so our count
+  of reads and theirs sit in one column; its rate-limit probe logs the headers of the
+  **same response** whose body it just reported; and the `github-rate-limit` check's
+  line does the same for its own reading. Nothing on any node changes, and no
+  configuration changes.
+
+  Why you would want it: `GET /rate_limit` reports a bucket GitHub looks up by
+  identity, while the headers report the bucket *the request that just went out* was
+  charged to, and `x-ratelimit-resource` names it. Those normally restate each other.
+  Where they do not, a `github-rate-limit` node reports an untouched budget while the
+  `github` check beside it spends hundreds of calls an hour — a contradiction with no
+  third number to settle it, which is what these lines supply. A response that
+  carries no budget headers at all is logged as exactly that, since a path to GitHub
+  that strips them otherwise reads as a token that spends nothing.
+
+### Fixed
+
+- **`little_sister_github.__version__` reports the installed version again.** It was a
+  literal, frozen at `0.1.0` since the first release, so installations of 0.1.1 and
+  0.1.2 answered `0.1.0` to anything that asked — a second source of a fact
+  `pyproject.toml` already owns. It is read from the installed distribution's metadata
+  now, the way little-sister reads its own, so it cannot disagree with the package
+  that carries it; in a source tree with no install it reads `0+unknown` rather than a
+  number that would be wrong.
+
 ## [0.1.2] - 2026-08-23
 
 ### Changed
