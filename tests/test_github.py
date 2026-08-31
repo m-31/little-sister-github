@@ -1187,6 +1187,154 @@ def test_actions_workflow_state_deleted_is_excluded():
     assert result.stored_code is StatusCode.OK
 
 
+# --- actions: an unseen workflow is not a healthy workflow -------------------
+#
+# The page is one read of the newest 100 runs **across all workflows**, so a
+# workflow whose newest run falls below that cut contributes nothing at all — and
+# with `show_healthy: false` it then renders exactly as a workflow that passed.
+# These pin the sentence, not the mechanism: the leaf may not report OK about a
+# workflow it has no reading for.
+
+def test_actions_unseen_workflow_is_not_a_healthy_workflow():
+    """Two workflows exist, the page holds runs of one, and `total_count` says the
+    page is a cut. The second has no state this run, and the leaf says so and
+    grades for it instead of reporting OK with nothing to show."""
+    check = _check()
+    fake = FakeClient(
+        [_repo("platform-a")],
+        runs={"example-org/platform-a": {
+            "total_count": 240,                         # the page is a cut of 240
+            "workflow_runs": [_wf_run(name="ci", conclusion="success", wf_id=1)]}},
+        workflows={"example-org/platform-a": {"workflows": [
+            {"id": 1, "name": "ci", "state": "active"},
+            {"id": 2, "name": "deploy", "state": "active"}]}},
+    )
+    result = check._actions(fake, check._discover(fake))
+    assert result.stored_code is StatusCode.WARN
+    assert result.reason_texts == [
+        "platform-a (main) / deploy: no state this run — the 1 run read of 240 "
+        "held none of this workflow's"]
+    assert result.reason_entries[0].code is StatusCode.WARN
+    assert result.reason_entries[0].slug == _slug("platform-a", "workflow", 2,
+                                                  "unread")
+
+
+def test_actions_unseen_workflow_is_reported_beside_a_real_failure():
+    """The blind spot does not displace a finding, and a finding does not hide the
+    blind spot: the failure is still first, and the unread workflow is still said."""
+    check = _check()
+    fake = FakeClient(
+        [_repo("platform-a")],
+        runs={"example-org/platform-a": {
+            "total_count": 500,
+            "workflow_runs": [_wf_run(name="ci", conclusion="failure", wf_id=1)]}},
+        workflows={"example-org/platform-a": {"workflows": [
+            {"id": 1, "name": "ci", "state": "active"},
+            {"id": 2, "name": "deploy", "state": "active"}]}},
+    )
+    result = check._actions(fake, check._discover(fake))
+    assert result.stored_code is StatusCode.ERROR
+    assert len(result.reason_texts) == 2
+    assert "failed" in result.reason_texts[0]
+    assert "deploy: no state this run" in result.reason_texts[1]
+
+
+def test_actions_complete_window_says_nothing_about_a_workflow_that_never_ran():
+    """`total_count` equals the rows returned, so nothing was cut: a workflow with
+    no runs has none for an honest reason, and a line about it would be noise the
+    reader learns to skip."""
+    check = _check()
+    fake = FakeClient(
+        [_repo("platform-a")],
+        runs={"example-org/platform-a": {
+            "total_count": 1,                           # the page is the whole answer
+            "workflow_runs": [_wf_run(name="ci", conclusion="success", wf_id=1)]}},
+        workflows={"example-org/platform-a": {"workflows": [
+            {"id": 1, "name": "ci", "state": "active"},
+            {"id": 2, "name": "never-run", "state": "active"}]}},
+    )
+    result = check._actions(fake, check._discover(fake))
+    assert result.stored_code is StatusCode.OK
+    assert result.reason_texts == []
+
+
+def test_actions_a_deleted_workflow_is_never_reported_unread():
+    """A workflow that no longer exists has no state on purpose. It is dropped by
+    the same set that finds the unread ones, so a cut window must not resurrect it."""
+    check = _check()
+    fake = FakeClient(
+        [_repo("platform-a")],
+        runs={"example-org/platform-a": {
+            "total_count": 400,
+            "workflow_runs": [_wf_run(name="ci", conclusion="success", wf_id=1)]}},
+        workflows={"example-org/platform-a": {"workflows": [
+            {"id": 1, "name": "ci", "state": "active"},
+            {"id": 2, "name": "old-deploy", "state": "deleted"}]}},
+    )
+    result = check._actions(fake, check._discover(fake))
+    assert result.stored_code is StatusCode.OK
+    assert result.reason_texts == []
+
+
+def test_actions_unread_workflow_honors_the_ignore_patterns():
+    """An ignored workflow is ignored whether or not it was read. Reporting it as
+    unread would put back on the leaf exactly what the pattern took off."""
+    check = _check(actions_ignore_patterns=(re.compile("nightly", re.IGNORECASE),))
+    fake = FakeClient(
+        [_repo("platform-a")],
+        runs={"example-org/platform-a": {
+            "total_count": 400,
+            "workflow_runs": [_wf_run(name="ci", conclusion="success", wf_id=1)]}},
+        workflows={"example-org/platform-a": {"workflows": [
+            {"id": 1, "name": "ci", "state": "active"},
+            {"id": 2, "name": "nightly-soak", "state": "active"}]}},
+    )
+    result = check._actions(fake, check._discover(fake))
+    assert result.stored_code is StatusCode.OK
+    assert result.reason_texts == []
+
+
+def test_actions_all_branches_names_no_branch_on_an_unread_workflow():
+    """With `all_branches` the aspect asks about no branch in particular, so the
+    line may not claim one — the entry is about the workflow, not about a branch."""
+    check = _check(actions_all_branches=True)
+    fake = FakeClient(
+        [_repo("platform-a")],
+        runs={"example-org/platform-a": {
+            "total_count": 240,
+            "workflow_runs": [_wf_run(name="ci", conclusion="success", wf_id=1)]}},
+        workflows={"example-org/platform-a": {"workflows": [
+            {"id": 1, "name": "ci", "state": "active"},
+            {"id": 2, "name": "deploy", "state": "active"}]}},
+    )
+    result = check._actions(fake, check._discover(fake))
+    assert result.reason_texts == [
+        "platform-a / deploy: no state this run — the 1 run read of 240 held none "
+        "of this workflow's"]
+
+
+def test_actions_a_cut_workflow_list_is_said_rather_than_assumed_whole():
+    """`/actions/workflows` is one page too, so the set the unread check is built
+    from can itself be a cut. A repository with more workflows than one page says
+    so, instead of letting the set pass as the whole set."""
+    check = _check()
+    fake = FakeClient(
+        [_repo("platform-a")],
+        runs={"example-org/platform-a": {
+            "total_count": 1,
+            "workflow_runs": [_wf_run(name="ci", conclusion="success", wf_id=1)]}},
+        workflows={"example-org/platform-a": {
+            "total_count": 137,                         # 137 exist, one page read
+            "workflows": [{"id": 1, "name": "ci", "state": "active"}]}},
+    )
+    result = check._actions(fake, check._discover(fake))
+    assert result.stored_code is StatusCode.WARN
+    assert result.reason_texts == [
+        "platform-a: 1 of 137 workflows read — the rest have no state this run"]
+    assert result.reason_entries[0].slug == _slug("platform-a", "workflows",
+                                                  "unread")
+
+
 # --- run() -------------------------------------------------------------------
 
 def _row(children):

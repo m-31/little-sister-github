@@ -402,6 +402,11 @@ configured otherwise), with a newer in-flight run shown on the same line: a fail
 run → ERROR, a run awaiting approval → WARN. Workflows matching
 `actions.ignore_workflow_name_patterns` are skipped.
 
+The runs are read one page at a time, so a busy repository can hold more of them
+than one read carries. Where it did, a workflow that appears in none of the runs
+read has **no state this run** and gets a WARN line saying so — an unread workflow
+is not a passing one, and without the line the two are indistinguishable.
+
 {pin_note}
 """,
     },
@@ -642,6 +647,27 @@ class _Coverage:
             f"GitHub did not answer for {self.unreachable} of "
             f"{total} repositories",
             code=StatusCode.WARN))
+
+
+@dataclass(frozen=True)
+class _WorkflowList:
+    """One page of ``/actions/workflows``, and whether it was the whole answer.
+
+    ``total`` is GitHub's own count for the query and ``listed`` is what this read
+    carried, so they differ **exactly** when ``by_id`` is a cut of the repository's
+    real workflow list. Carrying the pair rather than the set alone is what lets the
+    aspect say so: a set that is quietly short is indistinguishable from a complete
+    one, and every conclusion drawn from it inherits that silence.
+    """
+
+    #: Workflow id -> its name, for the ones that still exist.
+    by_id: dict[int, str]
+    listed: int
+    total: int
+
+    @property
+    def partial(self) -> bool:
+        return self.total > self.listed
 
 
 @dataclass(frozen=True)
@@ -2136,24 +2162,44 @@ class GitHubCheck(Check):
         cannot hide the failure it is trying to fix. Healthy idle workflows are
         optional; a run in flight is always emitted. Only runs of a currently
         existing workflow count.
+
+        **A workflow this read saw nothing of gets an entry of its own**, because
+        the alternative is silence and silence renders as health here. The read is
+        one page of runs across all of a repository's workflows, so it can be a cut
+        of the real answer; where it was, an existing workflow with no row in it has
+        no state this run, and says so instead of being absent.
         """
         problem_entries: list[Entry] = []
+        unread_entries: list[Entry] = []
         running_entries: list[Entry] = []
         healthy_entries: list[Entry] = []
         coverage = _Coverage()
         for repo in repos:
             full = repo.full_name
             try:
-                existing = self._existing_workflow_ids(client, full)
+                workflows = self._existing_workflows(client, full)
             except GitHubError as error:
                 if error.status == 404:
                     coverage.read_one()
                     continue                        # Actions not enabled
                 coverage.failed(repo, error, "workflows-unreadable", "workflows")
                 continue
+            existing = workflows.by_id
+            if workflows.partial:
+                unread_entries.append(Entry(
+                    slug(repo.id, "workflows", "unread"),
+                    f"{plain(repo.name)}: {workflows.listed} of "
+                    f"{workflows.total} workflows read — the rest have no state "
+                    f"this run",
+                    code=StatusCode.WARN))
             params: dict[str, Any] = {"per_page": 100}
-            if not self.actions_all_branches and repo.default_branch:
-                params["branch"] = repo.default_branch
+            # What the window is *of*, and the one thing a line about an unread
+            # workflow may claim: with `all_branches` the aspect asked about no
+            # branch in particular, so it may not name one.
+            branch_asked = ("" if self.actions_all_branches
+                            else repo.default_branch)
+            if branch_asked:
+                params["branch"] = branch_asked
             try:
                 data = client.get(f"/repos/{full}/actions/runs", params)
             except GitHubError as error:
@@ -2163,6 +2209,11 @@ class GitHubCheck(Check):
                 coverage.failed(repo, error, "runs-unreadable")
                 continue
             coverage.read_one()
+            # The rows **this page carried**, kept rather than iterated in place:
+            # against `total_count` below they are the whole of how the aspect
+            # knows its window was a cut.
+            runs = values.rows(data, "workflow_runs")
+            window_total = values.number(data, "total_count")
             # GitHub returns newest first. Keep the first in-flight run and the
             # first useful completed verdict independently for each stable
             # (workflow, branch) identity. The old one-set loop let the former
@@ -2172,7 +2223,7 @@ class GitHubCheck(Check):
                 tuple[str, object | None, object | None,
                       tuple[StatusCode, str] | None],
             ] = {}
-            for run in values.rows(data, "workflow_runs"):
+            for run in runs:
                 workflow_id = values.number(run, "workflow_id")
                 if workflow_id not in existing:
                     continue                        # run of a deleted workflow
@@ -2191,6 +2242,39 @@ class GitHubCheck(Check):
                 if completed is None and run_verdict is not None:
                     completed, verdict = run, run_verdict
                 states[key] = (current_workflow, completed, running, verdict)
+
+            # **An unseen workflow is not a healthy workflow.** One page is the
+            # newest 100 runs across *all* of this repository's workflows, so one
+            # whose newest run fell below that cut leaves no row here — and with
+            # `show_healthy: false` it then renders exactly as one that passed,
+            # which is the leaf reporting OK because it had nothing to say. Two
+            # facts already in hand say otherwise and neither costs a call:
+            # `total_count` says whether the page was a cut, and the workflow list
+            # says which ids should have been in it.
+            #
+            # **Only when it was a cut.** A workflow that has simply never run on
+            # this branch is honestly absent, and a line about it is the kind of
+            # noise that teaches a reader to skim past the real one.
+            if window_total > len(runs):
+                seen = {workflow_id for workflow_id, _branch in states}
+                where = (f"{plain(repo.name)} ({plain(branch_asked)})"
+                         if branch_asked else plain(repo.name))
+                counted = f"{len(runs)} run" + ("" if len(runs) == 1 else "s")
+                for workflow_id, listed_name in sorted(existing.items()):
+                    if workflow_id in seen:
+                        continue
+                    workflow = listed_name or str(workflow_id) or "workflow"
+                    # Ignored whether or not it was read: reporting it unread would
+                    # put back on the leaf exactly what the pattern took off.
+                    if any(p.search(workflow)
+                           for p in self.actions_ignore_patterns):
+                        continue
+                    unread_entries.append(Entry(
+                        slug(repo.id, "workflow", workflow_id, "unread"),
+                        f"{where} / {plain(workflow)}: no state this run — the "
+                        f"{counted} read of {window_total} held none of this "
+                        f"workflow's",
+                        code=StatusCode.WARN))
 
             for (workflow_id, branch), state in states.items():
                 workflow, completed, running, verdict = state
@@ -2214,20 +2298,39 @@ class GitHubCheck(Check):
                 else:
                     healthy_entries.append(entry)
         # The unreadable lines go **last**, after the healthy ones: they are the
-        # least actionable thing on the leaf, and one of them is not news.
+        # least actionable thing on the leaf, and one of them is not news. The
+        # *unread workflow* lines are not those and do not go there: a repository
+        # GitHub would not answer for is a wait-and-see, while a workflow this read
+        # could not reach is a question the leaf is answering wrongly until it is
+        # fixed — so they sit above everything that reads as reassurance.
         return self._finalize(
             "actions", "Latest completed and in-flight workflow-run state",
-            [*problem_entries, *running_entries, *healthy_entries], coverage)
+            [*problem_entries, *unread_entries, *running_entries,
+             *healthy_entries], coverage)
 
     @staticmethod
-    def _existing_workflow_ids(client: GitHubClient, full_name: str) -> set[int]:
-        """IDs of the repo's workflows that still exist (``state`` != ``deleted``),
-        so runs of a deleted workflow can be dropped."""
+    def _existing_workflows(client: GitHubClient,
+                            full_name: str) -> _WorkflowList:
+        """The repo's workflows that still exist (``state`` != ``deleted``), by id,
+        so runs of a deleted workflow can be dropped — **and how much of the list
+        this is**.
+
+        Name as well as id, because the ids that never appear in the runs page are
+        reported on their own entries and an operator cannot act on a number. The
+        counts are what stops that report from being built on a set that is itself a
+        cut: this reads one page like everything else here, and a repository with
+        more workflows than fit in it would otherwise have the coverage line go
+        blind in exactly the way the aspect it is there to catch does.
+        """
         data = client.get(f"/repos/{full_name}/actions/workflows",
                           {"per_page": 100})
-        return {values.number(workflow, "id")
-                for workflow in values.rows(data, "workflows")
-                if values.text(workflow, "state") != "deleted"}
+        listed = values.rows(data, "workflows")
+        return _WorkflowList(
+            by_id={values.number(workflow, "id"): values.text(workflow, "name")
+                   for workflow in listed
+                   if values.text(workflow, "state") != "deleted"},
+            listed=len(listed),
+            total=values.number(data, "total_count"))
 
     def _issues(self, client: GitHubClient, repos: list[Repo]) -> CheckResult:
         """An open issue → WARN, one line per issue. Repos listed under

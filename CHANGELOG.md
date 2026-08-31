@@ -11,6 +11,39 @@ the code says so.
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-09-01
+
+### Fixed
+
+- **The `actions` aspect no longer reports OK about a workflow it did not read.** It
+  reads one page of `/actions/runs` — the newest 100 runs across *all* of a
+  repository's workflows on the branch — so on a busy repository a workflow whose
+  newest run fell below that cut contributed nothing at all: no line, and nothing in
+  the aspect's coverage count. With `actions.show_healthy: false`, which is the
+  default, a workflow nobody had read rendered exactly as one that passed, so the leaf
+  reported **OK with no entries while workflows were failing**. Found on a running
+  deployment against 16 repositories, not in a suite.
+
+  The read is unchanged and still one page; what changes is that the aspect now says
+  when that page was a cut. `total_count` on the same response says whether anything
+  was left out, and the workflow list the aspect already fetches says which ones — so
+  a workflow with no run in the page read now gets its own WARN line naming it, and a
+  repository with more workflows than one page carries gets a line saying how many of
+  them were read. Neither costs an extra API call.
+
+  **What you will see:** an `actions` node that was green may go amber, on
+  repositories busy enough to fill a page. That is the defect surfacing, not a new
+  one — the runs it is amber about were already unread. The two new lines are ordinary
+  entries and can be pinned like any other; their slugs are
+  `<repo-id>-workflow-<workflow-id>-unread` and `<repo-id>-workflows-unread`. No
+  existing slug, node path or configuration key changes, and
+  `actions.ignore_workflow_name_patterns` applies to the new lines exactly as it does
+  to the old ones.
+
+  Reading every run rather than only saying that we did not is the larger change and
+  is deliberately not in this one: it needs a client that can paginate an
+  object-wrapped list, and a decision about what it costs per repository.
+
 ## [0.1.3] - 2026-08-29
 
 ### Added
