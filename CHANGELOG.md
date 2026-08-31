@@ -11,6 +11,42 @@ the code says so.
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-09-01
+
+**Breaking for anyone who pinned one of 0.1.4's two new `actions` lines**: both slugs
+are gone. See *Removed*.
+
+### Removed
+
+- **The per-workflow `…-workflow-<id>-unread` and per-repository `…-workflows-unread`
+  entries added in 0.1.4.** They were wrong, and the *Fixed* entry below says why. A
+  maintenance pin held against either slug now points at a line that is never emitted;
+  the replacement is one line per leaf with the slug `runs-window-partial`, which is
+  what to pin instead if you were pinning these.
+
+### Fixed
+
+- **The `actions` aspect no longer accuses a workflow of being unread when it simply
+  does not run on the branch.** 0.1.4 named every workflow that had no run in the page
+  it read, whenever that page was a cut. But the cut is a fact about the *repository's*
+  run list, and being missing from a branch-filtered page is a fact about *one
+  workflow* — and the two reads this aspect makes cannot tell "its newest run fell
+  outside the window" from "it never runs on this branch at all". A `pull_request`
+  linter, a tag-triggered release job and a `workflow_dispatch` restore job produce
+  exactly the same absence, forever. On a real dashboard that turned into dozens of
+  standing amber lines accusing workflows that were doing precisely what they are
+  meant to do.
+
+  What replaces it says only what the reads support: **one WARN line for the whole
+  leaf**, naming the repositories whose answer was short — `not all runs read in 9 of
+  16 repositories — a workflow whose newest run falls outside the window has no state
+  here and is not reported above: …`. The line still keeps the leaf from rendering
+  green while knowingly incomplete, which is what 0.1.4 set out to do; it no longer
+  claims to know which workflow is missing, because it does not.
+
+  Which workflow is unread is answerable, and only, by asking per workflow. That is
+  the remaining work and it is a change to how the aspect reads, not a line of prose.
+
 ## [0.1.4] - 2026-09-01
 
 ### Fixed

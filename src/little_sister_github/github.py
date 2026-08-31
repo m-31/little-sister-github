@@ -403,9 +403,11 @@ run → ERROR, a run awaiting approval → WARN. Workflows matching
 `actions.ignore_workflow_name_patterns` are skipped.
 
 The runs are read one page at a time, so a busy repository can hold more of them
-than one read carries. Where it did, a workflow that appears in none of the runs
-read has **no state this run** and gets a WARN line saying so — an unread workflow
-is not a passing one, and without the line the two are indistinguishable.
+than one read carries. Where any did, one WARN line names those repositories: a
+workflow whose newest run falls outside that window has no state here, and without
+the line it would be indistinguishable from a passing one. Which workflow that is
+cannot be said from this read — a workflow absent from the page may simply never run
+on this branch — so the line reports the reach, not a verdict.
 
 {pin_note}
 """,
@@ -2163,16 +2165,26 @@ class GitHubCheck(Check):
         optional; a run in flight is always emitted. Only runs of a currently
         existing workflow count.
 
-        **A workflow this read saw nothing of gets an entry of its own**, because
+        **Where the read could not see everything, the leaf says so once**, because
         the alternative is silence and silence renders as health here. The read is
         one page of runs across all of a repository's workflows, so it can be a cut
-        of the real answer; where it was, an existing workflow with no row in it has
-        no state this run, and says so instead of being absent.
+        of the real answer. What it may not say is *which* workflow it missed:
+        absence from a branch-filtered page is equally what a `pull_request`, tag or
+        `workflow_dispatch` workflow looks like, and neither read carries a branch or
+        a trigger to tell them apart.
         """
         problem_entries: list[Entry] = []
-        unread_entries: list[Entry] = []
         running_entries: list[Entry] = []
         healthy_entries: list[Entry] = []
+        # Repositories this aspect answered about only partly — the runs window was
+        # a cut of the real answer, or the workflow list was. **Keyed by id rather
+        # than guarded on the way in**: one repository can be short both ways, the
+        # line says *this answer is incomplete here* and not how many ways it is,
+        # and a pair of `not in` checks would leave the second one dead and the
+        # first one load-bearing without saying which. A mutation found exactly
+        # that. Insertion order is the discovery order, which is the reading order
+        # everywhere else on this leaf.
+        partial: dict[int, Repo] = {}
         coverage = _Coverage()
         for repo in repos:
             full = repo.full_name
@@ -2186,12 +2198,7 @@ class GitHubCheck(Check):
                 continue
             existing = workflows.by_id
             if workflows.partial:
-                unread_entries.append(Entry(
-                    slug(repo.id, "workflows", "unread"),
-                    f"{plain(repo.name)}: {workflows.listed} of "
-                    f"{workflows.total} workflows read — the rest have no state "
-                    f"this run",
-                    code=StatusCode.WARN))
+                partial[repo.id] = repo
             params: dict[str, Any] = {"per_page": 100}
             # What the window is *of*, and the one thing a line about an unread
             # workflow may claim: with `all_branches` the aspect asked about no
@@ -2243,38 +2250,24 @@ class GitHubCheck(Check):
                     completed, verdict = run, run_verdict
                 states[key] = (current_workflow, completed, running, verdict)
 
-            # **An unseen workflow is not a healthy workflow.** One page is the
-            # newest 100 runs across *all* of this repository's workflows, so one
-            # whose newest run fell below that cut leaves no row here — and with
-            # `show_healthy: false` it then renders exactly as one that passed,
-            # which is the leaf reporting OK because it had nothing to say. Two
-            # facts already in hand say otherwise and neither costs a call:
-            # `total_count` says whether the page was a cut, and the workflow list
-            # says which ids should have been in it.
+            # **What this read could not see, said once and never per workflow.**
+            # The page is the newest 100 runs across all of a repository's
+            # workflows, so where `total_count` exceeds the rows returned, a
+            # workflow whose last run fell outside it has no state here — and with
+            # `show_healthy: false` that renders exactly as a pass. The leaf must
+            # say so, or it is reporting OK because it had nothing to say.
             #
-            # **Only when it was a cut.** A workflow that has simply never run on
-            # this branch is honestly absent, and a line about it is the kind of
-            # noise that teaches a reader to skim past the real one.
+            # **It may not say which workflow, and 0.1.4 did, wrongly.** A workflow
+            # absent from a branch-filtered page is as likely never to run on that
+            # branch — `pull_request`, a tag, `workflow_dispatch` — as to have been
+            # cut off, and `/actions/workflows` carries neither branch nor trigger,
+            # so these two reads cannot tell the cases apart. Naming one is an
+            # accusation the data does not support: it put `Lint PR Title` and
+            # `Release` on a dashboard as unread, forever, on repositories where
+            # they were doing exactly what they are meant to do. Which workflow is
+            # unread is answerable only by asking per workflow.
             if window_total > len(runs):
-                seen = {workflow_id for workflow_id, _branch in states}
-                where = (f"{plain(repo.name)} ({plain(branch_asked)})"
-                         if branch_asked else plain(repo.name))
-                counted = f"{len(runs)} run" + ("" if len(runs) == 1 else "s")
-                for workflow_id, listed_name in sorted(existing.items()):
-                    if workflow_id in seen:
-                        continue
-                    workflow = listed_name or str(workflow_id) or "workflow"
-                    # Ignored whether or not it was read: reporting it unread would
-                    # put back on the leaf exactly what the pattern took off.
-                    if any(p.search(workflow)
-                           for p in self.actions_ignore_patterns):
-                        continue
-                    unread_entries.append(Entry(
-                        slug(repo.id, "workflow", workflow_id, "unread"),
-                        f"{where} / {plain(workflow)}: no state this run — the "
-                        f"{counted} read of {window_total} held none of this "
-                        f"workflow's",
-                        code=StatusCode.WARN))
+                partial[repo.id] = repo
 
             for (workflow_id, branch), state in states.items():
                 workflow, completed, running, verdict = state
@@ -2297,16 +2290,34 @@ class GitHubCheck(Check):
                     running_entries.append(entry)
                 else:
                     healthy_entries.append(entry)
+        # **One line for the whole leaf, and it grades.** Not one per repository and
+        # emphatically not one per workflow: what it reports is the same fact
+        # everywhere it is true — this answer is short — and repeating a fact an
+        # operator cannot act on differently is how a leaf teaches its reader to
+        # skip the color. It is `WARN` rather than `UNDEFINED` because a leaf that
+        # *knows* it is incomplete and renders green is the defect this whole item
+        # exists to remove; `UNDEFINED` is for a repository GitHub would not answer
+        # about, which is a wait-and-see, and this is not one.
+        window_entries: list[Entry] = []
+        if partial:
+            window_entries.append(Entry(
+                "runs-window-partial",
+                f"not all runs read in {len(partial)} of {len(repos)} "
+                + ("repository" if len(repos) == 1 else "repositories")
+                + " — a workflow whose newest run falls outside the window has no "
+                "state here and is not reported above: "
+                + ", ".join(plain(repo.name)
+                            for repo in partial.values()),
+                code=StatusCode.WARN))
         # The unreadable lines go **last**, after the healthy ones: they are the
         # least actionable thing on the leaf, and one of them is not news. The
-        # *unread workflow* lines are not those and do not go there: a repository
-        # GitHub would not answer for is a wait-and-see, while a workflow this read
-        # could not reach is a question the leaf is answering wrongly until it is
-        # fixed — so they sit above everything that reads as reassurance.
+        # window line sits with them and above them, for the same reason in the
+        # other direction: it is about this check's own reach rather than about
+        # anybody's repository, but unlike them it is a standing defect.
         return self._finalize(
             "actions", "Latest completed and in-flight workflow-run state",
-            [*problem_entries, *unread_entries, *running_entries,
-             *healthy_entries], coverage)
+            [*problem_entries, *running_entries, *healthy_entries,
+             *window_entries], coverage)
 
     @staticmethod
     def _existing_workflows(client: GitHubClient,
