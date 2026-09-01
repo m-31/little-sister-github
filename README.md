@@ -149,7 +149,7 @@ you want the word.
 | `code_scanning_quality` | *(the same read)* | everything else, by the rule's own **analysis** severity: `error` / `warning` / `note`, graded by `code_scanning_quality.severity_map` (**WARN** / **WARN** / **OK** by default) |
 | `secret_scanning_alerts` | `GET /repos/{r}/secret-scanning/alerts?state=open` | any open alert → **ERROR**; scanning disabled → **ERROR** (`secret_scanning.require_enabled`) |
 | `sbom_check` | `GET /repos/{r}/dependency-graph/sbom` | no dependency graph → **ERROR** (`sbom_check.ignore`) |
-| `actions` | `GET /repos/{r}/actions/workflows` + `…/actions/runs` | one coded line per workflow and branch **that has something to say**: the newest useful verdict, plus a newer in-flight run (default branch unless `actions.all_branches`; a passing idle workflow only with `actions.show_healthy`). Where one read did not carry every run, one WARN line names the repositories it was short about, so a partial answer is not read as a clean one |
+| `actions` | `GET /repos/{r}/actions/workflows` + `…/actions/workflows/{id}/runs` per workflow | one coded line per workflow and branch **that has something to say**: the newest useful verdict, plus a newer in-flight run (default branch unless `actions.all_branches`; a passing idle workflow only with `actions.show_healthy`). Asking per workflow is exact — nothing back means that workflow does not run on that branch. `actions.all_branches`, a workflow list longer than one page, and a budget too thin to pay per workflow each fall back to one page of `…/actions/runs`, and one WARN line then names the repositories the answer was short about ([ADR-0005](docs/adr/0005-the-actions-aspect-asks-per-workflow.md)) |
 | `issues` | `GET /repos/{r}/issues?state=open` | any open issue → **WARN** (`issues.ignore`); issues disabled → **WARN** |
 
 Discovery is one call verifying the declared kind — plus, for a personal account,
@@ -227,7 +227,9 @@ stays `ERROR`.
 - **`timeout:`** is the **whole run's** deadline, and the check honors it. When it
   runs out the aspects that finished are kept, the rest are absent, and the node
   says so. Size it for the scope: a run makes at least one request per repository
-  per aspect — `actions` makes two — and pages on top of that.
+  per aspect — `actions` makes one plus one per workflow
+  ([ADR-0005](docs/adr/0005-the-actions-aspect-asks-per-workflow.md)) — and pages on
+  top of that.
 - **`request_timeout:`** (default `15s`) bounds **one request**, and a request is
   additionally clamped to whatever is left of `timeout:`.
 - **`max_pause:`** (default: half of `timeout:`) bounds how much of the run may be

@@ -11,6 +11,39 @@ the code says so.
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-09-01
+
+### Changed
+
+- **The `actions` aspect now asks GitHub about each workflow separately, and the
+  answer is exact.** It read one page of `/actions/runs` — the newest 100 runs across
+  *all* of a repository's workflows on the branch — and a workflow whose newest run
+  fell outside that page contributed nothing at all. It now reads
+  `/actions/workflows/<id>/runs?branch=…` once per workflow, where nothing back means
+  that workflow does not run on that branch: an answer rather than a gap. The reasoning
+  is in [ADR-0005](docs/adr/0005-the-actions-aspect-asks-per-workflow.md).
+
+  **What you will see:** workflows that were missing from the leaf now appear, with
+  their real state. The `runs-window-partial` line disappears for ordinary
+  configurations, because the read it described is gone — it now appears only where
+  something genuinely still reads one shared page: `actions.all_branches`, a repository
+  with more than 100 workflows, or a budget too thin to pay for a read per workflow.
+  No node path, slug shape or configuration key changes.
+
+  **What it costs:** one read per repository plus one per workflow, where it was two
+  per repository. Bounded by how many workflows a repository has rather than by how
+  often they run, and workflows excluded by `actions.ignore_workflow_name_patterns`
+  now cost nothing at all — they are filtered before the reads rather than after. The
+  pre-run rate-limit estimate cannot price this, because the workflow count is not
+  known until the aspect has read the list; it is a floor for this aspect now, and the
+  aspect checks the budget GitHub states on its own responses before spending. A
+  repository the budget will not cover degrades to the old one-page read and is
+  reported as short rather than dropped.
+
+  **`actions.all_branches` is unchanged and stays inexact**, deliberately: the newest
+  state per (workflow, branch) is unbounded over branches, so one page is the only
+  bounded question there, and that mode keeps saying when the page was a cut.
+
 ## [0.1.5] - 2026-09-01
 
 **Breaking for anyone who pinned one of 0.1.4's two new `actions` lines**: both slugs

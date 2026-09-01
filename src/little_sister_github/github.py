@@ -402,12 +402,13 @@ configured otherwise), with a newer in-flight run shown on the same line: a fail
 run → ERROR, a run awaiting approval → WARN. Workflows matching
 `actions.ignore_workflow_name_patterns` are skipped.
 
-The runs are read one page at a time, so a busy repository can hold more of them
-than one read carries. Where any did, one WARN line names those repositories: a
-workflow whose newest run falls outside that window has no state here, and without
-the line it would be indistinguishable from a passing one. Which workflow that is
-cannot be said from this read — a workflow absent from the page may simply never run
-on this branch — so the line reports the reach, not a verdict.
+Each workflow is asked about on its own, so a workflow with nothing here does not
+run on this branch — that is an answer rather than a gap (ADR-0005). Three cases
+still read one shared page of runs and cannot be exact: `actions.all_branches`, a
+repository with more workflows than one page of the workflow list, and a budget too
+thin to pay for a read per workflow. One WARN line then names those repositories,
+because a workflow whose newest run falls outside a shared page has no state here and
+would otherwise be indistinguishable from a passing one.
 
 {pin_note}
 """,
@@ -1226,8 +1227,15 @@ class GitHubCheck(Check):
     #: alone. **Two aspects share one**: the code-scanning split partitions a single
     #: `/code-scanning/alerts` payload, so counting aspects would claim a request per
     #: repository that the run never makes — and the guard would grow more cautious
-    #: on a number that is not true. `actions` reads twice per repository and is
-    #: counted once, which is the approximation this estimate already made.
+    #: on a number that is not true.
+    #:
+    #: **`actions` is a floor here and no longer an approximation.** It reads its
+    #: workflow list once per repository and then once per workflow, a number this
+    #: estimate cannot know: it runs before any aspect, and the workflow count is
+    #: not in until the aspect has read the list. So the estimate counts the one
+    #: endpoint it can, and the aspect prices the rest itself against the budget
+    #: GitHub states on the response already in hand (`_budget_covers`), degrading
+    #: that repository to the wide read rather than walking through the guard.
     ASPECT_ENDPOINT: ClassVar[dict[str, str]] = {
         "pull_requests": "/pulls",
         "security_advisories": "/dependabot/alerts",
@@ -2155,6 +2163,15 @@ class GitHubCheck(Check):
             text += f" · {_link(label, running_url)}"
         return text
 
+    #: Rows asked for per workflow. The scan needs the newest in-flight run **and**
+    #: the newest useful completed verdict, which one row cannot carry and which a
+    #: `status=` filter would need two reads to get — so it asks for a few and finds
+    #: both in one. Ten covers "running now, cancelled before that, green before
+    #: that" with room; a workflow whose ten newest runs are all neutral reports no
+    #: verdict, which is the same answer the one-page read gave and is rare enough
+    #: to leave until it is seen.
+    _ACTIONS_WORKFLOW_ROWS = 10
+
     def _actions(self, client: GitHubClient,
                  repos: list[Repo]) -> CheckResult:
         """One coded entry per workflow/branch that has something to say.
@@ -2165,25 +2182,28 @@ class GitHubCheck(Check):
         optional; a run in flight is always emitted. Only runs of a currently
         existing workflow count.
 
-        **Where the read could not see everything, the leaf says so once**, because
-        the alternative is silence and silence renders as health here. The read is
-        one page of runs across all of a repository's workflows, so it can be a cut
-        of the real answer. What it may not say is *which* workflow it missed:
-        absence from a branch-filtered page is equally what a `pull_request`, tag or
-        `workflow_dispatch` workflow looks like, and neither read carries a branch or
-        a trigger to tell them apart.
+        **It asks per workflow, and that is what makes it exact.**
+        `/actions/workflows/<id>/runs?branch=` cannot go blind: an empty answer means
+        this workflow does not run on this branch, which is a fact rather than a gap.
+        The repository-wide `/actions/runs` it replaced returned the newest 100 runs
+        across *all* workflows, so a workflow whose newest run fell below that cut
+        contributed nothing and — with `show_healthy: false` — rendered exactly as
+        one that passed. Nothing could tell those apart from that read, which is why
+        the aspect briefly reported which workflows it had missed and was wrong to.
+
+        Two places still use the wide read, and both say so on the leaf:
+        `all_branches`, where "newest per (workflow, branch)" is unbounded and one
+        page is the only bounded question there is; and a repository whose remaining
+        budget will not cover a read per workflow, which degrades to it rather than
+        reporting nothing.
         """
         problem_entries: list[Entry] = []
         running_entries: list[Entry] = []
         healthy_entries: list[Entry] = []
-        # Repositories this aspect answered about only partly — the runs window was
-        # a cut of the real answer, or the workflow list was. **Keyed by id rather
-        # than guarded on the way in**: one repository can be short both ways, the
-        # line says *this answer is incomplete here* and not how many ways it is,
-        # and a pair of `not in` checks would leave the second one dead and the
-        # first one load-bearing without saying which. A mutation found exactly
-        # that. Insertion order is the discovery order, which is the reading order
-        # everywhere else on this leaf.
+        # Repositories this aspect answered about only partly. Keyed by id rather
+        # than guarded on the way in: a repository can be short more than one way,
+        # the line says *this answer is incomplete here* and not how many ways it
+        # is, and a pair of `not in` checks leaves one of them dead.
         partial: dict[int, Repo] = {}
         coverage = _Coverage()
         for repo in repos:
@@ -2196,19 +2216,26 @@ class GitHubCheck(Check):
                     continue                        # Actions not enabled
                 coverage.failed(repo, error, "workflows-unreadable", "workflows")
                 continue
-            existing = workflows.by_id
             if workflows.partial:
                 partial[repo.id] = repo
-            params: dict[str, Any] = {"per_page": 100}
-            # What the window is *of*, and the one thing a line about an unread
-            # workflow may claim: with `all_branches` the aspect asked about no
-            # branch in particular, so it may not name one.
+            # Filtered **before** the reads, not after: an ignored workflow should
+            # not cost a request either. The one-page read could not do this — it
+            # asked for runs, not for a workflow.
+            watched = {
+                workflow_id: name for workflow_id, name in workflows.by_id.items()
+                if not any(p.search(name or str(workflow_id))
+                           for p in self.actions_ignore_patterns)}
             branch_asked = ("" if self.actions_all_branches
                             else repo.default_branch)
-            if branch_asked:
-                params["branch"] = branch_asked
             try:
-                data = client.get(f"/repos/{full}/actions/runs", params)
+                if branch_asked and self._budget_covers(client, len(watched)):
+                    runs = self._workflow_runs(client, repo, watched, branch_asked)
+                else:
+                    rows, window_total = self._repository_runs(
+                        client, repo, branch_asked)
+                    if window_total > len(rows):
+                        partial[repo.id] = repo
+                    runs = rows
             except GitHubError as error:
                 if error.status == 404:
                     coverage.read_one()
@@ -2216,60 +2243,8 @@ class GitHubCheck(Check):
                 coverage.failed(repo, error, "runs-unreadable")
                 continue
             coverage.read_one()
-            # The rows **this page carried**, kept rather than iterated in place:
-            # against `total_count` below they are the whole of how the aspect
-            # knows its window was a cut.
-            runs = values.rows(data, "workflow_runs")
-            window_total = values.number(data, "total_count")
-            # GitHub returns newest first. Keep the first in-flight run and the
-            # first useful completed verdict independently for each stable
-            # (workflow, branch) identity. The old one-set loop let the former
-            # claim the key and made the latter disappear.
-            states: dict[
-                tuple[int, str],
-                tuple[str, object | None, object | None,
-                      tuple[StatusCode, str] | None],
-            ] = {}
-            for run in runs:
-                workflow_id = values.number(run, "workflow_id")
-                if workflow_id not in existing:
-                    continue                        # run of a deleted workflow
-                workflow = (values.text(run, "name")
-                            or str(workflow_id) or "workflow")
-                branch = values.text(run, "head_branch", default="?")
-                key = (workflow_id, branch)
-                if any(p.search(workflow) for p in self.actions_ignore_patterns):
-                    continue
-                status = values.text(run, "status").lower()
-                current = states.get(key, (workflow, None, None, None))
-                current_workflow, completed, running, verdict = current
-                if running is None and status in self._ACTIONS_RUNNING:
-                    running = run
-                run_verdict = self._action_verdict(run)
-                if completed is None and run_verdict is not None:
-                    completed, verdict = run, run_verdict
-                states[key] = (current_workflow, completed, running, verdict)
-
-            # **What this read could not see, said once and never per workflow.**
-            # The page is the newest 100 runs across all of a repository's
-            # workflows, so where `total_count` exceeds the rows returned, a
-            # workflow whose last run fell outside it has no state here — and with
-            # `show_healthy: false` that renders exactly as a pass. The leaf must
-            # say so, or it is reporting OK because it had nothing to say.
-            #
-            # **It may not say which workflow, and 0.1.4 did, wrongly.** A workflow
-            # absent from a branch-filtered page is as likely never to run on that
-            # branch — `pull_request`, a tag, `workflow_dispatch` — as to have been
-            # cut off, and `/actions/workflows` carries neither branch nor trigger,
-            # so these two reads cannot tell the cases apart. Naming one is an
-            # accusation the data does not support: it put `Lint PR Title` and
-            # `Release` on a dashboard as unread, forever, on repositories where
-            # they were doing exactly what they are meant to do. Which workflow is
-            # unread is answerable only by asking per workflow.
-            if window_total > len(runs):
-                partial[repo.id] = repo
-
-            for (workflow_id, branch), state in states.items():
+            for (workflow_id, branch), state in self._run_states(
+                    runs, watched).items():
                 workflow, completed, running, verdict = state
                 if verdict is None and running is None:
                     continue
@@ -2318,6 +2293,100 @@ class GitHubCheck(Check):
             "actions", "Latest completed and in-flight workflow-run state",
             [*problem_entries, *running_entries, *healthy_entries,
              *window_entries], coverage)
+
+    def _budget_covers(self, client: GitHubClient, workflows: int) -> bool:
+        """Whether the budget GitHub last stated covers a read per workflow here.
+
+        **Read from the headers of the response already in hand**, which cost
+        nothing: `/rate_limit` would spend a request to ask a question this run has
+        been told the answer to on every response it has had (the budget-header
+        trace, 0.1.3). It is also the more truthful of the two — the headers report
+        the bucket *the requests we are about to make* will be charged to.
+
+        This is where the per-workflow cost is priced, and it has to be here rather
+        than in the pre-run guard: that one runs before any aspect and multiplies
+        repositories by endpoints, while the number of workflows in a repository is
+        not known until this aspect has read its list. The guard stays a floor; this
+        keeps the aspect from walking through it.
+
+        No headers at all means **yes**. A path to GitHub that strips them is not a
+        reason to degrade every repository behind it to a worse read, and the
+        pre-run guard has already had its say.
+        """
+        stated = client.last_rate_limit
+        if stated is None or stated.remaining is None:
+            return True
+        return stated.remaining >= self.rate_limit_safety_factor * workflows
+
+    def _repository_runs(self, client: GitHubClient, repo: Repo,
+                         branch: str) -> tuple[list[Any], int]:
+        """One page of the repository's runs, and what GitHub says it is a page *of*.
+
+        The bounded question, and the only one `all_branches` has: the newest 100
+        runs across every workflow. ``total_count`` above the rows returned is the
+        page being a cut of the real answer — the aspect cannot say which workflow
+        it then has no state for, only that it has none for somebody.
+        """
+        params: dict[str, Any] = {"per_page": 100}
+        if branch:
+            params["branch"] = branch
+        data = client.get(f"/repos/{repo.full_name}/actions/runs", params)
+        return (values.rows(data, "workflow_runs"),
+                values.number(data, "total_count"))
+
+    def _workflow_runs(self, client: GitHubClient, repo: Repo,
+                       watched: dict[int, str], branch: str) -> list[Any]:
+        """The newest rows of each watched workflow on ``branch``, as one list.
+
+        Returned in the shape the repository-wide read returns so that one scan
+        serves both. A workflow with no rows contributes none and is **not** an
+        omission: it does not run on this branch, and that is the whole difference
+        between this read and the one it replaced.
+        """
+        rows: list[Any] = []
+        for workflow_id in sorted(watched):
+            data = client.get(
+                f"/repos/{repo.full_name}/actions/workflows/{workflow_id}/runs",
+                {"per_page": self._ACTIONS_WORKFLOW_ROWS, "branch": branch})
+            rows.extend(values.rows(data, "workflow_runs"))
+        return rows
+
+    def _run_states(self, runs: list[Any],
+                    watched: dict[int, str]) -> dict[
+                        tuple[int, str],
+                        tuple[str, object | None, object | None,
+                              tuple[StatusCode, str] | None]]:
+        """The newest in-flight run and the newest useful completed verdict, kept
+        **independently**, for each stable (workflow, branch) identity.
+
+        GitHub returns newest first, and both reads preserve that. The old one-set
+        loop let the in-flight run claim the key and made the verdict disappear, so
+        a retry hid the failure it was trying to fix.
+        """
+        states: dict[
+            tuple[int, str],
+            tuple[str, object | None, object | None,
+                  tuple[StatusCode, str] | None],
+        ] = {}
+        for run in runs:
+            workflow_id = values.number(run, "workflow_id")
+            if workflow_id not in watched:
+                continue        # a deleted workflow's run, or an ignored one
+            workflow = (values.text(run, "name")
+                        or watched[workflow_id]
+                        or str(workflow_id) or "workflow")
+            branch = values.text(run, "head_branch", default="?")
+            key = (workflow_id, branch)
+            status = values.text(run, "status").lower()
+            current = states.get(key, (workflow, None, None, None))
+            current_workflow, completed, running, verdict = current
+            if running is None and status in self._ACTIONS_RUNNING:
+                running = run
+            run_verdict = self._action_verdict(run)
+            if completed is None and run_verdict is not None:
+                completed, verdict = run, run_verdict
+            states[key] = (current_workflow, completed, running, verdict)
+        return states
 
     @staticmethod
     def _existing_workflows(client: GitHubClient,

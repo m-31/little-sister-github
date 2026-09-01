@@ -173,11 +173,33 @@ class FakeClient:
                 if isinstance(value, GitHubError):
                     raise value
                 return value
-            # default: every workflow_id seen in this repo's runs, all active
+            # default: every workflow_id seen in this repo's runs, all active, each
+            # carrying the name its runs carry — GitHub states the name in both
+            # places and the ignore patterns are now read off this one, because a
+            # workflow filtered out should not cost a request either.
             runs = self._runs.get(full, {"workflow_runs": []})
-            ids = {r.get("workflow_id") for r in (runs.get("workflow_runs") or [])}
-            return {"workflows": [{"id": i, "state": "active"}
-                                  for i in ids if i is not None]}
+            rows = runs.get("workflow_runs") or []
+            names = {r.get("workflow_id"): r.get("name", "") for r in rows}
+            return {"workflows": [{"id": i, "name": names[i], "state": "active"}
+                                  for i in names if i is not None]}
+        if "/actions/workflows/" in path and path.endswith("/runs"):
+            # `/repos/<full>/actions/workflows/<id>/runs` — the same fixture the
+            # repository-wide route serves, filtered the way GitHub filters it: this
+            # workflow's rows, on this branch, newest first, at most `per_page`. A
+            # test therefore writes one `runs=` payload and both reads agree about
+            # it, which is the point — they are two questions about one truth.
+            head, _, tail = path.partition("/actions/workflows/")
+            full = head[len("/repos/"):]
+            workflow_id = int(tail[:-len("/runs")])
+            value = self._runs.get(full, {"workflow_runs": []})
+            if isinstance(value, GitHubError):
+                raise value
+            branch = (params or {}).get("branch")
+            rows = [row for row in (value.get("workflow_runs") or [])
+                    if row.get("workflow_id") == workflow_id
+                    and (branch is None or row.get("head_branch") == branch)]
+            return {"total_count": len(rows),
+                    "workflow_runs": rows[:(params or {}).get("per_page", 100)]}
         if path.endswith("/actions/runs"):
             full = path[len("/repos/"):-len("/actions/runs")]
             value = self._runs.get(full, {"workflow_runs": []})
@@ -1126,13 +1148,24 @@ def test_actions_ignore_pattern_skips_workflow():
     assert result.stored_code is StatusCode.OK
 
 
-def test_actions_default_branch_only_queries_default_branch():
+def test_actions_default_branch_asks_each_workflow_about_that_branch():
+    """The read is per workflow and carries the branch, which is what makes it
+    exact: an empty answer means this workflow does not run there."""
     check = _check()
-    fake = FakeClient([_repo("platform-a", default_branch="develop")])
+    fake = FakeClient(
+        [_repo("platform-a", default_branch="develop")],
+        runs={"example-org/platform-a": {"workflow_runs": [
+            _wf_run(name="ci", branch="develop", wf_id=1),
+            _wf_run(name="deploy", branch="develop", wf_id=2)]}})
     check._actions(fake, check._discover(fake))
-    runs_calls = [p for (p, params) in fake.get_calls
-                  if p.endswith("/actions/runs") and params.get("branch") == "develop"]
-    assert runs_calls
+    asked = [(p, params) for (p, params) in fake.get_calls
+             if p.endswith("/runs") and "/actions/workflows/" in p]
+    assert [p for p, _ in asked] == [
+        "/repos/example-org/platform-a/actions/workflows/1/runs",
+        "/repos/example-org/platform-a/actions/workflows/2/runs"]
+    assert all(params.get("branch") == "develop" for _, params in asked)
+    # and the repository-wide read is not made at all
+    assert not [p for (p, _) in fake.get_calls if p.endswith("/actions/runs")]
 
 
 def test_actions_all_branches_omits_branch_param():
@@ -1187,36 +1220,67 @@ def test_actions_workflow_state_deleted_is_excluded():
     assert result.stored_code is StatusCode.OK
 
 
-# --- actions: what one read could not see -----------------------------------
+# --- actions: the exact read, and the two places it is not exact ------------
 #
-# The page is one read of the newest 100 runs **across all workflows**, so it can
-# be a cut of the real answer, and a workflow whose newest run fell outside it then
-# renders exactly as one that passed. The leaf has to say that — and may say only
-# that. 0.1.4 named the workflows it had not seen, which these pin shut: a workflow
-# absent from a branch-filtered page is as likely never to run on that branch as to
-# have been cut off, and these two reads cannot tell those apart.
+# `/actions/workflows/<id>/runs?branch=` cannot go blind: nothing back means this
+# workflow does not run on this branch. The repository-wide read it replaced could
+# not tell that from a workflow cut off below its 100-run page, which is why the
+# aspect briefly named workflows it had not seen and was wrong to. Two places still
+# use the wide read and still say so: `all_branches`, and a budget too thin to pay
+# per workflow.
 
 def _runs(rows, total):
     return {"example-org/platform-a": {"total_count": total,
                                        "workflow_runs": rows}}
 
 
-def _workflows(rows, total=0):
-    payload = {"workflows": rows}
-    if total:
-        payload["total_count"] = total
-    return {"example-org/platform-a": payload}
+def _named(*rows):
+    return {"example-org/platform-a": {"workflows": [
+        {"id": i, "name": n, "state": "active"} for i, n in rows]}}
 
 
-def test_actions_a_cut_window_is_said_once_for_the_leaf():
-    """`total_count` exceeds the rows returned, so the answer is short. One WARN
-    line for the whole leaf, naming the repository it is short about."""
+def test_actions_a_workflow_that_does_not_run_on_the_branch_is_simply_absent():
+    """The whole point of asking per workflow. `deploy` exists and has no run on
+    `main` — a `pull_request` linter, a tag-triggered release and a manual restore
+    job all look like this. It gets no entry, no accusation, and the leaf does not
+    go amber for it."""
     check = _check()
     fake = FakeClient(
         [_repo("platform-a")],
         runs=_runs([_wf_run(name="ci", conclusion="success", wf_id=1)], 240),
-        workflows=_workflows([{"id": 1, "name": "ci", "state": "active"},
-                              {"id": 2, "name": "deploy", "state": "active"}]),
+        workflows=_named((1, "ci"), (2, "deploy")),
+    )
+    result = check._actions(fake, check._discover(fake))
+    assert result.stored_code is StatusCode.OK
+    assert result.reason_texts == []
+    # it was asked about, and answered nothing — that is the difference
+    assert ("/repos/example-org/platform-a/actions/workflows/2/runs"
+            in [p for p, _ in fake.get_calls])
+
+
+def test_actions_an_ignored_workflow_costs_no_request():
+    """The pattern is applied to the workflow list before any run is asked for. The
+    one-page read could not do this — it asked for runs, not for a workflow."""
+    check = _check(actions_ignore_patterns=(re.compile("nightly", re.IGNORECASE),))
+    fake = FakeClient(
+        [_repo("platform-a")],
+        runs=_runs([_wf_run(name="ci", conclusion="success", wf_id=1)], 1),
+        workflows=_named((1, "ci"), (2, "nightly-soak")),
+    )
+    check._actions(fake, check._discover(fake))
+    asked = [p for p, _ in fake.get_calls if "/actions/workflows/" in p]
+    assert asked == ["/repos/example-org/platform-a/actions/workflows/1/runs"]
+
+
+def test_actions_all_branches_reads_one_page_and_says_when_it_was_cut():
+    """`all_branches` has no per-workflow spelling — "newest per (workflow, branch)"
+    is unbounded there — so it keeps the wide read, and keeps the line that says the
+    wide read was short."""
+    check = _check(actions_all_branches=True)
+    fake = FakeClient(
+        [_repo("platform-a")],
+        runs=_runs([_wf_run(name="ci", conclusion="success", wf_id=1)], 240),
+        workflows=_named((1, "ci"), (2, "deploy")),
     )
     result = check._actions(fake, check._discover(fake))
     assert result.stored_code is StatusCode.WARN
@@ -1224,68 +1288,84 @@ def test_actions_a_cut_window_is_said_once_for_the_leaf():
         "not all runs read in 1 of 1 repository — a workflow whose newest run "
         "falls outside the window has no state here and is not reported above: "
         "platform-a"]
-    assert result.reason_entries[0].code is StatusCode.WARN
     assert result.reason_entries[0].slug == "runs-window-partial"
+    assert not [p for p, _ in fake.get_calls if "/actions/workflows/" in p]
 
 
-def test_actions_a_cut_window_never_names_a_workflow():
-    """The regression 0.1.4 shipped. `deploy` is absent from the page, and the two
-    reads cannot say whether it was cut off or simply never runs on this branch —
-    `pull_request`, a tag and `workflow_dispatch` all produce the same absence. So
-    it is not named, accused, or counted as unread."""
+def test_actions_a_thin_budget_degrades_to_the_wide_read():
+    """A read per workflow the budget cannot pay for is worse than the wide read,
+    not better — so the aspect falls back to it and marks the repository short. The
+    number it decides on is GitHub's own, off the response already in hand."""
+    check = _check()
+    fake = FakeClient(
+        [_repo("platform-a")],
+        runs=_runs([_wf_run(name="ci", conclusion="failure", wf_id=1)], 240),
+        workflows=_named((1, "ci"), (2, "deploy")),
+        rate=(5000, 3, 0),                       # 3 left, 4 × 2 workflows needed
+    )
+    result = check._actions(fake, check._discover(fake))
+    assert not [p for p, _ in fake.get_calls if "/actions/workflows/" in p]
+    assert [p for p, _ in fake.get_calls if p.endswith("/actions/runs")]
+    assert result.stored_code is StatusCode.ERROR      # the failure is still found
+    assert "failed" in result.reason_texts[0]
+    assert result.reason_texts[1].startswith("not all runs read in 1 of 1 ")
+
+
+def test_actions_a_budget_that_covers_the_workflows_is_not_degraded():
+    """The other side of the same line, so the guard is pinned rather than merely
+    present: enough budget and the exact read is made."""
     check = _check()
     fake = FakeClient(
         [_repo("platform-a")],
         runs=_runs([_wf_run(name="ci", conclusion="success", wf_id=1)], 240),
-        workflows=_workflows([{"id": 1, "name": "ci", "state": "active"},
-                              {"id": 2, "name": "deploy", "state": "active"}]),
+        workflows=_named((1, "ci"), (2, "deploy")),
+        rate=(5000, 8, 0),                       # exactly 4 × 2
     )
     result = check._actions(fake, check._discover(fake))
-    assert len(result.reason_texts) == 1
-    assert not any("deploy" in text for text in result.reason_texts)
-
-
-def test_actions_a_complete_window_says_nothing():
-    """Nothing was cut, so there is nothing to say — and a workflow that has never
-    run stays silent rather than becoming a line the reader learns to skip."""
-    check = _check()
-    fake = FakeClient(
-        [_repo("platform-a")],
-        runs=_runs([_wf_run(name="ci", conclusion="success", wf_id=1)], 1),
-        workflows=_workflows([{"id": 1, "name": "ci", "state": "active"},
-                              {"id": 2, "name": "never-run", "state": "active"}]),
-    )
-    result = check._actions(fake, check._discover(fake))
-    assert result.stored_code is StatusCode.OK
+    assert [p for p, _ in fake.get_calls if "/actions/workflows/" in p]
     assert result.reason_texts == []
 
 
-def test_actions_a_cut_workflow_list_makes_the_answer_partial_too():
-    """`/actions/workflows` is one page as well, so a repository with more workflows
-    than fit in it is one this aspect has answered about only partly, even where
-    every run it asked for came back."""
+def test_actions_no_budget_headers_does_not_degrade_the_read():
+    """A path to GitHub that strips the headers is not a reason to give every
+    repository behind it a worse answer; the pre-run guard has already had its say."""
+    check = _check()
+    fake = FakeClient(
+        [_repo("platform-a")],
+        runs=_runs([_wf_run(name="ci", conclusion="success", wf_id=1)], 240),
+        workflows=_named((1, "ci")),
+        last_rate_limit=None,
+    )
+    check._actions(fake, check._discover(fake))
+    assert [p for p, _ in fake.get_calls if "/actions/workflows/" in p]
+
+
+def test_actions_a_cut_workflow_list_makes_the_answer_partial():
+    """`/actions/workflows` is one page as well. The exact read cannot help here —
+    a workflow the list never mentioned is one nothing knows to ask about."""
     check = _check()
     fake = FakeClient(
         [_repo("platform-a")],
         runs=_runs([_wf_run(name="ci", conclusion="success", wf_id=1)], 1),
-        workflows=_workflows([{"id": 1, "name": "ci", "state": "active"}],
-                             total=137),
+        workflows={"example-org/platform-a": {
+            "total_count": 137,
+            "workflows": [{"id": 1, "name": "ci", "state": "active"}]}},
     )
     result = check._actions(fake, check._discover(fake))
     assert result.stored_code is StatusCode.WARN
-    assert len(result.reason_texts) == 1
     assert result.reason_texts[0].startswith("not all runs read in 1 of 1 ")
 
 
 def test_actions_a_repository_short_both_ways_is_counted_once():
     """Both cuts on one repository. The line says *this answer is incomplete here*,
-    not how many ways it is, so the repository appears once and the count is one."""
-    check = _check()
+    not how many ways it is."""
+    check = _check(actions_all_branches=True)
     fake = FakeClient(
         [_repo("platform-a")],
         runs=_runs([_wf_run(name="ci", conclusion="success", wf_id=1)], 240),
-        workflows=_workflows([{"id": 1, "name": "ci", "state": "active"}],
-                             total=137),
+        workflows={"example-org/platform-a": {
+            "total_count": 137,
+            "workflows": [{"id": 1, "name": "ci", "state": "active"}]}},
     )
     result = check._actions(fake, check._discover(fake))
     assert len(result.reason_texts) == 1
@@ -1294,13 +1374,13 @@ def test_actions_a_repository_short_both_ways_is_counted_once():
 
 
 def test_actions_the_window_line_is_last_and_does_not_displace_a_failure():
-    """A finding is what an operator acts on; the window line is what they need to
-    know the findings are not all of them. The failure stays first."""
-    check = _check()
+    """A finding is what an operator acts on; the window line is what tells them the
+    findings are not all of them."""
+    check = _check(actions_all_branches=True)
     fake = FakeClient(
         [_repo("platform-a")],
         runs=_runs([_wf_run(name="ci", conclusion="failure", wf_id=1)], 500),
-        workflows=_workflows([{"id": 1, "name": "ci", "state": "active"}]),
+        workflows=_named((1, "ci")),
     )
     result = check._actions(fake, check._discover(fake))
     assert result.stored_code is StatusCode.ERROR
@@ -3044,7 +3124,7 @@ def test_the_run_receipt_names_the_slowest_read(caplog):
                       slowest_path="/repos/example-org/platform-a/pulls",
                       paused_seconds=3.0)
     _result, lines = _traced_run(caplog, check, fake)
-    assert ("/github: run ended after 0.0s of its 60s timeout — 19 read(s) in "
+    assert ("/github: run ended after 0.0s of its 60s timeout — 17 read(s) in "
             "41.5s, slowest read 14.5s (/repos/example-org/platform-a/pulls), "
             "3s paused, 8 of 8 aspects reported") in lines
 
@@ -3054,7 +3134,7 @@ def test_a_run_whose_reads_took_no_measurable_time_says_that(caplog):
     A double takes no time and so does a cached run; neither is a slow endpoint."""
     check = _check(timeout_seconds=60.0)
     _result, lines = _traced_run(caplog, check, FakeClient(_two_repos()))
-    assert ("/github: run ended after 0.0s of its 60s timeout — 19 read(s) in "
+    assert ("/github: run ended after 0.0s of its 60s timeout — 17 read(s) in "
             "0.0s, no read took measurable time, 0s paused, 8 of 8 aspects "
             "reported") in lines
 
