@@ -1,6 +1,11 @@
 # ADR-0003 — An aspect is one question asked of the whole scope
 
-- **Status:** Accepted
+- **Status:** Accepted; the table below is the seven aspects of 0.1.0 — since 0.1.1
+  `code_scanning_alerts` is two, `code_scanning_security` and
+  `code_scanning_quality` ([ADR-0006](0006-code-scanning-has-two-scales.md)), and
+  since 0.1.6 `actions` asks per workflow rather than making two reads
+  ([ADR-0005](0005-the-actions-aspect-asks-per-workflow.md)); the rule of this record
+  is unchanged by either
 - **Date:** 2026-08-15 — the shape is the port's and is already in the code; this
   record is where it is written down for the people who receive it
 - **Related:** [ADR-0004](0004-a-finding-grades-the-repository-does-not.md) (what

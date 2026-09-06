@@ -114,7 +114,7 @@ class _PauseBudgetSpent(Exception):
         self.wait = wait
 
 
-# **Two scales, and GitHub keeps them apart — so this check does too** (ADR-0005).
+# **Two scales, and GitHub keeps them apart — so this check does too** (ADR-0006).
 # A code-scanning alert carries a *security* severity when its rule has one, and an
 # *analysis* severity always; GitHub's own filter files the first under **Security**
 # and the second under **Other**. They used to be one eight-band row here, which is
@@ -159,9 +159,9 @@ DEFAULT_CODE_SCANNING_QUALITY_MAP = {
 #: it is rank 2 under code scanning — and a rank-derived circle would make one `high`
 #: 🔴 and the other 🟠 on one dashboard. Nobody reads a red circle as *where this sits
 #: in this row*. The
-#: rank orders the row (little-sister ADR-0055); the colour says how bad it is.
+#: rank orders the row (little-sister ADR-0055); the color says how bad it is.
 #:
-#: **Two scales share the ramp, and the repeats are the point** (ADR-0005). `error`
+#: **Two scales share the ramp, and the repeats are the point** (ADR-0006). `error`
 #: and `high` are comparable rungs of two scales GitHub itself keeps apart, and since
 #: the split they never appear in one row: `code_scanning_security` draws the security
 #: four, `code_scanning_quality` the analysis three, and `security_advisories`
@@ -183,7 +183,7 @@ BAND_GLYPHS = {
 #: What a severity this package does not name gets. The band list is **open**: GitHub
 #: may add a severity, an operator may mistype one into a `severity_map`, and an alert
 #: carrying neither severity lands in `code_scanning_quality`'s `none`. A band with no
-#: colour must not borrow one — and this stays rare enough to mean something.
+#: color must not borrow one — and this stays rare enough to mean something.
 UNKNOWN_BAND_GLYPH = "❓"
 
 
@@ -1362,6 +1362,12 @@ class GitHubCheck(Check):
         # organization listing made with a member's token is whole, but
         # `/users/{login}/repos` is public-only however privileged the token is.
         self._sees_private = True
+        # Where the next run's roster starts: the last aspect that **finished**, or
+        # `None` before the first run (ADR-0002 §7's 2026-09-06 update). Run state
+        # like the two below, and deliberately in memory only — a restart beginning
+        # at the head again costs one cycle, and the engine never runs one check
+        # twice at once, so a plain attribute is the whole of it.
+        self._resume_after: str | None = None
         # Run state, like `_sees_private` above: how many repository reads this run
         # could not be *completed* — the "we could not ask GitHub" class only, since
         # the graded kind is already amber on the line where it happened. Every
@@ -1588,6 +1594,31 @@ class GitHubCheck(Check):
         config did not switch off."""
         return tuple(name for name in self.ASPECTS
                      if name not in self.disabled_aspects)
+
+    def run_order(self) -> tuple[str, ...]:
+        """The roster this run walks: :meth:`active_aspects` rotated to start after
+        the last aspect that **finished** (ADR-0002 §7's 2026-09-06 update).
+
+        A run that never fits refreshed the same head and starved the same tail
+        forever, while those nodes kept their last reading and looked answered. So
+        the next run resumes where the last one got to: a run cut short after four
+        of eight starts at the fifth, and every aspect is read once per cycle rather
+        than the first four every time.
+
+        The resume point is a **name**, not an index, so a config that switches an
+        aspect off between runs shifts nothing; a name no longer in the roster starts
+        the run at the head, which is what a roster that changed under us deserves.
+        And it is only the *run* order: the row's order is `aspect_rank`, read from
+        `ASPECTS` (little-sister ADR-0055), so nothing on the dashboard moves.
+        """
+        roster = self.active_aspects()
+        if not roster or self._resume_after is None:
+            return roster
+        try:
+            start = (roster.index(self._resume_after) + 1) % len(roster)
+        except ValueError:
+            return roster
+        return roster[start:] + roster[:start]
 
     @classmethod
     def aspect_rank(cls, name: str) -> int:
@@ -1896,7 +1927,7 @@ class GitHubCheck(Check):
         they were watched. Read failures stay on the aspect **container**: they have
         no honest source severity and must not be smuggled into one. The container
         declares no code of its own, so an unreadable repository leaves it
-        `UNDEFINED` — which the tree ignores in favour of the bands beneath it,
+        `UNDEFINED` — which the tree ignores in favor of the bands beneath it,
         exactly as "I have nothing to say" should behave.
         """
         seen = set(declared_order)
@@ -1985,7 +2016,7 @@ class GitHubCheck(Check):
         rule's *analysis* severity always. This check reported one eight-band row
         built from the first field alone, defaulting it to `none` — so `error`,
         `warning` and `note` were rendered, and watched, and unreachable, because
-        nothing ever wrote them (ADR-0005).
+        nothing ever wrote them (ADR-0006).
 
         **One field per alert, so the two aspects partition rather than double-count.**
         The security severity where GitHub assigned one; the analysis severity
@@ -2126,7 +2157,7 @@ class GitHubCheck(Check):
     @classmethod
     def _action_verdict(cls, run: object) -> tuple[StatusCode, str] | None:
         """The completed verdict a run contributes, or none when it contributes
-        only an in-flight/neutral fact. Cancelled and skipped runs deliberately do
+        only an in-flight/neutral fact. Canceled and skipped runs deliberately do
         not erase the last useful verdict beneath them."""
         status = values.text(run, "status").lower()
         conclusion = values.text(run, "conclusion").lower()
@@ -2166,7 +2197,7 @@ class GitHubCheck(Check):
     #: Rows asked for per workflow. The scan needs the newest in-flight run **and**
     #: the newest useful completed verdict, which one row cannot carry and which a
     #: `status=` filter would need two reads to get — so it asks for a few and finds
-    #: both in one. Ten covers "running now, cancelled before that, green before
+    #: both in one. Ten covers "running now, canceled before that, green before
     #: that" with room; a workflow whose ten newest runs are all neutral reports no
     #: verdict, which is the same answer the one-page read gave and is rare enough
     #: to leave until it is seen.
@@ -2624,8 +2655,15 @@ class GitHubCheck(Check):
         cut_short = ""
         # Named once and walked by position, because **which** aspects a cut-short
         # run never reached is a fact about this roster and this order — and the
-        # order is fixed, so it is the same tail every time until somebody looks.
-        roster = self.active_aspects()
+        # order **moves**: it resumes after the last aspect that finished, so the
+        # tail a short run misses is the head of the next one (`run_order`).
+        roster = self.run_order()
+        if roster and roster[0] != self.active_aspects()[0]:
+            # The one line that says the rotation happened. Without it a reader of a
+            # log has to reconstruct the order from the per-aspect lines below, and
+            # the whole point of the rotation is that the order is not the one the
+            # constant shows.
+            logger.info("%s: roster resumes at %s", self.path, roster[0])
         for position, name in enumerate(roster, start=1):
             entered = deadline.elapsed()
             reads_before = client.reads_made
@@ -2640,6 +2678,10 @@ class GitHubCheck(Check):
                 # disagreeing with the constant it claims to follow.
                 children.append(replace(builders[name](client, repos),
                                         order=self.aspect_rank(name)))
+                # Only a *finished* aspect moves the resume point: one cut off by
+                # the deadline is where the next run has to start, not where it
+                # has to start after.
+                self._resume_after = name
             except DeadlineExceeded:
                 cut_short = (
                     f"run cut short after {deadline.elapsed():.0f}s of its "

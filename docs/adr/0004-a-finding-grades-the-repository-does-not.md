@@ -1,6 +1,10 @@
 # ADR-0004 — A finding grades; the repository does not
 
-- **Status:** Accepted
+- **Status:** Accepted; written the day before the code-scanning aspect became two
+  ([ADR-0006](0006-code-scanning-has-two-scales.md)), so "the two alert aspects" below
+  are three banded ones now, graded per scale as decision 8 says, and the `actions`
+  read decision 9 describes was replaced by
+  [ADR-0005](0005-the-actions-aspect-asks-per-workflow.md); the grading rules stand
 - **Date:** 2026-08-15 — the grading is the port's and is already in the code; this
   record is where it is written down for the people who receive it
 - **Related:** [ADR-0003](0003-an-aspect-is-one-question-asked-of-the-whole-scope.md)

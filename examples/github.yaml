@@ -18,7 +18,8 @@ frequency: 15m
 # **The whole run's budget**, and the check honors it: when it runs out, the
 # aspects that finished are reported, the rest are absent, and the node says the run
 # was cut short. Size it for the scope — a run makes at least one request per
-# repository per aspect (`actions` makes two) and pages on top of that.
+# repository per aspect (`actions` makes one per watched workflow on top) and pages
+# on top of that.
 timeout: 60s
 # **One request's budget**, which is a different number and must be well under the
 # one above; 15s when unset. It is what stops a single slow endpoint from spending

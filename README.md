@@ -31,7 +31,7 @@ aspect keeps reporting.
 # Pin them. A deployment names exact versions so an upgrade is a deliberate edit
 # rather than drift; a plugin is the one that declares a floor, because two plugins
 # that each pinned could not be installed together.
-dependencies = ["little-sister==0.3.13", "little-sister-github==0.1.0"]
+dependencies = ["little-sister==0.3.13", "little-sister-github==0.1.7"]
 ```
 
 ```python
@@ -136,7 +136,7 @@ so it works the same way for every branch check type you install.
 
 A severity band's title is a **colored circle** — 🔴 `critical`, 🟠 `high`, 🟡 `medium`,
 🔵 `low`, and the analysis severities `error` / `warning` / `note` on the same three
-rungs — with **❓** for a severity this package does not name. The colour is by name, so
+rungs — with **❓** for a severity this package does not name. The color is by name, so
 the same severity wears the same circle in every aspect and in every deployment; the
 band's own name sits beside it, and `nodes.yaml` sets a different title per node path if
 you want the word.
@@ -170,7 +170,7 @@ is amber, and what a severity band asserts while it is empty — is
 [ADR-0003](docs/adr/0003-an-aspect-is-one-question-asked-of-the-whole-scope.md) and
 [ADR-0004](docs/adr/0004-a-finding-grades-the-repository-does-not.md).
 
-**Which of these you can change, and which you cannot.** The two alert aspects are
+**Which of these you can change, and which you cannot.** The three banded aspects are
 graded by settings that exist in order to be overruled — `severity_map` says what a
 severity means here, `severities` says which ones are looked at at all. The other
 five carry the codes in this table with no knob for them: what a deployment decides

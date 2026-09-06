@@ -11,7 +11,35 @@ the code says so.
 
 ## [Unreleased]
 
-## [0.1.6] - 2026-09-01
+## [0.1.7] - 2026-09-06
+
+### Added
+
+- **The code-scanning split of 0.1.1 has its record**,
+  [ADR-0006](docs/adr/0006-code-scanning-has-two-scales.md): why an alert's two
+  severities are two aspects, why one read serves both, and why their defaults
+  differ. The three code comments that cited "ADR-0005" for it point there now;
+  ADR-0005 was always the `actions` record.
+
+### Changed
+
+- **A short run no longer starves the same aspects every time.** The aspect roster
+  was walked in a fixed order, so a run that ran out of budget after four of eight
+  refreshed those four and never reached the rest — and an aspect nothing refreshes
+  keeps its last reading, so it reads as answered rather than as absent. A run now
+  resumes after the last aspect that finished, so the tail one run misses is the head
+  of the next and every aspect is read once per cycle. The row's order is unchanged
+  (it comes from the aspect's rank, not from the run), and one INFO line names the
+  aspect a run resumes at. [ADR-0002](docs/adr/0002-a-read-failure-is-not-a-finding.md)
+  carries it.
+
+- **The records say what changed under them.** ADR-0002, ADR-0003 and ADR-0004 were
+  written for seven aspects and the old `actions` read; each now says at its head
+  that there are eight aspects since 0.1.1 and that `actions` asks per workflow since
+  0.1.6, so a reader arriving from a code comment is not sent to a count that stopped
+  being true. `examples/github.yaml` prices a run the way 0.1.6 spends it.
+
+## [0.1.6] - 2026-08-30
 
 ### Changed
 
@@ -44,7 +72,7 @@ the code says so.
   state per (workflow, branch) is unbounded over branches, so one page is the only
   bounded question there, and that mode keeps saying when the page was a cut.
 
-## [0.1.5] - 2026-09-01
+## [0.1.5] - 2026-08-30
 
 **Breaking for anyone who pinned one of 0.1.4's two new `actions` lines**: both slugs
 are gone. See *Removed*.
@@ -80,7 +108,7 @@ are gone. See *Removed*.
   Which workflow is unread is answerable, and only, by asking per workflow. That is
   the remaining work and it is a change to how the aspect reads, not a line of prose.
 
-## [0.1.4] - 2026-09-01
+## [0.1.4] - 2026-08-30
 
 ### Fixed
 
@@ -152,7 +180,7 @@ are gone. See *Removed*.
 
 - **Breaking: this package speaks check API epoch 2.** little-sister reads the
   whole `subnodes:` block itself now, for every check type, and a type only
-  **declares** what it ships (its ADR-0025). So this check no
+  **declares** what it ships (little-sister ADR-0025). So this check no
   longer parses that block, no longer layers its own defaults, and no longer hands
   a `title` / `about` back on an aspect result: it declares its `SUBNODES` text and
   its `{owner}` / `{team}` / link / grading tokens, and the library resolves and
@@ -471,7 +499,7 @@ same pins with no upgrade and no warning at all.
   band's title was the name back with a capital letter — `critical Critical` — twice
   the width of a chip for no second fact. The rows now read 🔴 🟠 🟡 🔵 beside the
   names.
-  - **The colour is by name, never by rank**, and this package is the reason. A rank
+  - **The color is by name, never by rank**, and this package is the reason. A rank
     here is *your* tuple: `security_advisories` reports the severities
     `dependabot_severities` names, so if you watch `high` and `medium`, `high` is
     first there and second under code scanning. A rank-derived circle would put one
@@ -480,7 +508,7 @@ same pins with no upgrade and no warning at all.
     analysis severities, matching their security counterparts rung for rung. Since
     the split above they never appear in one row, so nothing repeats where you can
     see it.
-  - **A severity this package does not name gets `❓`**, never a borrowed colour —
+  - **A severity this package does not name gets `❓`**, never a borrowed color —
     including the `none` band an alert with no severity of either kind lands in.
   - **The word is not lost.** The name is beside the title on every chip, and the two
     surfaces that draw a title *instead of* a name — the `/copy` hand-off and the
@@ -634,14 +662,14 @@ same pins with no upgrade and no warning at all.
     and otherwise 60 seconds. A **bare 429** is a throttle, because a rate limit is
     the only thing GitHub sends that status for. A **bare 403 is not**, and stays the
     permission answer it always was; reading it as *not now* would retry every
-    repository your token cannot see and then paint the real problem grey.
+    repository your token cannot see and then paint the real problem gray.
   - **The wait stays inside `timeout:`.** A short secondary limit is absorbed and the
     run carries on. A long primary limit — a reset twenty minutes out — is *not* slept
     through: the request is not retried, the line says how long GitHub asked for, and
     the run reports what it has. When to ask again is the check's schedule, and a
     request is not the place to hold a run past its budget.
   - If you have a dashboard where a burst of activity produced amber lines across
-    several repositories at once, **that is what this was** — and those lines are grey
+    several repositories at once, **that is what this was** — and those lines are gray
     now, with the count on the check's own node.
 
 - **An answer that is not JSON is no longer retried.** A proxy login page, or an error

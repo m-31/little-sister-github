@@ -1642,7 +1642,7 @@ def test_the_same_severity_wears_the_same_circle_whatever_it_is_ranked(monkeypat
 
 def test_a_severity_this_package_does_not_name_gets_a_question_mark(monkeypatch):
     """Reachable today, not hypothetical: an alert carrying neither severity lands in
-    quality's `none`. A band with no colour must not borrow one."""
+    quality's `none`. A band with no color must not borrow one."""
     rows = _aspects(_check(), monkeypatch, data={
         ("example-org/platform-a", "code_scanning"): [
             _scan_alert(1, "https://x/1")]})
@@ -1660,7 +1660,7 @@ def test_the_two_scales_repeat_colours_across_rows_and_never_within_one(monkeypa
     for name in ("security_advisories", "code_scanning_security",
                  "code_scanning_quality"):
         drawn = [title for title, _ in _titles(rows[name])]
-        assert len(drawn) == len(set(drawn)), f"{name} draws one colour twice"
+        assert len(drawn) == len(set(drawn)), f"{name} draws one color twice"
 
 
 def test_the_circle_survives_the_folding_rule_and_keeps_its_word(monkeypatch):
@@ -2066,8 +2066,8 @@ def test_issues_leaf_declares_its_built_in_text():
     result = check._issues(fake, check._discover(fake))
     assert result.name == "issues"
     # Declared, not stamped: the label is resolved once at construction and the
-    # engine writes it per aspect name (little-sister ADR-0025, 2026-08-19
-    # update), so the result hands back none of its own.
+    # engine writes it per aspect name (little-sister ADR-0025), so the result
+    # hands back none of its own.
     assert check.subnode_labels["issues"]["title"] == SUBNODES["issues"]["title"]
     assert (result.title, result.about) == ("", "")
 
@@ -2489,7 +2489,7 @@ def test_a_404_still_means_missing():
 def test_the_repositories_that_were_read_are_not_erased_by_the_one_that_was_not():
     """The trap `_Coverage.lines` exists for. An entry set of nothing but
     UNDEFINED derives UNDEFINED, so a leaf where one repository was unreachable
-    and the others were clean would go **grey** — the clean readings thrown away
+    and the others were clean would go **gray** — the clean readings thrown away
     with the unknown one. The `read` line is those clean readings."""
     check = _check()
     repos = [_repo(f"platform-{c}") for c in "abc"]
@@ -2560,7 +2560,7 @@ def test_a_banded_aspect_that_could_not_look_is_amber_and_its_bands_are_not():
     """The green-when-blind defect, gone — and gone without changing what a band
     means. A read failure has no honest source severity, so it stays on the
     container; the container used to declare no code and derive `UNDEFINED`, which
-    the roll-up skips in favour of the bands — and a watched band is `OK` when
+    the roll-up skips in favor of the bands — and a watched band is `OK` when
     empty, so a run that saw nothing rendered **green**. The coverage line grades
     the container instead. The bands are untouched: they still never have to tell
     *empty* from *unread*."""
@@ -2672,8 +2672,8 @@ class _Answer:
         """What `fetch._read` calls, and it calls nothing else on a body stream.
         `read1` rather than `read` because a real `read(n)` blocks until it has all *n*
         bytes: reading a body with it cannot be bounded by a clock, which is the defect
-        little-sister ADR-0058's 2026-08-16 amendment records. A double offering `read`
-        alone would still be modelling the version that could not be bounded."""
+        little-sister ADR-0058 records. A double offering `read`
+        alone would still be modeling the version that could not be bounded."""
         size = len(self._body) if size < 0 else size
         chunk, self._body = self._body[:size], self._body[size:]
         return chunk
@@ -3030,10 +3030,11 @@ def test_an_aspect_line_times_the_aspect_and_not_the_run(caplog):
 
 
 def test_the_cut_short_log_names_the_aspect_and_the_starving_tail(caplog):
-    """The node counts; the log names. `active_aspects()` is walked in a fixed
-    order, so the aspects a cut-short run never reaches are the same ones on every
-    run — and until this line existed a reader had to rebuild the roster by hand
-    from `ASPECTS` minus their own `disabled_aspects` to find out which.
+    """The node counts; the log names. The aspects a cut-short run never reaches
+    are this run's tail — the next run starts at them (ADR-0002 §7's 2026-09-06
+    update), which is exactly why the line has to name them rather than leave a
+    reader to rebuild the roster by hand from `ASPECTS` minus their own
+    `disabled_aspects`.
 
     An aspect is switched **off** here on purpose: every count on the line is the
     active roster's and not `ASPECTS`', and with a full roster the two agree, so a
@@ -3055,6 +3056,78 @@ def test_the_cut_short_log_names_the_aspect_and_the_starving_tail(caplog):
     assert (f"/github: run cut short after 61s of its 60s timeout — 1 of 7 "
             f"aspects reported — {second} (2 of 7) was never started; never "
             f"reached: " + ", ".join(check.active_aspects()[2:])) in lines
+
+
+def test_a_short_run_resumes_where_it_stopped_rather_than_starving_a_tail(caplog):
+    """ADR-0002 §7, 2026-09-06 update. A run that never fits refreshed the same
+    head and starved the same tail forever, while those nodes kept their last
+    reading and looked answered. The next run starts at the aspect this one never
+    got to."""
+    clock = _Clock()
+    check = _check(timeout_seconds=60.0)
+    first, second = check.active_aspects()[:2]
+    real_first = getattr(check, f"_{first}")
+
+    def spend_the_run(client, repos):
+        result = real_first(client, repos)
+        clock.advance(61)
+        return result
+
+    setattr(check, f"_{first}", spend_the_run)
+    check._new_deadline = lambda: Deadline(60.0, clock=clock)
+    _traced_run(caplog, check, FakeClient(_two_repos()))
+
+    assert check.run_order() == (*check.active_aspects()[1:], first)
+
+    # And the next run actually walks it: the roster is what `run` reads, not a
+    # number somebody could keep up to date beside it.
+    caplog.clear()
+    setattr(check, f"_{first}", real_first)
+    check._new_deadline = lambda: Deadline(60.0, clock=_Clock())
+    _result, lines = _traced_run(caplog, check, FakeClient(_two_repos()))
+
+    assert f"/github: roster resumes at {second}" in lines
+    assert any(line.startswith(f"/github: aspect 1/8 {second} ") for line in lines)
+    assert not any(line.startswith(f"/github: aspect 1/8 {first} ")
+                   for line in lines)
+
+
+def test_the_next_run_says_where_it_resumes(caplog):
+    """One line, because the order is no longer the one the constant shows and a
+    reader of a log would otherwise have to rebuild it from the aspect lines."""
+    check = _check()
+    second = check.active_aspects()[1]
+    check._resume_after = check.active_aspects()[0]
+
+    _result, lines = _traced_run(caplog, check, FakeClient(_two_repos()))
+
+    assert f"/github: roster resumes at {second}" in lines
+
+
+def test_a_run_that_finished_leaves_the_next_one_at_the_same_head(caplog):
+    """Rotation is not motion for its own sake: a run that reads everything has
+    nothing to catch up on, and starting somewhere else every time would only make
+    the log harder to read."""
+    check = _check()
+
+    _traced_run(caplog, check, FakeClient(_two_repos()))
+
+    assert check._resume_after == check.active_aspects()[-1]
+    assert check.run_order() == check.active_aspects()
+    assert "/github: roster resumes at" not in "\n".join(_lines(caplog))
+
+
+def test_the_resume_point_is_a_name_and_not_a_position():
+    """A config that switches an aspect off between runs must shift nothing, and a
+    name that has left the roster starts at the head rather than guessing."""
+    roster = _check().active_aspects()
+    check = _check(disabled_aspects=(roster[0],))
+    check._resume_after = roster[2]
+
+    assert check.run_order()[0] == roster[3]
+
+    check._resume_after = "code_scanning_alerts"   # retired in 0.1.1 (ADR-0006)
+    assert check.run_order() == check.active_aspects()
 
 
 def test_an_aspect_the_budget_died_inside_is_told_apart_from_one_never_started(
@@ -3409,7 +3482,7 @@ def _the_500_reaches_the_aspect(build):
     assert len(notes) == 2
     assert all(e.code is StatusCode.UNDEFINED for e in notes)
     assert "could not ask GitHub" in notes[0].text
-    # Nothing was read, so the aspect is amber on its own coverage — not grey,
+    # Nothing was read, so the aspect is amber on its own coverage — not gray,
     # which is what an entry set of nothing but UNDEFINED used to derive.
     gap = next(e for e in result.reason_entries if e.slug == "read")
     assert gap.code is StatusCode.WARN
@@ -3517,7 +3590,7 @@ def test_a_bare_403_is_still_the_permission_answer():
     """The half of this that must **not** move. A 403 with no throttle header is a
     token that may not read the thing — it grades WARN and somebody has to act on
     it. Reading it as *not now* would retry every unreadable repository in the scope
-    and paint the real permission problem grey."""
+    and paint the real permission problem gray."""
     with _through(_http_error(403, b'{"message":"Resource not accessible"}')) \
             as (build, _opener):
         with pytest.raises(GitHubError) as caught:
@@ -3530,7 +3603,7 @@ def test_a_403_with_budget_left_is_a_permission_answer_and_not_a_throttle():
     """GitHub puts `x-ratelimit-remaining` on **every** answer, so the header being
     present says nothing — it is the value `0` that says the budget is gone. Reading
     the header's presence instead would turn every unreadable repository in the scope
-    into a sixty-second wait and then a grey line."""
+    into a sixty-second wait and then a gray line."""
     plenty = _http_error(403, b'{"message":"Resource not accessible"}',
                          {"x-ratelimit-remaining": "4998",
                           "x-ratelimit-reset": "1700000060"})

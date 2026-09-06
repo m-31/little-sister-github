@@ -1,6 +1,6 @@
 [project]
 name = "little-sister-github"
-version = "0.1.6"
+version = "0.1.7"
 description = "GitHub check types for little-sister: repository overview, and API rate limit."
 authors = [
     { name = "Michael Meyling" }
@@ -35,28 +35,21 @@ requires-python = ">=3.11"
 # a release. The upgrade a floor cannot see, the library moving *past* the
 # surface, is caught by `require_api()` in `__init__.py`.
 #
-# **0.3.13 rather than 0.3.12**, which is what this package shipped against until now.
-# 0.3.13 is the release that speaks **check API epoch 2**, and the epoch moved because
+# **0.3.13** is the release that speaks **check API epoch 2**, and the epoch moved because
 # three names *left* the surface: little-sister reads the whole `subnodes:` block
-# itself now and a type only declares (its ADR-0025, 2026-08-19 update). `require_api()`
+# itself now and a type only declares (little-sister ADR-0025). `require_api()`
 # catches that direction — but only at startup, and a floor naming an older release
 # would let a resolver install the very library that call is about to reject.
 #
 # The floor's other job is unchanged, and is why it has always named a real release
 # rather than the first one with the surface: 0.3.11 has neither
 # `little_sister.transport` nor `little_sister.fetch`, and this package imports both
-# (ADR-0002's Update). An *added* name is the mismatch an epoch cannot catch, because
+# (ADR-0002). An *added* name is the mismatch an epoch cannot catch, because
 # it says what was removed and nothing about what arrived.
 #
-# The older history is kept because it explains why the previous number was not the
-# obvious one. 0.3.0 is where the check-authoring surface was first promised, but it
-# was tagged and never uploaded, so it names no version a resolver can fetch; 0.3.11 is
-# what lowered the library's own Python floor to the 3.11 promised above.
-#
-# **Until 0.3.13 is uploaded, this floor resolves from nowhere.** The releases go
-# out together, library first. Until that upload a local checkout needs the redirect
-# further down — and `uv.lock` cannot be regenerated honestly, because the only
-# resolution available names a path. See `### Requires` in the CHANGELOG.
+# A local checkout that wants the library from beside it uses the development
+# redirect further down — and restores `uv.lock` with it. See `### Requires` in the
+# CHANGELOG for when the floor last moved.
 dependencies = [
     "little-sister>=0.3.13",
 ]
@@ -86,38 +79,41 @@ changelog = "https://github.com/m-31/little-sister-github/blob/main/CHANGELOG.md
 package = true
 
 # no-sources-table:begin
-# **No `[tool.uv.sources]`, deliberately.** little-sister is on the index, so the
-# floor above resolves like any other dependency and there is nothing left to
-# redirect. Committing the table is harmful, and worth stating precisely because the
-# imprecise version of this paragraph was wrong in both directions: a consumer
-# installing from an index is **unaffected**, since uv honours a dependency's sources
-# table only when it resolves that dependency from a path or a git checkout — while a
-# consumer that *does* resolve this package that way has it **imposed**, and the
-# install fails on a directory nobody else's disk has. The table also reaches the
-# sdist, where uv rewrites the header, so searching for the table name will not find
-# it (little-sister `plugin-repository.md` §3).
-#
-# To develop against a local library checkout, add the redirect and do not commit
-# it:
+# **No `[tool.uv.sources]` in a release, and one in the meantime is allowed.**
+# little-sister is on the index, so the floor above resolves like any other dependency
+# and a released tree needs no redirect at all. Developing against an **unreleased**
+# library is the case that does — this package cannot import a name the index does not
+# carry yet — and the redirect is how:
 #
 #     [tool.uv.sources]
 #     little-sister = { git = "file:///path/to/little-sister" }
 #
-# It leaves a second trace, and that one arrives by itself: the next `uv run` rewrites
-# the committed `uv.lock` to name the directory, and the pre-commit gate **is** a
-# `uv run`. A lock naming a path outside its own repository resolves on no other
-# machine, so `uv sync --locked` then fails for CI and for every clone laid out
-# differently.
+# `release/local.sh on` writes it and re-locks. It leaves a second trace, and that one
+# arrives by itself: the next `uv run` rewrites the committed `uv.lock` to name the
+# directory, and the pre-commit gate **is** a `uv run`. **Committing both is the
+# ordinary state of that window**, and the commit gate stays quiet on purpose — a
+# window in which work still has to be committed is not one a gate can refuse without
+# refusing the state it prescribes.
 #
-# **Both traces are refused when a release is condensed** — `check_no_local_sources` —
-# and deliberately not before. The window in which this redirect is the *right* thing to
-# have is a window in which work still has to be committed, so a commit gate that refused
-# it would be refusing the state it prescribes; it stays quiet, and the release refuses,
-# which names the repository being released at the one moment the finding is actionable.
-# This used to end by asking you to restore the two files before committing. Asking was
-# not enough: on 2026-08-16 both were found committed in two plugins at once, with every
-# release check passing. A lock may name exactly one path, `editable = "."`, which is a
-# repository naming itself.
+# What it costs while it stands, measured rather than assumed: a lock naming a path
+# outside its own repository resolves on no other machine, so `uv sync --locked` fails
+# for CI and for every clone laid out differently. A lock may name exactly one path,
+# `editable = "."`, which is a repository naming itself.
+#
+# **What must never happen is either trace reaching a published artifact**, and that is
+# where they are refused — `check_no_local_sources`, when a release is condensed, which
+# names the repository being released at the one moment the finding is actionable. The
+# costs there are the ones worth stating precisely, because the imprecise version of
+# this paragraph was wrong in both directions: a consumer installing from an index is
+# **unaffected**, since uv honors a dependency's sources table only when it resolves
+# that dependency from a path or a git checkout — while a consumer that *does* resolve
+# this package that way has it **imposed**, and the install fails on a directory nobody
+# else's disk has. The table also reaches the sdist, where uv rewrites the header, so
+# searching for the table name will not find it (little-sister
+# `plugin-repository.md` §3). This paragraph used to ask an author to restore the two
+# files before committing, and asking was not enough: on 2026-08-16 both were found
+# committed in two plugins at once, with every release check passing. The release is
+# what catches it, and asking has stopped.
 # no-sources-table:end
 
 [dependency-groups]

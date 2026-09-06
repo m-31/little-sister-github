@@ -1,6 +1,9 @@
 # ADR-0002 — A read failure is not a finding about the repository
 
-- **Status:** Accepted
+- **Status:** Accepted; written for seven aspects — since 0.1.1 there are eight,
+  `code_scanning_alerts` having become `code_scanning_security` and
+  `code_scanning_quality` ([ADR-0006](0006-code-scanning-has-two-scales.md)), and
+  every count below reads accordingly
 - **Date:** 2026-08-23 (accepted 2026-08-15)
 - **Related:** [ADR-0001](0001-a-second-check-type-in-this-package.md) (which
   applied the *wording* half of this — "could not ask" — to `github-rate-limit`,
@@ -11,6 +14,25 @@
   (a slug is an identifier, never a position), little-sister **ADR-0058** (one
   transport policy, and any client — the vocabulary this record's machinery moved
   into)
+
+> **Update (2026-09-06):** §7 says the deadline keeps what finished; this says which
+> aspects a run **starts** with. The roster was walked in `ASPECTS` order every run,
+> so a run that never fits refreshed the same head and starved the same tail forever
+> — and a starved aspect keeps its last reading, so it reads as answered rather than
+> as absent, which is the one shape of wrong this record exists to refuse. A run now
+> **resumes after the last aspect that finished**: cut short after four of eight, the
+> next run starts at the fifth, and every aspect is read once per cycle instead of
+> the first four every time. Three things about it. Only a *finished* aspect moves
+> the resume point, so the aspect the deadline cut off is where the next run starts
+> rather than the one after it. The point is a **name**, so a config that switches an
+> aspect off between runs shifts nothing, and a name that has left the roster starts
+> at the head. And it is the **run** order alone — a node's place in the row is
+> `aspect_rank`, read from `ASPECTS` (little-sister ADR-0055), so nothing on the
+> dashboard moves. It is held in memory: a restart begins at the head again, which
+> costs one cycle. Written to retire, finally: when the engine releases a check's
+> units oldest-first, that ordering is what this rotation becomes, and the aspect
+> that starves first is the one that has waited longest rather than the one that sits
+> late in a constant.
 
 ## Context
 
@@ -41,7 +63,7 @@ long to wait" — was being handed to `urlopen` as its **per-socket-operation**
 timeout: spent afresh on each of the several hundred requests a run makes, and
 therefore bounding nothing. The engine does not bound a run either — it calls
 `run()` with no deadline of its own, and the comment beside that call ("a hanging
-check that hit its timeout should show the full wait") says honouring the value is
+check that hit its timeout should show the full wait") says honoring the value is
 the check's job. Reading it as the **run's** budget is this record's decision, not a
 rule quoted from elsewhere: the library's own `http` check still spends it the other
 way, on a check that makes exactly one request, where the two readings coincide. So a slow GitHub
@@ -109,7 +131,7 @@ the wall clock and not the run's monotonic one), and otherwise a 60-second floor
 **bare 429** takes that floor, because a rate limit is the only thing GitHub sends that
 status for. A **bare 403 does not**: with no throttle header on it, it is still the
 permission answer, and reading it as *not now* would retry every unreadable repository
-in the scope and turn a real permission problem grey.
+in the scope and turn a real permission problem gray.
 
 **Never from the body**, though GitHub's throttle bodies say so in prose. That is this
 section's rule, on the one classification most tempting to break it for.
@@ -188,7 +210,7 @@ before, with no line and no noise. Two properties are load-bearing:
 
 This is also what fixes the **severity-band** aspects, and without changing what a
 band means. Their read failures sit on the *container*, whose own code used to be
-`UNDEFINED` and therefore skipped in favour of the watched bands — rendered `OK` when
+`UNDEFINED` and therefore skipped in favor of the watched bands — rendered `OK` when
 empty, so that a band's silence stays visible. `security_advisories` and
 `code_scanning_alerts` consequently showed green when they had read nothing at all.
 The coverage line grades the container instead, so the bands never have to tell
@@ -236,9 +258,6 @@ aspect as ERROR and the other repositories' open pull requests were never looked
 for. That is the all-or-nothing shape this record rejects, one level down.
 
 ### 9. Discovery follows the same rule as everything under it
-
-> Added 2026-08-15, with decision 5's rewrite. Discovery was the one read still
-> graded by where it happened rather than by what came back.
 
 A run that cannot list the repositories has the same two cases as a run that cannot
 read one, and decision 2 already separates them. A **transient** discovery failure is

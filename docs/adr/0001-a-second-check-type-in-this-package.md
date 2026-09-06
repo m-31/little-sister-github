@@ -79,7 +79,7 @@ Entries rather than children because a resource is a **reading, not a domain**: 
 no sub-structure to grow into, and one page showing every budget at once is what an
 operator opens this node for. The keyed form also means the identity is GitHub's own
 resource name — `core`, `graphql` — so a maintenance pin held against `core` survives a
-config that starts watching `search` next year, and never slides onto a neighbour
+config that starts watching `search` next year, and never slides onto a neighbor
 (little-sister ADR-0050).
 
 What is given up is per-resource `about` text, since only a node can carry one. The
@@ -166,9 +166,9 @@ the gap is the API's rather than a decision taken here. What a deployment sees i
 is worth knowing: GitHub answers a secondary limit with **403 or 429**, and ADR-0002
 reads a throttle header on either as *not now* — transient, and a transient failure is
 a line that grades nothing — which means a burst throttle reaches a dashboard as
-**grey** `could not ask GitHub` lines on the `github` check's aspects, while this
+**gray** `could not ask GitHub` lines on the `github` check's aspects, while this
 check's node typically stays green with plenty of budget left. **That combination — an
-untroubled budget here beside a rash of grey lines on the `github` check, with that
+untroubled budget here beside a rash of gray lines on the `github` check, with that
 check's own node saying how many reads could not be completed — is the signature of a
 secondary limit**, and reading it as a permission problem is the mistake this paragraph
 exists to prevent. GitHub's answer may carry a `retry-after` header, and it is read,
