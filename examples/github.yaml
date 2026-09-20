@@ -29,7 +29,8 @@ timeout: 60s
 # that dribbles bytes forever.
 # request_timeout: 15s
 
-# **How much of the run may be spent asleep**, waiting out a GitHub rate limit;
+# **How much of the run may be spent asleep** — waiting out a GitHub rate limit, or
+# on the backoff before a retry; the node says which happened, by cause;
 # half of `timeout:` when unset. `timeout:` alone does not bound this — a run that
 # sleeps through its whole budget never overruns it and reports nothing at all.
 # A wait this cannot afford is refused whole rather than trimmed (a short wait does
@@ -84,8 +85,16 @@ include_archived: false
 # 1 and cannot be 0 — a filter that matches nothing is a finding, not a state.
 # expect_min_repos: 20
 
-# Only run when the remaining API budget exceeds factor × (repos × aspects);
-# otherwise skip this run with a WARN rather than exhaust the rate limit.
+# Only run when every budget window this run will spend can afford it: factor ×
+# the reads that will land on that window — one per repository per endpoint,
+# `actions` one plus one per workflow the last run saw — less what something else
+# is measured to be spending on it over a run's length. Otherwise skip this run
+# with a WARN naming the window, rather than exhaust the rate limit. A token has
+# more than one `core` window, split by request path, and `GET /rate_limit`
+# reports one of them (for some tokens one nothing spends), so the guard prices
+# each window from the headers of this process's own reads; before the first run
+# of a process it reads the endpoint as it always did. A window that resets before
+# the run would be through (a `core` window in its last seconds) is outside the guard.
 rate_limit_safety_factor: 4
 
 # --- Switching an aspect off ---------------------------------------------------
@@ -157,6 +166,10 @@ secret_scanning:
   require_enabled: true
 
 # --- Aspect: SBOM presence -----------------------------------------------------
+# Asks GitHub's GraphQL API whether each repository has dependency manifests
+# Dependabot can read — one GraphQL query per repository, one point of the `graphql`
+# budget each, in place of the REST export (ADR-0008). A repository named under
+# `ignore` is not asked.
 sbom_check:
   ignore:                 # repositories exempt from the SBOM requirement
     - platform-docs
@@ -165,7 +178,25 @@ sbom_check:
 # --- Aspect: workflow runs -----------------------------------------------------
 actions:
   # all_branches: false   # true watches every branch, not just the default one
+  # **The branches to watch instead of the repository's default one.** Each watched
+  # workflow is asked about each name, so this costs a read per pair and the guard
+  # prices it that way; write your trunk in the list if you want it watched too, as
+  # the names replace the default branch rather than adding to it. Setting this and
+  # `all_branches` together is refused at startup: they ask different questions. Where
+  # none of these branches matched a repository at all, the leaf says so on one line
+  # and names the default branch it saw — usually a `main` against a `master`.
+  # branches: [release, staging]
   # show_healthy: false   # true also lists workflows that passed and are idle
+  # **A switched-off workflow is a line, and its runs are not read** — the newest one
+  # is frozen at whatever it was when somebody, or GitHub, switched the workflow off.
+  # The line names the cause. `disabled_manually` is somebody's decision;
+  # `disabled_inactivity` is GitHub's, after 60 days without activity **in a public
+  # repository**; `disabled_fork` is GitHub's too and is the common one, because
+  # scheduled workflows are off by default on a fork — which is why it ships OK, and
+  # why an OK line here is hidden unless `show_healthy` is on. A state not named
+  # below is WARN.
+  # disabled_severity_map:
+  #   disabled_fork: warn       # …if you do want to hear about your forks
   ignore_workflow_name_patterns: []    # regexes, case-insensitive
 
 # --- Aspect: open issues -------------------------------------------------------

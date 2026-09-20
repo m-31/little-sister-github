@@ -11,6 +11,212 @@ the code says so.
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-09-20
+
+**Breaking for anyone who pinned a disabled workflow's line**: that line is keyed
+without a branch now, so the pin stops matching and has to be made again. Nothing else
+moves — no `type:` name, no other slug, no configuration key. See *Changed*.
+
+### Added
+
+- **An `actions` line now carries what the check read, beside the sentence it wrote.**
+  Each line says which repository it is **about** — the numeric id, the one a rename
+  cannot change — and carries a **record**: the repository's name, the workflow, the
+  branch, the verdict, and a block per run with its number, its URL, GitHub's own
+  `status` and `conclusion`, and its times. A disabled workflow's line carries the
+  repository, the workflow, its URL and GitHub's `state`
+  ([ADR-0012](docs/adr/0012-the-actions-line-carries-what-it-read.md)). **Nothing you
+  see today moves**: the line's text is unchanged, character for character, and the
+  record is invisible until a surface renders it — the node's own page shows it as a
+  list of names and values. It is what the library's line templates, its grading seam
+  and its per-subject views will be built on, and **the field names are stored keys**
+  from now on, like a slug: a deployment's template will address them.
+
+- **The `github` check asks conditionally, and an unchanged read now costs nothing.** It
+  keeps each read's `ETag` and sends `If-None-Match` on the next run; GitHub answers `304
+  Not Modified` and does not charge an authorized conditional request against the primary
+  rate limit. Nothing about what the check reports changes — the held answer is the answer
+  the full read gave — and nothing is configured. A second run against an organization
+  that has not changed spends a fraction of the requests it used to. The check's own page
+  gains a line saying how many payloads are held, how many were dropped, and how many of
+  this run's requests were free against what the pre-run guard priced it at; the guard
+  itself is unchanged and still prices a run at full cost, which is conservative
+  ([ADR-0011](docs/adr/0011-conditional-requests-and-the-cache-that-holds-them.md)).
+
+- **`actions.branches:` watches the branches you name instead of the default one.** Each
+  watched workflow is asked about each name, so the read stays exact — nothing back means
+  that workflow does not run on that branch — and the guard prices it as one plus workflows
+  times branches. The names **replace** the repository's default branch rather than adding
+  to it, so write your trunk in the list if you want it watched too; setting this and
+  `actions.all_branches` together is refused at startup, since they ask different
+  questions. Where none of the named branches matched a repository at all, one WARN line
+  says so and names that repository's default branch — the usual cause is an estate that
+  spells its trunk `main` in some repositories and `master` in others. No existing key
+  changes meaning, and a config without this key reads exactly as before
+  ([ADR-0009](docs/adr/0009-named-branches-replace-the-default-branch.md)).
+
+- **A switched-off workflow is reported, and its runs are no longer read.** A workflow
+  GitHub reports as disabled had its runs fetched like any other, which bought a verdict
+  frozen at the moment it was switched off — an old green that reassured about nothing, or
+  an old red no fix could clear. It is now one line naming the cause in GitHub's own
+  wording and ending `no runs read`, and the request is saved: one per disabled workflow
+  per run. `disabled_manually` and `disabled_inactivity` are WARN, `disabled_fork` is OK
+  because GitHub disables scheduled workflows on a fork by default and forks are
+  discovered unless you say otherwise — an OK line follows `show_healthy` like a passing
+  idle workflow. `actions.disabled_severity_map` grades any of them your way, in the same
+  shape as the other severity maps, and a state this package has not met is WARN and is
+  said as GitHub spelled it
+  ([ADR-0010](docs/adr/0010-a-disabled-workflow-is-a-line-not-a-read.md)).
+
+- **The `github-rate-limit` line says how much of a window this process itself spent** —
+  `core: 2441 of 5000 requests left, resets in 1min; 269 of it this process's own; ~1250/h
+  of it is spent by something else using this token`. A count of what the ledger recorded
+  rather than an estimate, said whenever it is not zero, and it completes the sentence the
+  node was already half telling: what is ours, what somebody else is spending, and what the
+  window carried before this process first read it. It is this process's share since it
+  first saw that window, so on a token shared with a second instance or a pipeline the
+  remainder is what the other two clauses describe. No config changes, and no line that did
+  not carry this clause has moved
+  ([ADR-0007](docs/adr/0007-the-budget-is-read-where-it-is-spent.md)).
+
+- **`docs/architecture.md` says how the two checks are built, and `docs/decisions.md`
+  digests the records.** What used to be reconstructible only from the eight records and
+  the source — the client's two dialects and three faults, the run's order and its
+  deadline, the guard's three rungs, the ledger and every clause of the budget node, the
+  keys nobody may rename, and what each line in the log means — is one document that
+  names the record beside each rule; the register is one digest per record, held to its
+  records by the release check. The README is cut to the front door and gains a table of
+  every `github` setting with its default: the fault table, the budget ledger and the
+  guard's mechanics moved out of it, and nothing about what a deployment writes changed.
+
+- **The README says what the token needs, read by read** — classic scope and fine-grained
+  permission per aspect and for discovery, that read access is enough everywhere, that a
+  fine-grained token is issued with the organization as resource owner and granted the
+  repositories the scope will contain, and that a GitHub App's installation token is not a
+  fit today because little-sister resolves a credential once at startup and such a token
+  expires after an hour. One sentence used to say `read:org`, `repo`, `security_events`
+  and *dependency-graph read access*; the table replaces it.
+
+- **ADR-0008 records how `sbom_check` will outlive the synchronous SBOM export** GitHub
+  removes on `2026-11-13`: the aspect asks GraphQL whether a repository has dependency
+  manifests — one query per run, on the `graphql` budget — instead of downloading an SBOM
+  per repository, and grades as before with the cause on the line. Built in this release,
+  the entry below.
+
+### Changed
+
+- **Re-pin any maintenance pin held on a disabled workflow's line.** A disabled
+  workflow's line is now keyed `<repository id>-workflow-<workflow id>`, without a
+  branch, because the workflow is off on every branch. It replaces the frozen verdict
+  line that was keyed with one, so a pin held against that slug stops matching and has
+  to be made again. Nothing else changes key: a running or recently-run workflow keeps
+  `<repository id>-workflow-<workflow id>-<branch>`
+  ([ADR-0010](docs/adr/0010-a-disabled-workflow-is-a-line-not-a-read.md)).
+
+- **`sbom_check` asks the dependency graph instead of downloading an SBOM.** The aspect
+  read `GET /repos/{owner}/{repo}/dependency-graph/sbom` for every repository — the
+  synchronous export GitHub removes on `2026-11-13`, and the source of the `Failed to
+  generate SBOM: Request timed out` 500s that were most of this aspect's amber. It now
+  asks GraphQL's `dependencyGraphManifests`, one query per repository — GitHub ends a
+  GraphQL request at ten seconds, a query costs one point whatever it carries, and a
+  query for many repositories was as slow as its heaviest — at one point a repository,
+  and grades what it always graded: no manifests is no dependency graph and stays
+  **ERROR**, now worded `platform-api: no dependency graph (0 manifests)` — **and a
+  repository the export read green may read red now**: an SPDX export always carried the
+  relationship describing itself, so the old line fired on a `404` alone, and a graph
+  with no manifests at all went unseen; list such a repository under `sbom_check.ignore`
+  if that is intended, as the record always meant; manifests none
+  of which could be parsed is **ERROR** too, new, with the cause on the line —
+  `platform-api: 2 manifests, none parseable (package-lock.json exceeds the size
+  limit)`; a graph with more than ten manifests has content whatever the first ten say.
+  A repository the query is refused for is amber on its own line, one that vanished
+  between discovery and the query grades nothing, and a query that fails whole is
+  *could not ask* on the coverage line. The aspect name, its `ignore` key and the `sbom`
+  slug of its lines are unchanged, so every pin holds; **the `graphql` budget is now
+  spent by this package** — a few points a run — the `github-rate-limit` node watches it
+  by default, and the `github` guard prices the queries against that window rather than
+  one `core` read per repository. `GitHubClient.graphql()` is the seam, a `POST` with
+  the same headers, deadline, retry and throttle reading as every REST read; on a GitHub
+  Enterprise Server `api_url` ending in `/api/v3`, the endpoint is `/api/graphql`. The
+  token needs nothing new. [ADR-0008](docs/adr/0008-the-dependency-graph-is-asked-not-exported.md).
+
+- **The `github-rate-limit` node reads the budget where it is spent, and says how many
+  windows there are.** The budget headers on every response the `github` check makes on
+  the same token feed a ledger, kept per window for the life of the process, and the
+  node's line is written from it: the window with the least left grades the resource,
+  and the line says when it is one of several and what the others hold —
+  `core: 2441 of 5000 requests left, resets in 1min — the tightest of 2 windows GitHub
+  keeps for this token; the other has 3932 left, resets in 6min`. `GET /rate_limit` is
+  still read every run and merged in as one more reading; a resource nothing in this
+  process spends is its number and says so — `graphql: 5000 of 5000 points left, resets
+  in 59min — as /rate_limit reports it; nothing here has spent it` — and a window the
+  endpoint reports at its full limit that nothing here spent is not a window on the
+  line. When `used` on a window rises faster than this process's own requests, the line
+  says at what rate something else is spending the token, with a tilde; and when this
+  process saw a window open — the previous window on that path ended and this one
+  appeared — it says what the window already carried at the first reading, `45 of it
+  were spent by something else before this process first read this window`, which is
+  where a consumer that spends before every run of yours, such as an hourly job on the
+  same token, shows up. After a restart the second clause waits for the first rollover,
+  because until then the number would be your own reads. `dependency_sbom`
+  gets the same treatment — graded by its own numbers, a hundred a minute. **The grade
+  can move:** `warn_below` and `error_below` are compared with the tightest window, so a
+  token whose endpoint reported a pristine counter stops reading green while the
+  `github` check beside it spends thousands an hour, and a deployment that tuned its
+  thresholds against the endpoint's number may see amber sooner. No slug, `type:` name or
+  configuration key moves. ADR-0007, decisions 1 and 2.
+
+- **The `github` check's pre-run guard prices the run per window, and can fire where it
+  never could.** It read `GET /rate_limit` and compared one number with `factor ×
+  repositories × endpoints`; on two of the three tokens measured that number was 5,000
+  every time. It now prices each endpoint's reads against the window this process's own
+  reads of it were charged to, `actions` as one plus one read per workflow the last run
+  saw, less what something else is measured to be spending on that window over a run's
+  length, and skips the run naming the window: `skipped this run: 310 API calls left on
+  the window GitHub charges the dependabot, code-scanning and actions reads to (resets in
+  12min), need > 4×57 for 19 repo(s)`. A path the ledger has not seen this window is
+  priced against the tightest window it knows of the budget that path is charged to,
+  and by the endpoint where that budget has no window open; before the first run of a
+  process the endpoint is read and the sentence is the old one. A window that resets before the run would be
+  through — `dependency_sbom`'s minute, or an hourly window in its last seconds — is
+  outside the guard: it cannot lock the next run out, which is what the guard is for,
+  and the throttle path already handles a wait that short. `rate_limit_safety_factor`
+  keeps its meaning and its name. ADR-0007, decision 3.
+
+- **A pause on the node is named by its cause.** Every transient retry's wait was added
+  to one total and rendered as `paused Ns for a GitHub rate limit` — in two weeks of one
+  deployment's logs, eighty-six times, every one of them the library's own one-second
+  backoff after a 500 from the SBOM endpoint or a connection that did not answer, and
+  not one throttle. The node now says `paused 61s for a GitHub rate limit` only when a
+  throttle was read — a `retry-after`, or an exhausted primary window — and `paused 3s
+  retrying after GitHub did not answer` for the rest, or both. A reason string, not a
+  key: nothing stored against this package moves, but a dashboard reader has been told
+  *rate limit* for every retry so far. ADR-0007, decision 4.
+
+- **A read that got no answer leaves no budget claim on the trace**, where it used to
+  carry the previous response's numbers as its own — the source of two false early
+  resets in the logs — and every trace line that names a window names its end as a
+  clock time beside the minutes, `resets in 34min (21:50:07)`, so two lines about two
+  windows read as two. The node keeps the minutes. ADR-0007, decision 5.
+
+- **ADR-0001 says what the budget turned out to be.** An update on the record names the
+  two sentences a deployment's logs measured false — that every call the `github` check
+  makes is charged to `core`, and that the pre-run guard reads the budget the run spends —
+  and points at [ADR-0007](docs/adr/0007-the-budget-is-read-where-it-is-spent.md), an
+  accepted record: GitHub keeps two `core` counters per token, split by request path,
+  each with its own hourly window, and `GET /rate_limit` reports one of them — for some
+  tokens one that nothing spends. The SBOM read is charged to `dependency_sbom`, a hundred
+  a minute. What the `github-rate-limit` node, the guard and the node's pause sentence
+  do about it is the record's five decisions, and they are the four entries above that
+  cite ADR-0007.
+
+### Requires
+
+- **little-sister 0.3.17 or newer.** The floor rises from 0.3.13 because the `actions`
+  lines above carry `Entry.subject` and `Entry.data`, which that release is the first to
+  promise. A deployment on an older library cannot install this version; upgrade the
+  library first. Nothing else about the floor moves, and no configuration changes with it.
+
 ## [0.1.7] - 2026-09-06
 
 ### Added

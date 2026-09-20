@@ -4,7 +4,7 @@
   `code_scanning_alerts` having become `code_scanning_security` and
   `code_scanning_quality` ([ADR-0006](0006-code-scanning-has-two-scales.md)), and
   every count below reads accordingly
-- **Date:** 2026-08-23 (accepted 2026-08-15)
+- **Date:** 2026-09-20 (accepted 2026-08-15)
 - **Related:** [ADR-0001](0001-a-second-check-type-in-this-package.md) (which
   applied the *wording* half of this — "could not ask" — to `github-rate-limit`,
   and named this type's grading half as the question this record answers),
@@ -14,25 +14,6 @@
   (a slug is an identifier, never a position), little-sister **ADR-0058** (one
   transport policy, and any client — the vocabulary this record's machinery moved
   into)
-
-> **Update (2026-09-06):** §7 says the deadline keeps what finished; this says which
-> aspects a run **starts** with. The roster was walked in `ASPECTS` order every run,
-> so a run that never fits refreshed the same head and starved the same tail forever
-> — and a starved aspect keeps its last reading, so it reads as answered rather than
-> as absent, which is the one shape of wrong this record exists to refuse. A run now
-> **resumes after the last aspect that finished**: cut short after four of eight, the
-> next run starts at the fifth, and every aspect is read once per cycle instead of
-> the first four every time. Three things about it. Only a *finished* aspect moves
-> the resume point, so the aspect the deadline cut off is where the next run starts
-> rather than the one after it. The point is a **name**, so a config that switches an
-> aspect off between runs shifts nothing, and a name that has left the roster starts
-> at the head. And it is the **run** order alone — a node's place in the row is
-> `aspect_rank`, read from `ASPECTS` (little-sister ADR-0055), so nothing on the
-> dashboard moves. It is held in memory: a restart begins at the head again, which
-> costs one cycle. Written to retire, finally: when the engine releases a check's
-> units oldest-first, that ordering is what this rotation becomes, and the aspect
-> that starves first is the one that has waited longest rather than the one that sits
-> late in a constant.
 
 ## Context
 
@@ -250,6 +231,24 @@ The deadline is checked in **two** places and both are load-bearing: in `run()`
 before each aspect, so an aspect whose budget is gone is never started; and in the
 client, so a long aspect is cut off partway rather than running to the end of forty
 repositories past the deadline.
+
+**A run resumes after the last aspect that finished.** The roster was walked in
+`ASPECTS` order every run, so a run that never fits refreshed the same head and starved
+the same tail forever — and a starved aspect keeps its last reading, so it reads as
+answered rather than as absent, which is the one shape of wrong this record exists to
+refuse. Cut short after four of eight, the next run starts at the fifth, and every
+aspect is read once per cycle instead of the first four every time. Only a *finished*
+aspect moves the resume point, so the aspect the deadline cut off is where the next run
+starts rather than the one after it. The point is a **name**, so a config that switches
+an aspect off between runs shifts nothing, and a name that has left the roster starts
+at the head. And it is the **run** order alone — a node's place in the row is
+`aspect_rank`, read from `ASPECTS` (little-sister ADR-0055), so nothing on the
+dashboard moves. It is held in memory, so a restart begins at the head again, which
+costs one cycle.
+
+It is written to retire: when the engine releases a check's units oldest-first, that
+ordering is what this rotation becomes, and the aspect that starves first is the one
+that has waited longest rather than the one that sits late in a constant.
 
 ### 8. `pull_requests` is isolated per repository, like the others
 

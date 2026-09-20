@@ -5,7 +5,7 @@
   are three banded ones now, graded per scale as decision 8 says, and the `actions`
   read decision 9 describes was replaced by
   [ADR-0005](0005-the-actions-aspect-asks-per-workflow.md); the grading rules stand
-- **Date:** 2026-08-15 — the grading is the port's and is already in the code; this
+- **Date:** 2026-09-20 (accepted 2026-08-15) — the grading is the port's and is already in the code; this
   record is where it is written down for the people who receive it
 - **Related:** [ADR-0003](0003-an-aspect-is-one-question-asked-of-the-whole-scope.md)
   (what an aspect is, which this record grades within),
@@ -15,9 +15,6 @@
   carries its own code), little-sister **ADR-0036** (a keyed line is a member),
   little-sister **ADR-0050** (a slug is an identifier, never a position),
   little-sister **ADR-0043** (decision 7 — a subject is a virtual child)
-
-A bare ADR number here is this repository's; a reference to one of little-sister's
-is always written out, because the two numbering spaces overlap.
 
 ## Context
 
@@ -68,8 +65,8 @@ Either way the line is a keyed member, and that is what makes one finding
 separately actionable: an engineer who opens a ticket for one alert pins **that
 line** and the other nineteen keep reporting (little-sister ADR-0036). The key is
 built from something GitHub minted — the per-repository number of the pull
-request, issue or alert where there is one, the finding's own API URL where there
-is not, the workflow and branch for a workflow line, and the aspect for the aspects
+request, issue or alert where there is one, the finding's own `html_url` — the
+page a person opens — where there is not, the workflow and branch for a workflow line, and the aspect for the aspects
 that report at most one line per repository. What it is never built from is the
 rendered text, or the line's position in a list (little-sister ADR-0050).
 

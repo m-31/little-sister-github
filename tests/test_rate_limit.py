@@ -14,6 +14,7 @@ from little_sister.checks import CHECK_TYPES, CheckError
 from little_sister.status import StatusCode
 from little_sister.transport import Fault
 
+from little_sister_github.budget import ledger
 from little_sister_github.github import (
     NO_BUDGET_HEADERS,
     GitHubError,
@@ -100,6 +101,27 @@ def _lines(result):
     """``{slug: (text, code)}`` for the lines a run produced."""
     return {entry.slug: (entry.text, entry.code)
             for entry in result.reason_entries}
+
+
+def _spent(check, path, *, remaining, reset, resource="core", limit=5000,
+           used=None, now=None, times=1):
+    """A charged reading on this check's token, as a `github` check's response
+    would have fed it — `times` of them, a second apart, when a test wants the
+    attempts counted."""
+    import time
+    at = time.time() if now is None else now
+    counter = None
+    for step in range(times):
+        counter = ledger().record(
+            check.token, path, resource=resource, limit=limit,
+            remaining=remaining, used=limit - remaining if used is None else used,
+            reset=reset, now=at + step)
+    return counter
+
+
+_ON_A = "/repos/example-org/platform-a/dependabot/alerts"
+_ON_B = "/repos/example-org/platform-a/pulls"
+_ENDPOINT_SAYS = "— as /rate_limit reports it; nothing here has spent it"
 
 
 # --- the type ----------------------------------------------------------------
@@ -192,7 +214,277 @@ def test_a_payload_with_no_reset_leaves_the_clause_off():
     result, _ = _run(_check(), payload)
     text = _lines(result)["core"][0]
     assert "resets" not in text and "now" not in text
-    assert text == "core: 4000 of 5000 requests left"
+    assert text == f"core: 4000 of 5000 requests left {_ENDPOINT_SAYS}"
+
+
+# --- the ledger's windows (ADR-0007, decision 2) -------------------------------
+
+def test_the_tightest_of_two_windows_grades_the_resource_and_the_line_says_so():
+    """"the counter with the least `remaining` grades the resource, and the
+    sentence says it is one of several when it is" — against a pristine endpoint,
+    which is what two of the three tokens measured report. The grade is the
+    tighter window's (WARN) and not the endpoint's (OK), and the line says *2
+    windows* and what the other holds."""
+    import time
+    now = int(time.time())
+    check = _check()
+    _spent(check, _ON_A, remaining=3932, reset=now + 400)
+    _spent(check, _ON_B, remaining=800, reset=now + 100)
+    result, _ = _run(check, _resources(core=(5000, 5000, now + 3600),
+                                       graphql=(5000, 5000, now + 3600)))
+    text, code = _lines(result)["core"]
+    assert code is StatusCode.WARN
+    assert text == ("core: 800 of 5000 requests left, resets in 1min; 1 of it "
+                    "this process's own — the tightest of 2 windows GitHub keeps "
+                    "for this token; the other has 3932 left, resets in 6min")
+    assert result.stored_code is StatusCode.WARN
+
+
+def test_a_resource_the_ledger_has_not_heard_of_is_read_from_the_endpoint_and_says_so():
+    """"A resource the ledger has heard nothing about from a response is reported
+    from the endpoint and says so" — `graphql` here, which nothing in this
+    process spends, pristine or not."""
+    import time
+    now = int(time.time())
+    check = _check()
+    _spent(check, _ON_B, remaining=4000, reset=now + 400)
+    result, _ = _run(check, _resources(core=(5000, 5000, now + 3600),
+                                       graphql=(5000, 4900, now + 3570)))
+    lines = _lines(result)
+    assert lines["graphql"][0] == (
+        f"graphql: 4900 of 5000 points left, resets in 59min {_ENDPOINT_SAYS}")
+    assert lines["graphql"][1] is StatusCode.OK
+    assert not lines["core"][0].endswith(_ENDPOINT_SAYS)
+
+
+def test_a_pristine_endpoint_alone_is_reported_as_such_and_opens_no_window():
+    """The token whose endpoint says `5000 of 5000, 0 used` on every read: before
+    the `github` check has run, that is all there is, and the line says where it
+    came from. A minute later the same reading with a newer reset is not a second
+    window."""
+    import time
+    now = int(time.time())
+    check = _check()
+    first, _ = _run(check, _resources(core=(5000, 5000, now + 3600),
+                                      graphql=(5000, 5000, now + 3600)))
+    assert _lines(first)["core"][0] == (
+        f"core: 5000 of 5000 requests left, resets in 59min {_ENDPOINT_SAYS}")
+    second, _ = _run(check, _resources(core=(5000, 5000, now + 3660),
+                                       graphql=(5000, 5000, now + 3660)))
+    assert "windows" not in _lines(second)["core"][0]
+    assert ledger().counters(check.token, "core", float(now)) == []
+
+
+def test_the_endpoints_body_is_one_more_reading_of_the_window_its_reset_names():
+    """"The `/rate_limit` body is still read every run and is merged into the
+    ledger as one more reading, of whichever counter its `reset` names" — the
+    second identity in the logs, whose endpoint restated counter B exactly. The
+    node says the newer number, and the endpoint's sample raised nothing this
+    process is believed to have spent."""
+    import time
+    now = int(time.time())
+    check = _check()
+    _spent(check, _ON_B, remaining=3000, reset=now + 1500, times=3)
+    result, _ = _run(check, _resources(core=(5000, 2900, now + 1500),
+                                       graphql=(5000, 5000, now + 3600)))
+    assert _lines(result)["core"][0] == (
+        "core: 2900 of 5000 requests left, resets in 24min; 3 of it this "
+        "process's own")
+    (counter,) = ledger().counters(check.token, "core", float(now))
+    assert counter.attempts == 2 and counter.remaining == 2900
+
+
+def test_a_real_counter_the_endpoint_alone_reports_is_graded_and_named_as_such():
+    """The endpoint reporting a counter with spend that nothing here has spent —
+    the other instance's reads on a shared token — is a reading, and it grades:
+    the budget is the token's, whoever spends it (ADR-0001)."""
+    import time
+    now = int(time.time())
+    check = _check()
+    result, _ = _run(check, _resources(core=(5000, 300, now + 1500),
+                                       graphql=(5000, 5000, now + 3600)))
+    text, code = _lines(result)["core"]
+    assert code is StatusCode.ERROR
+    assert text == f"core: 300 of 5000 requests left, resets in 24min {_ENDPOINT_SAYS}"
+
+
+def test_the_line_says_what_this_process_spent_and_the_three_clauses_reconcile():
+    """Backlog #5: the node said what somebody else spends and what a window
+    carried before it, and nothing about its own reads — the one number a reader
+    can act on. It is a count, not a rate, so it carries no tilde, and it is the
+    ledger's `own_spend`: the attempts plus the reading that opened the window."""
+    import time
+    now = int(time.time())
+    check = _check()
+    _spent(check, _ON_B, remaining=4900, used=100, reset=now + 1500,
+           now=now - 3600)
+    _spent(check, _ON_B, remaining=4800, used=200, reset=now + 1500,
+           now=now - 60, times=99)
+    result, _ = _run(check, _resources(core=(5000, 5000, now + 3600),
+                                       graphql=(5000, 5000, now + 3600)))
+    text = _lines(result)["core"][0]
+    assert "; 100 of it this process's own" in text
+    # the whole window is ours, so there is no rate to say about anybody else
+    assert "spent by something else" not in text
+
+
+def test_the_own_spend_clause_comes_before_the_other_two():
+    """The three clauses are one sentence about where a window went — this
+    process's, somebody else's rate, and what it carried before — and they are said
+    in that order, because the reader's own spend is the one they can change."""
+    import time
+    now = int(time.time())
+    check = _check()
+    _spent(check, _ON_B, remaining=4000, reset=now - 3700, now=now - 4000)
+    _spent(check, _ON_B, remaining=4954, used=46, reset=now + 1530,
+           now=now - 3600)
+    _spent(check, _ON_B, remaining=2000, used=1546, reset=now + 1530,
+           now=now - 268, times=268)
+    text = _lines(_run(check, _resources(core=(5000, 5000, now + 3600),
+                                         graphql=(5000, 5000, now + 3600)))[0]
+                  )["core"][0]
+    ours = text.index("this process's own")
+    else_ = text.index("spent by something else using this token")
+    before = text.index("before this process first read this window")
+    assert ours < else_ < before
+
+
+def test_a_window_nothing_here_spent_says_nothing_about_its_own_spend():
+    """A resource this process has not touched — the endpoint's own counter — has
+    no spend of ours to report, and the line says what it already said: that the
+    numbers are `/rate_limit`'s and nothing here has spent them."""
+    import time
+    now = int(time.time())
+    check = _check()
+    result, _ = _run(check, _resources(core=(5000, 300, now + 1500),
+                                       graphql=(5000, 5000, now + 3600)))
+    text = _lines(result)["core"][0]
+    assert "this process's own" not in text
+    assert text.endswith(_ENDPOINT_SAYS)
+
+
+def test_the_line_says_what_something_else_spends_when_it_is_not_negligible():
+    """"the spend this process did not make … `~1250/h of it is spent by
+    something else using this token`" — measured between this process's own
+    readings: an hour, 268 attempts, `used` up by 1,500; the rest is somebody's,
+    and it is said with the tilde. Below one percent of the limit an hour it is
+    not said."""
+    import time
+    now = int(time.time())
+    check = _check()
+    _spent(check, _ON_B, remaining=3500, used=1500, reset=now + 1500,
+           now=now - 3600)
+    _spent(check, _ON_B, remaining=2000, used=3000, reset=now + 1500,
+           now=now - 268, times=268)
+    result, _ = _run(check, _resources(core=(5000, 5000, now + 3600),
+                                       graphql=(5000, 5000, now + 3600)))
+    text = _lines(result)["core"][0]
+    assert text.startswith("core: 2000 of 5000 requests left, resets in 24min; ")
+    assert "~1230/h of it is spent by something else using this token" in text
+    quiet = _check()
+    _spent(quiet, _ON_A, remaining=4000, used=1000, reset=now + 1500,
+           now=now - 3600)
+    _spent(quiet, _ON_A, remaining=3970, used=1030, reset=now + 1500,
+           now=now - 28, times=28)
+    result, _ = _run(quiet, _resources(core=(5000, 5000, now + 3600),
+                                       graphql=(5000, 5000, now + 3600)))
+    assert "spent by something else" not in _lines(result)["core"][0]
+
+
+def test_the_line_says_what_a_window_carried_before_this_process_first_read_it():
+    """The hourly job on the deployment's second token opens each window and
+    spends thirty to forty-five requests before this process reads it — in
+    `first_used`, never in the rate. With the rollover seen, the tightest window
+    says it, and there is no floor but zero: with the rollover seen the number is
+    a measurement, not an estimate."""
+    import time
+    now = int(time.time())
+    check = _check()
+    _spent(check, _ON_B, remaining=4000, reset=now - 1000, now=now - 1500)
+    _spent(check, _ON_B, remaining=4954, used=46, reset=now + 2630,
+           now=now - 900)
+    result, _ = _run(check, _resources(core=(5000, 5000, now + 3600),
+                                       graphql=(5000, 5000, now + 3600)))
+    assert _lines(result)["core"][0] == (
+        "core: 4954 of 5000 requests left, resets in 43min; 1 of it this "
+        "process's own; 45 of it were spent by something else before this "
+        "process first read this window")
+
+
+def test_a_window_this_process_opened_says_nothing_about_somebody_else():
+    import time
+    now = int(time.time())
+    check = _check()
+    _spent(check, _ON_B, remaining=4000, reset=now - 1000, now=now - 1500)
+    _spent(check, _ON_B, remaining=4999, used=1, reset=now + 2630, now=now - 900)
+    result, _ = _run(check, _resources(core=(5000, 5000, now + 3600),
+                                       graphql=(5000, 5000, now + 3600)))
+    assert _lines(result)["core"][0] == (
+        "core: 4999 of 5000 requests left, resets in 43min; 1 of it this "
+        "process's own")
+
+
+def test_the_two_clauses_about_something_else_read_as_one():
+    import time
+    now = int(time.time())
+    check = _check()
+    _spent(check, _ON_B, remaining=4000, reset=now - 3700, now=now - 4000)
+    _spent(check, _ON_B, remaining=4954, used=46, reset=now + 1530,
+           now=now - 3600)
+    _spent(check, _ON_B, remaining=2000, used=1546, reset=now + 1530,
+           now=now - 268, times=268)
+    result, _ = _run(check, _resources(core=(5000, 5000, now + 3600),
+                                       graphql=(5000, 5000, now + 3600)))
+    assert _lines(result)["core"][0] == (
+        "core: 2000 of 5000 requests left, resets in 25min; 269 of it this "
+        "process's own; ~1230/h of it is spent by something else using this "
+        "token, and 45 of it before this process first read this window")
+
+
+def test_three_windows_are_all_named():
+    import time
+    now = int(time.time())
+    check = _check()
+    _spent(check, _ON_A, remaining=3932, reset=now + 400)
+    _spent(check, _ON_B, remaining=2441, reset=now + 100)
+    _spent(check, "/orgs/example-org/repos", remaining=4100, reset=now + 1220)
+    result, _ = _run(check, _resources(core=(5000, 5000, now + 3600),
+                                       graphql=(5000, 5000, now + 3600)))
+    assert _lines(result)["core"][0] == (
+        "core: 2441 of 5000 requests left, resets in 1min; 1 of it this "
+        "process's own — the tightest of 3 windows GitHub keeps for this token; "
+        "the others have 3932 left, resets in 6min, and 4100 left, resets in "
+        "20min")
+
+
+def test_a_resource_the_endpoint_leaves_out_but_the_reads_spend_is_read_from_them():
+    """`dependency_sbom` on an installation whose endpoint leaves it out: the
+    reads still carry its headers, and the ledger keys by resource, so the
+    watched line is a reading and not a warning about the payload."""
+    import time
+    now = int(time.time())
+    check = _check(budgets=(Budget("dependency_sbom", 30, 10),))
+    _spent(check, "/repos/example-org/platform-a/dependency-graph/sbom",
+           resource="dependency_sbom", limit=100, remaining=84, reset=now + 50)
+    result, _ = _run(check, _resources(core=(5000, 5000, now + 3600)))
+    text, code = _lines(result)["dependency_sbom"]
+    assert code is StatusCode.OK
+    assert text == ("dependency_sbom: 84 of 100 requests left, resets in under "
+                    "a minute; 1 of it this process's own")
+
+
+def test_another_tokens_windows_are_not_this_nodes():
+    """"per token (keyed by a digest of the token's value …)": a second check on
+    another credential reports its own budget and nothing of this one's."""
+    import time
+    now = int(time.time())
+    check = _check()
+    ledger().record("some-other-token", _ON_B, resource="core", limit=5000,
+                    remaining=10, used=4990, reset=now + 100, now=float(now))
+    result, _ = _run(check, _resources(core=(5000, 5000, now + 3600),
+                                       graphql=(5000, 5000, now + 3600)))
+    assert _lines(result)["core"][1] is StatusCode.OK
+    assert "windows" not in _lines(result)["core"][0]
 
 
 # --- the units ---------------------------------------------------------------

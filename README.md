@@ -5,7 +5,7 @@ GitHub check types for [little-sister](https://github.com/m-31/little-sister).
 **`github`** — one node per configured account — an organization, optionally
 narrowed to one team, or a personal account — with a child per enabled aspect:
 open pull requests, Dependabot advisories, code-scanning and secret-scanning
-alerts, SBOM presence, workflow runs and open issues.
+alerts, dependency-graph presence, workflow runs and open issues.
 
 **`github-rate-limit`** — one node per **token**, with a line per API budget.
 Cheap enough to run every minute, and it is what explains a `github` check that
@@ -14,6 +14,13 @@ has started skipping its runs.
 Every finding is an individually addressable line, so an operator who opens a
 ticket for one alert can put **that line** into maintenance and the rest of the
 aspect keeps reporting.
+
+This file is the front door: what the package needs, how it is installed and
+configured, and what the token must be allowed to read. How the two checks are built
+— the client, the run, the budget ledger, what every line on a node and in the log
+means — is [`docs/architecture.md`](docs/architecture.md); why they are built that way
+is [`docs/decisions.md`](docs/decisions.md) and the records in
+[`docs/adr/`](docs/adr/).
 
 ## The contract
 
@@ -31,7 +38,7 @@ aspect keeps reporting.
 # Pin them. A deployment names exact versions so an upgrade is a deliberate edit
 # rather than drift; a plugin is the one that declares a floor, because two plugins
 # that each pinned could not be installed together.
-dependencies = ["little-sister==0.3.13", "little-sister-github==0.1.7"]
+dependencies = ["little-sister==0.3.17", "little-sister-github==0.1.8"]
 ```
 
 ```python
@@ -63,9 +70,46 @@ kind: organization
 team: platform
 ```
 
-The token needs `read:org`, `repo`, `security_events` and dependency-graph read
-access. Each team's check carries its own credential, so a second team is a second
-config file rather than a code change.
+What the token needs, read by read, is under *What the token needs* below. Each
+team's check carries its own credential, so a second team is a second config file rather
+than a code change.
+
+### The settings
+
+The common keys every check has — `path`, `title`, `about`, `frequency`, `timeout`,
+`secrets` — are little-sister's; `timeout:` is the **whole run's** budget here (it used
+to be spent per request — if you are upgrading, re-read it against your scope). The
+example file carries a comment per key; this is the same list with its defaults.
+
+| Key | Default | What it decides |
+|---|---|---|
+| `owner` | required | the account login — an organization or a person |
+| `kind` | required | `organization` or `user`; declared, and verified against GitHub on every run |
+| `team` | — | narrows an organization to one team, by slug or name; refused with `kind: user` |
+| `name_prefix` | — | keeps only repositories whose name starts with it |
+| `include_archived` | `false` | archived repositories are ones nobody can act on |
+| `include_forks` | `true` | a fork the account holds is a repository, and its pull requests are real |
+| `api_url` | `https://api.github.com` | a GitHub Enterprise Server's `…/api/v3`; its GraphQL endpoint is found beside it |
+| `advanced_security_on_private` | `true` for an organization, `false` for a personal account | whether the code-scanning and secret-scanning aspects read **private** repositories — a question about visibility, since Advanced Security is paid there; the ones they skip are named on the aspect ([ADR-0003](docs/adr/0003-an-aspect-is-one-question-asked-of-the-whole-scope.md), decision 6) |
+| `expect_min_repos` | `1` | fewer repositories discovered is WARN on the check's node; cannot be `0` |
+| `request_timeout` | `15s` | one request's budget; a request is also clamped to what is left of `timeout` |
+| `max_pause` | half of `timeout` | how much of the run may be spent asleep, waiting out a rate limit or on a retry's backoff; must be less than `timeout` |
+| `rate_limit_safety_factor` | `4` | the guard: a run is skipped when a budget window it would spend has less than this times the reads landing on it |
+| `<aspect>.enabled` | `true` | in the aspect's own block; `secret_scanning:` is the block of `secret_scanning_alerts` |
+| `pull_requests.ignore_title_prefixes` | `[]` | open pull requests whose title starts with one are not listed (case-insensitive) |
+| `security_advisories.severities` | `[critical, high]` | which Dependabot severities are reported at all |
+| `security_advisories.severity_map` | `critical`, `high` → ERROR; `medium`, `low` → WARN | what each reported severity means here |
+| `code_scanning_security.severity_map` | every band ERROR | the alerts GitHub gave a security severity |
+| `code_scanning_quality.severity_map` | `error`, `warning` → WARN; `note` → OK | everything else, by the rule's own analysis severity |
+| `secret_scanning.require_enabled` | `true` | a repository with secret scanning switched off is ERROR |
+| `sbom_check.ignore` | `[]` | repositories exempt from the dependency-graph requirement |
+| `actions.all_branches` | `false` | watch every branch rather than the default one — the one mode that stays incomplete, and says so |
+| `actions.branches` | `[]` | watch these branches **instead of** the default one, each workflow asked about each name; refused together with `all_branches` |
+| `actions.disabled_severity_map` | `disabled_manually`, `disabled_inactivity` → WARN; `disabled_fork` → OK | what a switched-off workflow means here; its runs are not read |
+| `actions.show_healthy` | `false` | also list workflows that passed and are idle |
+| `actions.ignore_workflow_name_patterns` | `[]` | regexes, case-insensitive, applied before anything is spent on a workflow |
+| `issues.ignore` | `[]` | repositories exempt from the issues check |
+| `subnodes` | — | your own display text per aspect, appended to the shipped one with `{default}` |
 
 ### `owner:` may name a person
 
@@ -75,35 +119,15 @@ required.** It is declared rather than discovered because every load-time decisi
 is taken from it, and it is **verified** on every run against `GET /users/{login}`,
 because a claim nobody checks decays: GitHub lets a personal account convert to an
 organization. A disagreement is a refusal naming both the config's claim and
-GitHub's answer, not a wrong scope.
+GitHub's answer, not a wrong scope. `team:` is an organization's, so `kind: user`
+with a team is refused before the check ever runs.
 
-What follows from the kind:
-
-- **`team:` is an organization's.** A personal account has no teams, so the
-  combination is a config error, refused before the check ever runs.
-- **`advanced_security_on_private`** defaults to `true` for an organization and
-  `false` for a personal account — see below.
-- **A personal account's private repositories need its own token.**
-  `/users/{login}/repos` returns public repositories only, however privileged the
-  token — the private ones are listed by `/user/repos`, and only for the account
-  the token belongs to. When they are out of reach the check's own reading says
-  `(public only)`, because a scope smaller than the one configured otherwise reads
-  exactly like a complete one.
-- The link to the organization security overview is dropped on a personal account
-  rather than pointing at a page that 404s.
-
-### Advanced Security is about visibility, not about the kind
-
-Code scanning and secret scanning need GitHub Advanced Security.
-`advanced_security_on_private:` says whether this deployment has it on **private**
-repositories; the account kind only picks the default. With it off, private
-repositories drop out of those two aspects entirely and are **named on the aspect's
-node**; the account's public repositories are still read. Every other aspect reads
-private repositories either way. Why the switch is drawn on visibility rather than
-on the account kind, and why the skipped repositories are named instead of reported
-as unscanned, is
-[ADR-0003](docs/adr/0003-an-aspect-is-one-question-asked-of-the-whole-scope.md),
-decision 6.
+**A personal account's private repositories need its own token.**
+`/users/{login}/repos` returns public repositories only, however privileged the
+token — the private ones are listed by `/user/repos`, and only for the account
+the token belongs to. When they are out of reach the check's own reading says
+`(public only)`, because a scope smaller than the one configured otherwise reads
+exactly like a complete one.
 
 ### Switching an aspect off
 
@@ -119,10 +143,7 @@ rate-limit estimate shrinks with it. **No node also means no pin**: a maintenanc
 pin held against that node, or against a line under it, matches nothing while the
 aspect is off. An aspect that says nothing is on, so an aspect a later release
 adds arrives switched on in configs written before it existed. Switching every
-aspect off is a config error. The one block not named after its aspect is
-`secret_scanning:`, which switches `secret_scanning_alerts` — the block is named
-for GitHub's feature, the node for what it reports, and both are keys somebody
-holds, which is why neither was renamed
+aspect off is a config error
 ([ADR-0003](docs/adr/0003-an-aspect-is-one-question-asked-of-the-whole-scope.md),
 decisions 5 and 7).
 
@@ -134,13 +155,6 @@ so it works the same way for every branch check type you install.
 
 ## What it reads
 
-A severity band's title is a **colored circle** — 🔴 `critical`, 🟠 `high`, 🟡 `medium`,
-🔵 `low`, and the analysis severities `error` / `warning` / `note` on the same three
-rungs — with **❓** for a severity this package does not name. The color is by name, so
-the same severity wears the same circle in every aspect and in every deployment; the
-band's own name sits beside it, and `nodes.yaml` sets a different title per node path if
-you want the word.
-
 | Aspect | Endpoint | Grade |
 |---|---|---|
 | `pull_requests` | `GET /repos/{r}/pulls?state=open` | any open PR (minus `ignore_title_prefixes`) → **WARN** |
@@ -148,21 +162,20 @@ you want the word.
 | `code_scanning_security` | `GET /repos/{r}/code-scanning/alerts?state=open` | the alerts GitHub gave a **security** severity: one leaf per `critical` / `high` / `medium` / `low`, graded by `code_scanning_security.severity_map` (all **ERROR** by default) |
 | `code_scanning_quality` | *(the same read)* | everything else, by the rule's own **analysis** severity: `error` / `warning` / `note`, graded by `code_scanning_quality.severity_map` (**WARN** / **WARN** / **OK** by default) |
 | `secret_scanning_alerts` | `GET /repos/{r}/secret-scanning/alerts?state=open` | any open alert → **ERROR**; scanning disabled → **ERROR** (`secret_scanning.require_enabled`) |
-| `sbom_check` | `GET /repos/{r}/dependency-graph/sbom` | no dependency graph → **ERROR** (`sbom_check.ignore`) |
-| `actions` | `GET /repos/{r}/actions/workflows` + `…/actions/workflows/{id}/runs` per workflow | one coded line per workflow and branch **that has something to say**: the newest useful verdict, plus a newer in-flight run (default branch unless `actions.all_branches`; a passing idle workflow only with `actions.show_healthy`). Asking per workflow is exact — nothing back means that workflow does not run on that branch. `actions.all_branches`, a workflow list longer than one page, and a budget too thin to pay per workflow each fall back to one page of `…/actions/runs`, and one WARN line then names the repositories the answer was short about ([ADR-0005](docs/adr/0005-the-actions-aspect-asks-per-workflow.md)) |
+| `sbom_check` | `POST /graphql` — `repository(owner:, name:) { dependencyGraphManifests(first: 10) { totalCount nodes { filename parseable exceedsMaxSize } } }`, one query per repository, one point each | no dependency graph → **ERROR** (`platform-api: no dependency graph (0 manifests)`); manifests none of which could be parsed → **ERROR**, with the cause on the line (`platform-api: 2 manifests, none parseable (package-lock.json exceeds the size limit)`); more than ten manifests is a graph whatever the first ten say (`sbom_check.ignore`; [ADR-0008](docs/adr/0008-the-dependency-graph-is-asked-not-exported.md)) |
+| `actions` | `GET /repos/{r}/actions/workflows` + `…/actions/workflows/{id}/runs` per workflow and branch | one coded line per workflow and branch **that has something to say**: the newest useful verdict, plus a newer in-flight run (the default branch, or the branches `actions.branches` names, or every branch with `actions.all_branches`; a passing idle workflow only with `actions.show_healthy`). Asking per workflow is exact — nothing back means that workflow does not run on that branch. `actions.all_branches` and a budget too thin to pay per workflow fall back to one page of `…/actions/runs`, and one WARN line then names the repositories the answer was short about; where the named branches matched no workflow in a repository, another names it and its default branch ([ADR-0005](docs/adr/0005-the-actions-aspect-asks-per-workflow.md), [ADR-0009](docs/adr/0009-named-branches-replace-the-default-branch.md)) |
 | `issues` | `GET /repos/{r}/issues?state=open` | any open issue → **WARN** (`issues.ignore`); issues disabled → **WARN** |
 
 Discovery is one call verifying the declared kind — plus, for a personal account,
-one asking whose token this is — and then the repository listing: the
-organization's, the account's, or (with `team:`) the org's teams followed by that
-team's repositories. It is filtered by `name_prefix`, `include_archived` and
-`include_forks`, and every aspect starts from that one set — narrowed only where an
-aspect says so: the two Advanced Security aspects drop private repositories when
-`advanced_security_on_private` is off, and `sbom_check` and `issues` skip their own
-`ignore` lists. The check's own node carries the
+one asking whose token this is — and then the repository listing, filtered by
+`name_prefix`, `include_archived` and `include_forks`. Every aspect starts from that
+one set, narrowed only where an aspect says so. The check's own node carries the
 discovery coverage reading (`expect_min_repos`) and the repository roster, and rolls
-up worst-of its aspects. Only stdlib `urllib` is used — the package has no
-dependency but little-sister itself.
+up worst-of its aspects. A severity band's title is a **colored circle** by severity
+name — 🔴 `critical`, 🟠 `high`, 🟡 `medium`, 🔵 `low`, the analysis severities on the
+same three rungs, ❓ for one this package does not name — and `nodes.yaml` sets a
+different title per node path if you want the word. Only stdlib `urllib` is used — the
+package has no dependency but little-sister itself.
 
 The table says what each aspect grades. **Why** it grades that way — why the tree
 is aspect-first, why a missing dependency graph is red while an open pull request
@@ -177,77 +190,70 @@ five carry the codes in this table with no knob for them: what a deployment deci
 about those is whether the aspect runs (`enabled: false`) and which repositories or
 titles it skips.
 
+### What the token needs
+
+The check works with a **classic** personal access token and with a **fine-grained**
+one; nothing in it cares which, as long as the token may read what an aspect reads. A
+fine-grained token is issued with the organization as its resource owner and granted the
+repositories the check should see — every repository the scope will contain, or the
+listing is quietly shorter than the organization. Read access is enough everywhere; the
+check writes nothing.
+
+| Read | Classic scope | Fine-grained permission |
+|---|---|---|
+| discovery — `/orgs/{org}/repos`, `/users/{login}/repos` | `repo` (`public_repo` for public repositories only) | *Metadata* (read), which every fine-grained token has |
+| discovery with `team:` — `/orgs/{org}/teams`, `…/teams/{team}/repos` | `read:org` | *Members* — an **organization** permission (read) |
+| `pull_requests` | `repo` | *Pull requests* (read) |
+| `security_advisories` — Dependabot alerts | `security_events` | *Dependabot alerts* (read) |
+| `code_scanning_security`, `code_scanning_quality` | `security_events` | *Code scanning alerts* (read) |
+| `secret_scanning_alerts` | `repo` or `security_events` | *Secret scanning alerts* (read) |
+| `sbom_check` — the dependency graph | `repo` | *Contents* (read) |
+| `actions` | `repo` | *Actions* (read) |
+| `issues` | `repo` | *Issues* (read) |
+| `github-rate-limit` — `GET /rate_limit` | none | none |
+
+A token that may not read something answers `401` or `403`, and the check reports that
+as a fact about the repository rather than as a failure of the run; a token that may
+not read the **repository list** fails discovery, which the node says in as many words.
+A GitHub App's installation token is not a fit today: it expires after an hour, and
+little-sister resolves a credential once, at startup.
+
 ### When GitHub is the one having a bad day
 
 A read that fails is not automatically a finding about the repository, and this type
 tells the two apart by **status**
-([ADR-0002](docs/adr/0002-a-read-failure-is-not-a-finding.md)).
+([ADR-0002](docs/adr/0002-a-read-failure-is-not-a-finding.md)): a 5xx, a dropped
+connection or a rate limit — retried once — is a line saying *could not ask GitHub*
+that **grades nothing**, while a `404` and a `401` or `403` without a throttle header
+are answers, and still grade. Because those quiet lines grade nothing, the coverage
+does: an aspect that could not ask about a repository carries one amber line of its
+own, `GitHub did not answer for 1 of 40 repositories`, and the check's own node states
+the run's total once, with what the run slept, by cause — `paused 61s for a GitHub rate
+limit`, `paused 3s retrying after GitHub did not answer`. A wait GitHub asks for is
+taken when the run and `max_pause` can afford it and refused whole when they cannot;
+when to ask again is your `frequency:`. If GitHub cannot answer *which repositories
+exist*, the check says `WARN` and reports nothing else, so every aspect keeps what the
+last good run found; a discovery failure GitHub *answered* — an owner or team that is
+not there, a token that may not look — is a defect in your configuration and stays
+`ERROR`. The fault table, the throttle reading and the two coverage lines are
+[`docs/architecture.md`](docs/architecture.md) §2 and §3.
 
-| what came back | what you see |
-|---|---|
-| **5xx** or a transport failure, twice | a line saying *could not ask GitHub* that **grades nothing** — the repository is not painted amber for GitHub's outage |
-| a **rate limit** — 403 or 429 with a throttle header | the same quiet line, and the wait GitHub named is honored if the run can afford it |
-| **404** | unchanged: the thing is absent, which is a finding |
-| **401 / 403** with no throttle header | unchanged: still grades, because a token that may not read a repository is a fact about that repository |
-| an answer this check **cannot read** | a line saying *could not read*, which grades — waiting changes nothing about a payload of the wrong shape |
+### The run is skipped before it can exhaust the token
 
-**A rate limit is *not now*, not *no*.** GitHub answers one with 403 **or** 429, and a
-bare 403 also means *this token may not see it* — so the status alone cannot tell the
-two apart, and the headers decide: `retry-after`, then `x-ratelimit-remaining: 0` with
-`x-ratelimit-reset`, otherwise 60 seconds. A bare 429 counts as a throttle, because
-GitHub sends that status for nothing else; a bare 403 does not. **The wait stays inside
-`timeout:`** — a short secondary limit is absorbed and the run carries on, while a
-reset twenty minutes out is not slept through: the line says how long GitHub asked for,
-and the run reports what it has. When to ask again is your `frequency:`.
+A run is skipped, with a WARN naming the window, when a budget window it would spend
+cannot afford it: `rate_limit_safety_factor` times the reads that will land on that
+window, less what something else is measured to be spending on it. A token has more
+than one `core` window, split by request path, and `GET /rate_limit` reports one of
+them — for some tokens one nothing spends — so the guard prices each window from the
+budget headers of this process's own reads, and reads the endpoint only where it knows
+nothing yet ([ADR-0007](docs/adr/0007-the-budget-is-read-where-it-is-spent.md),
+decision 3):
 
-A transient failure is **retried once** before any of that, so what reaches the
-dashboard has usually survived a second ask — usually, because a run short of budget
-skips the retry, which is why the sentences below claim only that GitHub did not
-answer (ADR-0002, decision 3).
+```
+skipped this run: 310 API calls left on the window GitHub charges the dependabot, code-scanning and actions reads to (resets in 12min), need > 4×57 for 19 repo(s)
+```
 
-Because those repository lines grade nothing, the **coverage** does, in two places
-that say different things. An aspect that could not ask about a repository carries one
-amber line of its own — `GitHub did not answer for 1 of 40 repositories` — so an
-aspect that could not look is never mistaken for one with nothing to report, whether
-it missed one repository or all of them. That line appears **only** when something
-could not be asked about, so an aspect whose only trouble was a permission error stays
-as quiet as before: that repository is already amber on its own line, and counting it
-twice would make the number mean two things. And the check's own node states the run's
-total, once: `3 repository reads could not be completed this run`.
-
-Discovery follows the same rule as everything under it. If GitHub cannot answer *which
-repositories exist*, the check says `WARN` and reports **nothing else** — which leaves
-every aspect showing what the last good run found, rather than replacing a working
-dashboard with one red line. A discovery failure GitHub *answered* — an owner or team
-that is not there, a token that may not look — is a defect in your configuration and
-stays `ERROR`.
-
-### Three budgets, and they are not the same one
-
-- **`timeout:`** is the **whole run's** deadline, and the check honors it. When it
-  runs out the aspects that finished are kept, the rest are absent, and the node
-  says so. Size it for the scope: a run makes at least one request per repository
-  per aspect — `actions` makes one plus one per workflow
-  ([ADR-0005](docs/adr/0005-the-actions-aspect-asks-per-workflow.md)) — and pages on
-  top of that.
-- **`request_timeout:`** (default `15s`) bounds **one request**, and a request is
-  additionally clamped to whatever is left of `timeout:`.
-- **`max_pause:`** (default: half of `timeout:`) bounds how much of the run may be
-  spent **asleep** waiting out a GitHub rate limit. The deadline cannot say this on
-  its own: a run that sleeps for its whole budget never overruns it, and reports
-  nothing. A wait the budget cannot afford is refused whole and ends the run like
-  an exhausted `timeout:` — what finished is kept, and the node says which wait it
-  would have taken. It must be **less** than `timeout:`, or no run could reach it.
-
-`request_timeout:` is what reaches the socket layer, which bounds a socket
-*operation* rather than a whole request; `timeout:` is checked between requests and
-clamps that socket timeout down to whatever is left of the run. A response body is
-read in bounded chunks against `timeout:` as well, which is what closes the last gap
-in that pair: a socket timeout alone never fires on a server dribbling one byte at a
-time, because every individual read succeeds.
-
-If you are upgrading, re-read your `timeout:` against that first bullet: it used to
-be spent per request and now bounds the run.
+The `github-rate-limit` check on the same token explains the skipped runs.
 
 ## `github-rate-limit` — the API budget
 
@@ -279,28 +285,39 @@ resource name — so a maintenance pin held against `core` survives a config tha
 starts watching `search` next year:
 
 ```
-core: 4812 of 5000 requests left, resets in 43min
-graphql: 122 of 5000 points left, resets in 12min
+core: 2441 of 5000 requests left, resets in 1min; 269 of it this process's own; ~1250/h of it is spent by something else using this token — the tightest of 2 windows GitHub keeps for this token; the other has 3932 left, resets in 6min
+graphql: 5000 of 5000 points left, resets in 59min — as /rate_limit reports it; nothing here has spent it
 ```
 
-Readings it will not fake:
-
-- an **unreadable endpoint** says the *asking* failed, rather than claiming a
-  budget nobody read;
-- a **watched resource GitHub did not report** is a warning line naming it, not a
-  missing line;
-- a **row this check cannot read** — a missing `limit`, a field in a shape that is
-  not a number — is a warning line for *that resource only*;
-- a resource whose reported limit is **not positive** says nothing at all rather
-  than grading.
-
-Why each of those is the reading it is, is
-[ADR-0001](docs/adr/0001-a-second-check-type-in-this-package.md), decision 5.
+The line is written from the budget headers on every response this process has had on
+that token, kept in a ledger for the life of the process, with `GET /rate_limit` merged
+in as one more reading: the tightest window grades the resource, and the line says how
+many windows there are, what the others hold, how much of the window **this process**
+itself spent, at what rate something else is spending the token, and — once this process
+has seen a window open — what it already carried at the first reading
+([ADR-0007](docs/adr/0007-the-budget-is-read-where-it-is-spent.md) decision 2). Its own
+spend is a count of what the ledger recorded, not an
+estimate, and it is bounded by the ledger's life: it is this process's share since it
+first saw that window, so on a token a second instance or a pipeline also spends, the
+rest of `used` is what the other two clauses are for. After a restart the line is the endpoint's until the first `github` run
+refills the memory. What every clause means, and the readings the check refuses to
+fake, is [`docs/architecture.md`](docs/architecture.md) §4.
 
 Grading is on what is left and **only** on that: the reset time is on the line so
 you can see a red budget is about to refill, and it does not soften the verdict
-([ADR-0001](docs/adr/0001-a-second-check-type-in-this-package.md), decision 4). The
-thresholds in force are rendered on the node.
+([ADR-0001](docs/adr/0001-a-second-check-type-in-this-package.md), decision 4), and
+the foreign rate is on the line and not in the grade. `warn_below` and
+`error_below` are compared with the **tightest** window, so a deployment that
+tuned them against the endpoint's number may see the node go amber sooner — that
+is the node telling the truth. The thresholds in force are rendered on the node.
+
+Between runs most of what the `github` check reads has not changed, so it asks
+conditionally: it keeps each read's `ETag` and sends `If-None-Match`, and GitHub answers
+`304 Not Modified` without charging the primary rate limit — measured, not assumed. The
+held answer is returned unchanged, so no reading and no line differs from what a full
+read would have said. Nothing is configured, and the check's own page says how many
+payloads are held and how many of a run's requests were free
+([ADR-0011](docs/adr/0011-conditional-requests-and-the-cache-that-holds-them.md)).
 
 The token needs **no scopes** for this endpoint — but it has to resolve, and it has
 to be one GitHub accepts. A reference that resolves to nothing pins the check to a

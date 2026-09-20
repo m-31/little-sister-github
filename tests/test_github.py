@@ -15,6 +15,7 @@ from little_sister.status import StatusCode
 from little_sister.transport import Deadline, DeadlineExceeded, Fault
 
 from little_sister_github import github as mod_github
+from little_sister_github.budget import Ledger, ledger
 from little_sister_github.github import (
     BAND_GLYPHS,
     DEFAULT_REQUEST_TIMEOUT,
@@ -32,8 +33,17 @@ from little_sister_github.github import (
     budget_said,
 )
 
-_SBOM_PRESENT = {"sbom": {"relationships": [{"spdxElementId": "root"}]}}
-_SBOM_EMPTY = {"sbom": {"relationships": []}}
+#: One parseable manifest — what a repository with a dependency graph answers.
+_MANIFEST = {"filename": "package-lock.json", "parseable": True,
+             "exceedsMaxSize": False}
+
+
+def _graph(count, *nodes):
+    """A `dependencyGraphManifests` connection: the count, and the nodes read."""
+    return {"totalCount": count, "nodes": list(nodes)}
+
+
+_GRAPH_PRESENT = _graph(3, _MANIFEST)
 
 #: `FakeClient(last_rate_limit=...)` left unset — the headers agree with whatever
 #: that double's `rate_limit()` answers. A sentinel and not `None`, because `None`
@@ -64,9 +74,13 @@ class FakeClient:
 
     ``data`` maps ``(repo_full_name, kind)`` -> list (kind: pulls / dependabot /
     code_scanning / secret_scanning); ``errors`` maps the same key -> a
-    ``GitHubError`` to raise; ``sboms`` maps repo_full_name -> an SBOM object or a
-    ``GitHubError`` (absent -> present SBOM); ``runs`` maps repo_full_name -> an
-    ``/actions/runs`` object or a ``GitHubError`` (absent -> no runs).
+    ``GitHubError`` to raise; ``graphs`` maps repo_full_name -> a
+    `dependencyGraphManifests` connection (``_graph``) or a GraphQL error type
+    (``"FORBIDDEN"``, ``"NOT_FOUND"``) for that repository's alias (absent -> a
+    graph with manifests); ``graph_answer`` is one whole canned answer to every
+    query, ``graph_error`` a ``GitHubError`` every query raises; ``runs`` maps
+    repo_full_name -> an ``/actions/runs`` object or a ``GitHubError`` (absent ->
+    no runs).
     """
 
     _KINDS = (
@@ -77,16 +91,24 @@ class FakeClient:
         ("/issues", "issues"),
     )
 
-    def __init__(self, repos, data=None, errors=None, sboms=None, runs=None,
-                 workflows=None, rate=(5000, 5000, 0),
+    def __init__(self, repos, data=None, errors=None, graphs=None, runs=None,
+                 workflows=None, rate=(5000, 5000, 0), graph_answer=None,
+                 graph_error=None,
                  owner_type="Organization", auth_login=None,
-                 private_repos=None, paused_seconds=0.0, read_seconds=0.0,
-                 slowest_read=0.0, slowest_path="", last_rate_limit=_AGREEING):
+                 private_repos=None, throttled_seconds=0.0, retried_seconds=0.0,
+                 read_seconds=0.0, slowest_read=0.0, slowest_path="",
+                 last_rate_limit=_AGREEING):
         self._repos = repos
-        # The real client counts what it slept on a throttle and the check reads it
-        # for the node's sentence — so the double carries it too, and a test that
-        # wants the sentence sets it.
-        self.paused_seconds = paused_seconds
+        # The real client counts what it slept, apart by cause — because GitHub
+        # asked, or on the backoff after a failure GitHub did not explain — and
+        # the check reads both for the node's sentences; so the double carries
+        # both, and a test that wants a sentence sets the one it is about.
+        self.throttled_seconds = throttled_seconds
+        self.retried_seconds = retried_seconds
+        # Attempts GitHub answered `304`. The double makes no conditional
+        # requests, so it is zero unless a test about the cache sets it — the
+        # report line subtracts it from `reads_made` to say what a run spent.
+        self.free_reads = 0
         # The rest of what the real client counts for the run's trace. The timings
         # have no meaning in a double — nothing here takes time — and a test that
         # wants the summary sentence sets them the way it sets `paused_seconds`.
@@ -102,7 +124,9 @@ class FakeClient:
         self._private_repos = private_repos
         self._data = data or {}
         self._errors = errors or {}
-        self._sboms = sboms or {}
+        self._graphs = graphs or {}
+        self._graph_answer = graph_answer
+        self._graph_error = graph_error
         self._runs = runs or {}
         self._workflows = workflows or {}
         self._rate = rate
@@ -119,6 +143,8 @@ class FakeClient:
         self.get_calls: list[tuple[str, dict]] = []
         self.paginated_calls: list[str] = []
         self.paginated_params: list[tuple[str, dict]] = []
+        self.rate_limit_calls = 0
+        self.graphql_queries: list[str] = []
 
     @property
     def reads_made(self):
@@ -126,6 +152,12 @@ class FakeClient:
         counted a second time, so the trace's number cannot disagree with the list
         the rest of the suite asserts against."""
         return len(self.calls)
+
+    @property
+    def paused_seconds(self):
+        """Both kinds of wait together, as the real client sums them for the
+        run's receipt and the pause budget."""
+        return self.throttled_seconds + self.retried_seconds
 
     def get_paginated(self, path, params=None):
         self.calls.append(path)
@@ -160,12 +192,6 @@ class FakeClient:
             if isinstance(self._owner_type, GitHubError):
                 raise self._owner_type
             return {"login": path[len("/users/"):], "type": self._owner_type}
-        if path.endswith("/dependency-graph/sbom"):
-            full = path[len("/repos/"):-len("/dependency-graph/sbom")]
-            value = self._sboms.get(full, _SBOM_PRESENT)
-            if isinstance(value, GitHubError):
-                raise value
-            return value
         if path.endswith("/actions/workflows"):
             full = path[len("/repos/"):-len("/actions/workflows")]
             if full in self._workflows:
@@ -208,7 +234,38 @@ class FakeClient:
             return value
         return {}
 
+    def graphql(self, query, variables=None):
+        """The dependency-graph query, answered the way GitHub answers an aliased
+        query: one object per alias under `data`, `null` for an alias that
+        errored, and that alias's error under `errors` with its `path`. The
+        aliases and repositories are read off the query text itself, so the
+        query the code builds is what is exercised."""
+        self.calls.append("graphql")
+        self.graphql_queries.append(query)
+        if self._graph_error is not None:
+            raise self._graph_error
+        if self._graph_answer is not None:
+            return self._graph_answer
+        data, errors = {}, []
+        for alias, owner, name in re.findall(
+                r'(\w+): repository\(owner: "([^"]+)", name: "([^"]+)"\)', query):
+            value = self._graphs.get(f"{owner}/{name}", _GRAPH_PRESENT)
+            if isinstance(value, str):
+                data[alias] = None
+                errors.append({"type": value, "path": [alias],
+                               "message": f"{value} for {owner}/{name}"})
+            else:
+                data[alias] = {"dependencyGraphManifests": value}
+        answer = {"data": data}
+        if errors:
+            answer["errors"] = errors
+        return answer
+
     def rate_limit(self):
+        # Counted apart from `calls`: the real endpoint read is free and is not on
+        # the run's read count, and a test about the guard's ladder wants to know
+        # whether the endpoint was asked at all.
+        self.rate_limit_calls += 1
         return self._rate
 
 
@@ -263,10 +320,19 @@ def _repos(*names, **kw):
 
 
 def _wf_run(name="ci", branch="main", status="completed", conclusion="success",
-            wf_id=1, url="https://gh/run/1", run_number=1):
-    return {"name": name, "head_branch": branch, "status": status,
-            "conclusion": conclusion, "workflow_id": wf_id, "html_url": url,
-            "run_number": run_number}
+            wf_id=1, url="https://gh/run/1", run_number=1,
+            started=None, updated=None):
+    """One `/actions/runs` row. `started` / `updated` are left out unless a test
+    asks for them, which is also the shape GitHub answers with for a run that has
+    not begun — the record has to carry that absence as an absence."""
+    row = {"name": name, "head_branch": branch, "status": status,
+           "conclusion": conclusion, "workflow_id": wf_id, "html_url": url,
+           "run_number": run_number}
+    if started is not None:
+        row["run_started_at"] = started
+    if updated is not None:
+        row["updated_at"] = updated
+    return row
 
 
 # --- discovery ---------------------------------------------------------------
@@ -502,7 +568,7 @@ def test_a_refused_repository_alone_adds_no_coverage_line():
     check = _check()
     repos = _repos("platform-a", "platform-b")
     fake = FakeClient([_repo("platform-a"), _repo("platform-b")],
-                      sboms={"example-org/platform-a": _denied()})
+                      graphs={"example-org/platform-a": "FORBIDDEN"})
     result = check._sbom_check(fake, repos)
     assert not [e for e in result.reason_entries if e.slug == "read"]
     note = next(e for e in result.reason_entries if e.slug.endswith("unreadable"))
@@ -593,7 +659,7 @@ def test_an_aspect_can_be_switched_off(monkeypatch):
     # and the calls those two aspects make are gone with them
     assert any("/secret-scanning/alerts" in c for c in fake_on.calls)
     assert not any("/secret-scanning/alerts" in c for c in fake_off.calls)
-    assert not any("/dependency-graph/sbom" in c for c in fake_off.calls)
+    assert "graphql" in fake_on.calls and "graphql" not in fake_off.calls
 
 
 def test_a_switched_off_aspect_shrinks_the_rate_estimate(monkeypatch):
@@ -979,44 +1045,234 @@ def test_secret_scanning_require_enabled_false_suppresses_flag():
     assert result.reason_texts == []
 
 
-# --- sbom_check --------------------------------------------------------------
+# --- sbom_check: the dependency graph is asked, not exported (ADR-0008) ---------
 
-def test_sbom_missing_is_error():
+_UNPARSEABLE = {"filename": "package-lock.json", "parseable": False,
+                "exceedsMaxSize": True}
+
+
+def _sbom(check, fake):
+    return check._sbom_check(fake, check._discover(fake))
+
+
+def test_sbom_a_graph_with_manifests_is_ok():
+    """"What grades stays what it was": a repository whose graph has content says
+    nothing, as one with a non-empty SBOM did."""
     check = _check()
     fake = FakeClient([_repo("platform-a")],
-                      sboms={"example-org/platform-a": _SBOM_EMPTY})
-    result = check._sbom_check(fake, check._discover(fake))
+                      graphs={"example-org/platform-a": _graph(3, _MANIFEST)})
+    result = _sbom(check, fake)
     assert result.name == "sbom_check"
-    assert result.stored_code is StatusCode.ERROR
-    assert "missing SBOM" in result.reason_texts[0]
-    assert "network/dependencies)" in result.reason_texts[0]   # linked to the dep graph
-
-
-def test_sbom_present_is_ok():
-    check = _check()
-    fake = FakeClient([_repo("platform-a")],
-                      sboms={"example-org/platform-a": _SBOM_PRESENT})
-    result = check._sbom_check(fake, check._discover(fake))
     assert result.stored_code is StatusCode.OK
     assert result.reason_texts == []
+    assert fake.calls == ["graphql"] or "graphql" in fake.calls
+
+
+def test_sbom_an_empty_graph_is_error():
+    """"`totalCount` of zero is no dependency graph and grades ERROR, as a `404`
+    and an empty `relationships` did" — the line says *no dependency graph*, with
+    the count, linked to the graph's page, on the slug the pins hold."""
+    check = _check()
+    fake = FakeClient([_repo("platform-a")],
+                      graphs={"example-org/platform-a": _graph(0)})
+    result = _sbom(check, fake)
+    assert result.stored_code is StatusCode.ERROR
+    (entry,) = result.reason_entries
+    assert entry.slug == _slug("platform-a", "sbom")
+    assert entry.text == ("[platform-a: no dependency graph (0 manifests)]"
+                          "(https://github.com/example-org/platform-a/network/"
+                          "dependencies)")
+    assert "SBOM" not in entry.text
+
+
+def test_sbom_manifests_none_of_them_parseable_is_error_and_names_the_cause():
+    """"Manifests that exist but none of them parseable … grade ERROR too, and the
+    line names the cause: `platform-api: 2 manifests, none parseable
+    (package-lock.json exceeds the size limit)`" — Dependabot cannot alert from a
+    manifest it could not parse, which is why this aspect is red at all."""
+    check = _check()
+    fake = FakeClient([_repo("platform-a"), _repo("platform-b")], graphs={
+        "example-org/platform-a": _graph(
+            2, _UNPARSEABLE, {"filename": "Gemfile.lock", "parseable": False,
+                              "exceedsMaxSize": False}),
+        "example-org/platform-b": _graph(1, _UNPARSEABLE)})
+    result = _sbom(check, fake)
+    assert result.stored_code is StatusCode.ERROR
+    texts = {entry.slug: entry.text for entry in result.reason_entries}
+    assert texts[_slug("platform-a", "sbom")].startswith(
+        "[platform-a: 2 manifests, none parseable (package-lock.json exceeds the "
+        "size limit; Gemfile.lock could not be parsed)](")
+    assert texts[_slug("platform-b", "sbom")].startswith(
+        "[platform-b: 1 manifest, not parseable (package-lock.json exceeds the "
+        "size limit)](")
+
+
+def test_sbom_one_parseable_manifest_among_unparseable_ones_is_a_graph():
+    check = _check()
+    fake = FakeClient([_repo("platform-a")], graphs={
+        "example-org/platform-a": _graph(2, _UNPARSEABLE, _MANIFEST)})
+    assert _sbom(check, fake).reason_texts == []
+
+
+def test_sbom_more_than_ten_manifests_grades_on_the_count_alone():
+    """"A repository with more than ten manifests has a graph, whatever the first
+    ten say, and grades on `totalCount` alone."
+    """
+    check = _check()
+    fake = FakeClient([_repo("platform-a")], graphs={
+        "example-org/platform-a": _graph(12, *([_UNPARSEABLE] * 10))})
+    assert _sbom(check, fake).reason_texts == []
 
 
 def test_sbom_ignore_list_skips_repo():
+    """"`sbom_check.ignore` keeps its meaning: a repository named there is not
+    asked" — not asked, so it is not in the query at all."""
     check = _check(sbom_ignore=("platform-a",))
-    fake = FakeClient([_repo("platform-a")],
-                      sboms={"example-org/platform-a": _SBOM_EMPTY})
-    result = check._sbom_check(fake, check._discover(fake))
+    fake = FakeClient([_repo("platform-a"), _repo("platform-b")],
+                      graphs={"example-org/platform-a": _graph(0)})
+    result = _sbom(check, fake)
     assert result.stored_code is StatusCode.OK
     assert result.reason_texts == []
+    (query,) = fake.graphql_queries
+    assert "platform-b" in query and '"platform-a"' not in query
 
 
-def test_sbom_404_counts_as_missing():
+def test_sbom_a_forbidden_alias_grades_as_a_permission_answer():
+    """"`FORBIDDEN` or an insufficient-scope error is the token being told no
+    about it, and grades as a permission answer grades today" — amber on that
+    repository's own line, no coverage line."""
+    check = _check()
+    fake = FakeClient([_repo("platform-a"), _repo("platform-b")],
+                      graphs={"example-org/platform-a": "FORBIDDEN"})
+    result = _sbom(check, fake)
+    assert result.stored_code is StatusCode.WARN
+    (note,) = result.reason_entries
+    assert note.slug == _slug("platform-a", "unreadable")
+    assert note.code is StatusCode.WARN
+    assert note.text.startswith("platform-a: could not read (FORBIDDEN")
+    assert check._unreachable == 0
+
+
+def test_sbom_a_not_found_alias_grades_nothing():
+    """"`NOT_FOUND` is a repository that left between discovery and the query, a
+    line that grades nothing" — and it was answered, so it is not a coverage
+    gap either."""
+    check = _check()
+    fake = FakeClient([_repo("platform-a"), _repo("platform-b")],
+                      graphs={"example-org/platform-a": "NOT_FOUND"})
+    result = _sbom(check, fake)
+    (note,) = result.reason_entries
+    assert note.code is StatusCode.UNDEFINED
+    assert note.text.startswith("platform-a: not found — gone since discovery")
+    assert not [e for e in result.reason_entries if e.slug == "read"]
+    # the leaf's own code is derived, and nothing here graded: not WARN, and
+    # not counted as an outage on the node
+    assert result.stored_code is not StatusCode.WARN
+    assert check._unreachable == 0
+
+
+def test_sbom_an_errors_only_answer_is_could_not_ask():
+    """"A `200` with `errors` and no `data` is the query failing whole, and the
+    aspect says it could not ask — the coverage line, never a claim about any
+    repository."
+    """
+    check = _check()
+    fake = FakeClient([_repo("platform-a"), _repo("platform-b")], graph_answer={
+        "errors": [{"type": "RATE_LIMITED",
+                    "message": "API rate limit exceeded for user ID 1."}]})
+    result = _sbom(check, fake)
+    notes = [e for e in result.reason_entries if e.slug.endswith("unreadable")]
+    assert len(notes) == 2 and all(e.code is StatusCode.UNDEFINED for e in notes)
+    assert "could not ask GitHub" in notes[0].text and "RATE_LIMITED" in notes[0].text
+    gap = next(e for e in result.reason_entries if e.slug == "read")
+    assert gap.text == "GitHub did not answer for 2 of 2 repositories"
+    assert result.stored_code is StatusCode.WARN
+    assert check._unreachable == 2
+
+
+def test_sbom_an_answer_with_neither_data_nor_errors_cannot_be_read():
+    check = _check()
+    fake = FakeClient([_repo("platform-a")], graph_answer={"ok": True})
+    result = _sbom(check, fake)
+    (note,) = result.reason_entries
+    assert note.code is StatusCode.WARN and "could not read" in note.text
+    assert check._unreachable == 0
+
+
+def test_sbom_a_repository_object_of_the_wrong_shape_is_could_not_read():
+    check = _check()
+    fake = FakeClient([_repo("platform-a")], graph_answer={
+        "data": {"r0": {"dependencyGraphManifests": {"nodes": []}}}})
+    (note,) = _sbom(check, fake).reason_entries
+    assert note.code is StatusCode.WARN and "totalCount" in note.text
+
+
+def test_sbom_an_errors_field_that_is_not_a_list_cannot_be_read():
+    """An answer whose `errors` is not the list GraphQL promises is one this check
+    cannot read — WARN, and not an outage on the node."""
     check = _check()
     fake = FakeClient([_repo("platform-a")],
-                      sboms={"example-org/platform-a": _answered("nope", 404)})
-    result = check._sbom_check(fake, check._discover(fake))
-    assert result.stored_code is StatusCode.ERROR
-    assert "missing SBOM" in result.reason_texts[0]
+                      graph_answer={"data": {}, "errors": "nope"})
+    (note,) = _sbom(check, fake).reason_entries
+    assert note.code is StatusCode.WARN and "cannot read" in note.text
+    assert check._unreachable == 0
+
+
+def test_sbom_an_alias_error_of_a_kind_the_record_does_not_name_is_could_not_read():
+    """Decision 4 names `FORBIDDEN`, the scope error and `NOT_FOUND`; any other
+    type on an alias is an answer this check cannot read, and says which — the
+    measurement decision 4 asks for is what teaches it a new one."""
+    check = _check()
+    fake = FakeClient([_repo("platform-a")], graph_answer={
+        "data": {"r0": None},
+        "errors": [{"type": "SERVICE_UNAVAILABLE", "path": ["r0"],
+                    "message": "Something went wrong"}]})
+    (note,) = _sbom(check, fake).reason_entries
+    assert note.code is StatusCode.WARN
+    assert "could not read (SERVICE_UNAVAILABLE: Something went wrong)" in note.text
+    assert check._unreachable == 0
+
+
+def test_sbom_an_alias_with_neither_object_nor_error_cannot_be_read():
+    check = _check()
+    fake = FakeClient([_repo("platform-a")], graph_answer={"data": {"r0": None}})
+    (note,) = _sbom(check, fake).reason_entries
+    assert note.code is StatusCode.WARN
+    assert "no repository object under r0" in note.text
+
+
+def test_sbom_asks_one_repository_a_query():
+    """"One query per repository" — not fifty and not ten. GitHub ends a GraphQL
+    request at ten seconds; nineteen repositories in one query were cut in twenty
+    of twenty-nine runs, and ten in one still took four to ten seconds because a
+    few heavy repositories dominate whichever chunk holds them. A query costs one
+    point whatever it carries, so nothing is saved by sharing one: alone, no
+    query is slower than its own repository, a cut costs exactly that line, and
+    there is no chunk size left to move. An ignored repository is not asked."""
+    names = [f"platform-{i:03d}" for i in range(5)]
+    check = _check(team="", name_prefix="platform", sbom_ignore=("platform-004",))
+    fake = FakeClient([_repo(n) for n in names])
+    result = _sbom(check, fake)
+    assert result.reason_texts == []
+    assert len(fake.graphql_queries) == 4
+    assert all(query.count("repository(owner:") == 1
+               for query in fake.graphql_queries)
+    assert '"platform-004"' not in "".join(fake.graphql_queries)
+    assert fake.graphql_queries[0] == (
+        'query { r0: repository(owner: "example-org", name: "platform-000") '
+        '{ dependencyGraphManifests(first: 10) { totalCount nodes { filename '
+        'parseable exceedsMaxSize } } } }')
+
+
+def test_sbom_the_synchronous_export_is_gone_from_the_code():
+    """"… and the synchronous read is gone from the code": nothing here asks
+    `/dependency-graph/sbom` any more, on a run or in the source."""
+    import inspect
+    assert "dependency-graph/sbom" not in inspect.getsource(mod_github)
+    check = _check()
+    fake = FakeClient([_repo("platform-a")])
+    _sbom(check, fake)
+    assert not [c for c in fake.calls if "dependency-graph" in c]
 
 
 # --- actions (failed workflow runs) -----------------------------------------
@@ -1031,6 +1287,78 @@ def test_actions_failure_is_error():
     assert result.stored_code is StatusCode.ERROR
     assert result.reason_entries[0].code is StatusCode.ERROR
     assert "failed" in result.reason_texts[0]
+
+
+def test_actions_entry_carries_its_subject_and_its_record():
+    """The first emitter of little-sister ADR-0082: what the check read, kept
+    beside the sentence rather than folded into it."""
+    check = _check()
+    fake = FakeClient([_repo("platform-a")], runs={
+        "example-org/platform-a": {"workflow_runs": [
+            _wf_run(conclusion="failure", run_number=41,
+                    url="https://gh/run/41",
+                    started="2026-09-19T09:12:00Z",
+                    updated="2026-09-19T09:20:14Z")]}})
+    result = check._actions(fake, check._discover(fake))
+    entry, = [e for e in result.reason_entries if e.data]
+    # the subject is the id a rename cannot change — the slug's own first part
+    assert entry.subject == str(_repo_id("platform-a"))
+    assert entry.data["repository"] == "example-org/platform-a"
+    assert entry.data["workflow"] == "ci"
+    assert entry.data["branch"] == "main"
+    # two words for the outcome, and they are not the same field: `conclusion` is
+    # GitHub's, for a grading map; `verdict` is ours, for a line template
+    assert entry.data["verdict"] == "failed"
+    assert entry.data["completed"]["conclusion"] == "failure"
+    assert entry.data["completed"]["run_number"] == 41
+    assert entry.data["completed"]["url"] == "https://gh/run/41"
+    # `started` is one of the three names the library reads as an instant
+    assert entry.data["completed"]["started"] == "2026-09-19T09:12:00Z"
+    assert entry.data["completed"]["updated"] == "2026-09-19T09:20:14Z"
+    assert "running" not in entry.data
+
+
+def test_actions_the_sentence_does_not_move_when_the_record_arrives():
+    """`text` is what every surface still shows: the record is invisible until
+    something renders it."""
+    check = _check()
+    fake = FakeClient([_repo("platform-a")], runs={
+        "example-org/platform-a": {"workflow_runs": [
+            _wf_run(conclusion="failure", run_number=41,
+                    url="https://gh/run/41")]}})
+    result = check._actions(fake, check._discover(fake))
+    assert result.reason_texts[0] == (
+        "[platform-a (main) / ci](https://gh/run/41): failed (#41)")
+
+
+def test_actions_an_absent_time_is_null_and_not_an_empty_string():
+    """The library refuses a timed name whose value is not a time, so a run GitHub
+    gave no `run_started_at` for has to read as *no time*, not as `""`."""
+    check = _check()
+    fake = FakeClient([_repo("platform-a")], runs={
+        "example-org/platform-a": {"workflow_runs": [
+            _wf_run(conclusion="failure")]}})
+    result = check._actions(fake, check._discover(fake))
+    entry, = [e for e in result.reason_entries if e.data]
+    assert entry.data["completed"]["started"] is None
+    assert entry.data["completed"]["updated"] is None
+
+
+def test_actions_an_in_flight_run_rides_its_own_block():
+    check = _check()
+    fake = FakeClient([_repo("platform-a")], runs={
+        "example-org/platform-a": {"workflow_runs": [
+            _wf_run(status="in_progress", conclusion="", run_number=42,
+                    url="https://gh/run/42", started="2026-09-19T10:00:00Z"),
+            _wf_run(conclusion="success", run_number=41,
+                    url="https://gh/run/41")]}})
+    result = check._actions(fake, check._discover(fake))
+    entry, = [e for e in result.reason_entries if e.data]
+    assert entry.data["verdict"] == "passed"
+    assert entry.data["completed"]["run_number"] == 41
+    assert entry.data["running"]["run_number"] == 42
+    assert entry.data["running"]["started"] == "2026-09-19T10:00:00Z"
+    assert entry.data["running"]["conclusion"] is None
 
 
 def test_actions_waiting_is_warn():
@@ -1166,6 +1494,398 @@ def test_actions_default_branch_asks_each_workflow_about_that_branch():
     assert all(params.get("branch") == "develop" for _, params in asked)
     # and the repository-wide read is not made at all
     assert not [p for (p, _) in fake.get_calls if p.endswith("/actions/runs")]
+
+
+# --- disabled workflows (ADR-0010) -------------------------------------------
+
+def _listed(*rows):
+    """The workflow list with a state per row, as GitHub's schema spells them."""
+    return {"example-org/platform-a": {"workflows": [
+        {"id": i, "name": n, "state": st,
+         "html_url": f"https://gh/wf/{i}"} for i, n, st in rows]}}
+
+
+def test_a_manually_disabled_workflow_is_a_line_and_costs_no_read():
+    """The proposal of backlog #1 §7 item 5: a switched-off workflow is a finding,
+    and its runs are not worth a request — the newest one is frozen at whatever it
+    was when somebody switched it off."""
+    check = _check()
+    fake = FakeClient(
+        [_repo("platform-a")],
+        runs=_runs([_wf_run(name="ci", wf_id=1)], 1),
+        workflows=_listed((1, "ci", "active"),
+                          (2, "nightly", "disabled_manually")))
+    result = check._actions(fake, check._discover(fake))
+    assert result.stored_code is StatusCode.WARN
+    line, = result.reason_entries
+    assert line.text == ("[platform-a / nightly](https://gh/wf/2): disabled "
+                         "manually, no runs read")
+    # the read it saved: workflow 2 was never asked about
+    asked = [p for p, _ in fake.get_calls if "/actions/workflows/" in p]
+    assert asked == ["/repos/example-org/platform-a/actions/workflows/1/runs"]
+
+
+def test_a_disabled_line_carries_its_subject_and_its_record():
+    """The disabled line is an `actions` line about a repository too, so it groups
+    with the rest of them. `state` is GitHub's own word and is free-form — the
+    library types three names and this is not one of them."""
+    check = _check()
+    fake = FakeClient(
+        [_repo("platform-a")],
+        workflows=_listed((2, "nightly", "disabled_manually")))
+    result = check._actions(fake, check._discover(fake))
+    line, = result.reason_entries
+    assert line.subject == str(_repo_id("platform-a"))
+    assert line.data == {"repository": "example-org/platform-a",
+                         "workflow": "nightly",
+                         "url": "https://gh/wf/2",
+                         "state": "disabled_manually"}
+
+
+def test_a_disabled_line_is_keyed_without_a_branch():
+    """It is not a fact about one branch — the workflow is off everywhere. That is
+    a different slug from the frozen verdict it replaces, which is why the release
+    notes say a pin held on that line has to be made again (PL10)."""
+    check = _check()
+    fake = FakeClient(
+        [_repo("platform-a")],
+        workflows=_listed((2, "nightly", "disabled_manually")))
+    line, = check._actions(fake, check._discover(fake)).reason_entries
+    assert line.slug == _slug("platform-a", "workflow", 2)
+    assert line.slug != _slug("platform-a", "workflow", 2, "main")
+
+
+def test_inactivity_is_amber_and_says_what_github_did():
+    """GitHub disables *scheduled* workflows after sixty days without activity **in
+    a public repository**, so on a private estate this is rare — the line is worth
+    its amber for the case it does fire, and says the cause rather than `disabled`."""
+    check = _check()
+    fake = FakeClient(
+        [_repo("platform-a")],
+        workflows=_listed((3, "soak", "disabled_inactivity")))
+    line, = check._actions(fake, check._discover(fake)).reason_entries
+    assert line.code is StatusCode.WARN
+    assert line.text == ("[platform-a / soak](https://gh/wf/3): disabled by "
+                         "GitHub after 60 days without repository activity, "
+                         "no runs read")
+
+
+def test_a_fork_disabled_workflow_is_ok_and_hidden_like_a_passing_one():
+    """GitHub disables scheduled workflows on a fork by default and `include_forks`
+    is true unless a deployment says otherwise, so grading this would put one
+    standing amber on the leaf per fork — a state nobody chose. `OK`, and it follows
+    `show_healthy` exactly as a passing idle workflow does (ADR-0004 §9)."""
+    check = _check()
+    fake = FakeClient(
+        [_repo("platform-a")],
+        workflows=_listed((4, "release", "disabled_fork")))
+    result = check._actions(fake, check._discover(fake))
+    assert result.reason_texts == []
+    shown = _check(actions_show_healthy=True)
+    fake2 = FakeClient(
+        [_repo("platform-a")],
+        workflows=_listed((4, "release", "disabled_fork")))
+    line, = shown._actions(fake2, shown._discover(fake2)).reason_entries
+    assert line.code is StatusCode.OK
+    assert line.text == ("[platform-a / release](https://gh/wf/4): disabled by "
+                         "GitHub on this fork, no runs read")
+
+
+def test_the_deployment_grades_a_disabled_state_for_itself():
+    """The grade is the deployment's, in the sibling `severity_map` shape: an estate
+    that runs seasonal workflows quiets `disabled_manually`, one that wants to hear
+    about its forks raises `disabled_fork`."""
+    check = _check(actions_disabled_map={"disabled_manually": StatusCode.OK,
+                                         "disabled_fork": StatusCode.ERROR},
+                   actions_show_healthy=True)
+    fake = FakeClient(
+        [_repo("platform-a")],
+        workflows=_listed((2, "nightly", "disabled_manually"),
+                          (4, "release", "disabled_fork")))
+    result = check._actions(fake, check._discover(fake))
+    codes = {entry.code for entry in result.reason_entries}
+    assert codes == {StatusCode.OK, StatusCode.ERROR}
+    assert result.stored_code is StatusCode.ERROR
+
+
+def test_a_disabled_state_this_package_has_not_met_is_amber_and_said_as_given():
+    """An undeclared state grades WARN, as an undeclared severity does (ADR-0004
+    §6), and is said the way GitHub spelled it — a state GitHub adds later arrives
+    as a word to look up rather than as silence or as a flat `disabled`."""
+    check = _check()
+    fake = FakeClient(
+        [_repo("platform-a")],
+        workflows=_listed((5, "odd", "disabled_by_some_new_rule")))
+    line, = check._actions(fake, check._discover(fake)).reason_entries
+    assert line.code is StatusCode.WARN
+    assert line.text == ("[platform-a / odd](https://gh/wf/5): disabled "
+                         "(disabled_by_some_new_rule), no runs read")
+
+
+def test_a_disabled_workflow_is_not_priced_by_the_guard():
+    """`_workflow_counts` is what the guard prices `1 + W` from, and it must count
+    only the workflows whose runs will be read — or every run after this change is
+    over-priced by the workflows it stopped reading."""
+    check = _check()
+    fake = FakeClient(
+        [_repo("platform-a")],
+        runs=_runs([_wf_run(name="ci", wf_id=1)], 1),
+        workflows=_listed((1, "ci", "active"),
+                          (2, "nightly", "disabled_manually"),
+                          (3, "soak", "disabled_inactivity")))
+    check._actions(fake, check._discover(fake))
+    assert check._workflow_counts == {"example-org/platform-a": 1}
+    assert check._priced_reads(_repos("platform-a"))["actions/workflows"] == 1 + 1
+
+
+def test_an_ignored_disabled_workflow_is_neither_read_nor_reported():
+    """The ignore patterns run before anything is spent and before anything is
+    said: a workflow a deployment has told this check not to watch does not come
+    back as a disabled line."""
+    check = _check(actions_ignore_patterns=(re.compile("nightly", re.IGNORECASE),))
+    fake = FakeClient(
+        [_repo("platform-a")],
+        workflows=_listed((2, "nightly", "disabled_manually")))
+    result = check._actions(fake, check._discover(fake))
+    assert result.reason_texts == []
+    assert check._workflow_counts == {"example-org/platform-a": 0}
+
+
+def test_a_deleted_workflow_is_still_dropped_rather_than_called_disabled():
+    """`deleted` is in the same enum and is not a disabled state: such a workflow
+    is dropped, and its last failure is not a fact about the repository today
+    (ADR-0004 §9)."""
+    check = _check()
+    fake = FakeClient(
+        [_repo("platform-a")],
+        workflows=_listed((6, "gone", "deleted")))
+    result = check._actions(fake, check._discover(fake))
+    assert result.reason_texts == []
+    assert check._workflow_counts == {"example-org/platform-a": 0}
+
+
+def test_the_disabled_severity_map_is_refused_with_the_key_it_was_typed_under():
+    """Not every map of this shape is spelled `<block>.severity_map`, and a refusal
+    has to name the key the deployment actually typed."""
+    with pytest.raises(CheckError, match=r"actions\.disabled_severity_map"):
+        GitHubCheck._extra_from_config(
+            {"path": "/github", "owner": "example-org", "kind": "organization",
+             "secrets": {"token": "env://GITHUB_TOKEN"},
+             "actions": {"disabled_severity_map": "warn"}},
+            tmp_path_stub())
+
+
+# --- named branches (ADR-0009) -----------------------------------------------
+
+def test_actions_named_branches_replace_the_default_branch():
+    """The key says *ask about these*. The repository's own default branch is not
+    added to the list: a deployment that wants its trunk writes it there, and
+    nothing here has to resolve `main` against `master` on the deployment's
+    behalf."""
+    check = _check(actions_branches=("release", "staging"))
+    fake = FakeClient(
+        [_repo("platform-a", default_branch="main")],
+        runs=_runs([_wf_run(name="ci", branch="release", wf_id=1)], 1),
+        workflows=_named((1, "ci")))
+    check._actions(fake, check._discover(fake))
+    asked = [params.get("branch") for (p, params) in fake.get_calls
+             if "/actions/workflows/" in p and p.endswith("/runs")]
+    assert asked == ["release", "staging"]
+    assert "main" not in asked
+
+
+def test_actions_each_watched_workflow_is_asked_about_each_named_branch():
+    """`W × B` reads and no other: the pairing is what keeps ADR-0005's
+    construction — nothing back means no run on *that* branch — true of a list."""
+    check = _check(actions_branches=("release", "staging"))
+    fake = FakeClient(
+        [_repo("platform-a")],
+        runs=_runs([_wf_run(name="ci", branch="release", wf_id=1)], 2),
+        workflows=_named((1, "ci"), (2, "deploy")))
+    check._actions(fake, check._discover(fake))
+    asked = [(p, params.get("branch")) for (p, params) in fake.get_calls
+             if "/actions/workflows/" in p and p.endswith("/runs")]
+    assert asked == [
+        ("/repos/example-org/platform-a/actions/workflows/1/runs", "release"),
+        ("/repos/example-org/platform-a/actions/workflows/1/runs", "staging"),
+        ("/repos/example-org/platform-a/actions/workflows/2/runs", "release"),
+        ("/repos/example-org/platform-a/actions/workflows/2/runs", "staging")]
+
+
+def test_actions_a_named_branch_that_matched_nothing_is_one_line_naming_the_default():
+    """The only thing the per-entry rendering cannot show: a branch that produced
+    no entry produces no line either. It says *no run on*, never *no such branch* —
+    the read cannot tell those apart — and names the default branch it did see,
+    because `main` against `master` is what this nearly always is."""
+    check = _check(actions_branches=("release",))
+    fake = FakeClient(
+        [_repo("platform-a", default_branch="master")],
+        runs=_runs([_wf_run(name="ci", branch="master", wf_id=1)], 1),
+        workflows=_named((1, "ci")))
+    result = check._actions(fake, check._discover(fake))
+    assert result.stored_code is StatusCode.WARN
+    line, = result.reason_entries
+    assert line.slug == "branches-unmatched"
+    assert line.text == (
+        "no workflow run on any branch this check names (release) in 1 of 1 "
+        "repository — the branch may not exist there, or nothing has run on it "
+        "yet: platform-a (default branch master)")
+
+
+def test_actions_the_unmatched_line_stays_silent_after_a_degraded_read():
+    """A page that was a cut cannot support the claim: no row on a named branch
+    there is as likely to be the cut as the branch. The repository is reported
+    short instead, which is the true statement about it."""
+    check = _check(actions_branches=("release", "staging"))
+    fake = FakeClient(
+        [_repo("platform-a", default_branch="main")],
+        runs=_runs([_wf_run(name="ci", branch="main", wf_id=1)], 240),
+        workflows=_named((1, "ci"), (2, "deploy")),
+        rate=(5000, 3, 0),              # 3 left, 4 × 2 workflows × 2 branches
+    )
+    result = check._actions(fake, check._discover(fake))
+    assert not [p for p, _ in fake.get_calls if "/actions/workflows/" in p]
+    assert [entry.slug for entry in result.reason_entries] == [
+        "runs-window-partial"]
+
+
+def test_actions_a_repository_with_no_watched_workflow_is_not_called_unmatched():
+    """Nothing ran on a named branch because nothing was asked: every workflow is
+    ignored. Blaming the branch list for that would send an operator to the wrong
+    key."""
+    check = _check(actions_branches=("release",),
+                   actions_ignore_patterns=(re.compile("ci", re.IGNORECASE),))
+    fake = FakeClient(
+        [_repo("platform-a")],
+        runs=_runs([], 0),
+        workflows=_named((1, "ci")))
+    result = check._actions(fake, check._discover(fake))
+    assert result.reason_texts == []
+
+
+def test_actions_more_than_one_named_branch_degrades_to_an_unfiltered_page():
+    """The wide read filters one branch and there are two, so it takes the page
+    whole and keeps the rows on a named branch — a cut by construction, and
+    reported as one however much `total_count` agrees with the rows."""
+    check = _check(actions_branches=("release", "staging"))
+    fake = FakeClient(
+        [_repo("platform-a")],
+        runs=_runs([_wf_run(name="ci", branch="release", conclusion="failure",
+                            wf_id=1),
+                    _wf_run(name="ci", branch="wip", conclusion="failure",
+                            wf_id=1, url="https://gh/run/2", run_number=2)], 2),
+        workflows=_named((1, "ci")),
+        rate=(5000, 3, 0),
+    )
+    result = check._actions(fake, check._discover(fake))
+    wide = [params for (p, params) in fake.get_calls
+            if p.endswith("/actions/runs")]
+    assert wide and all("branch" not in params for params in wide)
+    assert result.stored_code is StatusCode.ERROR
+    # the `wip` row is dropped, the `release` one grades, and the page is short
+    assert "(release)" in result.reason_texts[0]
+    assert not any("wip" in text for text in result.reason_texts)
+    assert [entry.slug for entry in result.reason_entries] == [
+        _slug("platform-a", "workflow", 1, "release"), "runs-window-partial"]
+
+
+def test_actions_one_named_branch_is_filtered_by_github_on_the_degraded_read():
+    """With a single name the wide read can still ask GitHub for it, so the page
+    is a page of that branch and is short only if GitHub says it was cut."""
+    check = _check(actions_branches=("release",))
+    fake = FakeClient(
+        [_repo("platform-a")],
+        runs=_runs([_wf_run(name="ci", branch="release", wf_id=1)], 1),
+        workflows=_named((1, "ci"), (2, "deploy")),
+        rate=(5000, 3, 0),
+    )
+    result = check._actions(fake, check._discover(fake))
+    wide = [params for (p, params) in fake.get_calls
+            if p.endswith("/actions/runs")]
+    assert wide == [{"per_page": 100, "branch": "release"}]
+    assert result.reason_texts == []
+
+
+def test_actions_branches_and_all_branches_together_are_refused_naming_both():
+    """Two modes asked at once is a configuration mistake, not something to
+    resolve quietly: a precedence rule would answer a question this config did not
+    ask and leave the deployment reading the mode it did not get off the leaf."""
+    with pytest.raises(CheckError) as caught:
+        _check(actions_all_branches=True, actions_branches=("release",))
+    assert "actions.all_branches" in str(caught.value)
+    assert "actions.branches" in str(caught.value)
+
+
+def test_actions_branches_is_parsed_deduplicated_and_refuses_an_empty_name():
+    """A repeated name would buy an identical second read of every workflow, and
+    the intent is not ambiguous, so it is dropped. An empty one is refused: a
+    deployment meant to name a branch there, and silently asking about one fewer
+    than the config lists answers a question nobody asked."""
+    extra = GitHubCheck._extra_from_config(
+        {"path": "/github", "owner": "example-org", "kind": "organization",
+         "secrets": {"token": "env://GITHUB_TOKEN"},
+         "actions": {"branches": ["release", "staging", "release"]}},
+        tmp_path_stub())
+    assert extra["actions_branches"] == ("release", "staging")
+    with pytest.raises(CheckError, match="cannot be empty"):
+        GitHubCheck._extra_from_config(
+            {"path": "/github", "owner": "example-org", "kind": "organization",
+             "secrets": {"token": "env://GITHUB_TOKEN"},
+             "actions": {"branches": ["release", "  "]}},
+            tmp_path_stub())
+    with pytest.raises(CheckError, match="must be a list"):
+        GitHubCheck._extra_from_config(
+            {"path": "/github", "owner": "example-org", "kind": "organization",
+             "secrets": {"token": "env://GITHUB_TOKEN"},
+             "actions": {"branches": "release"}},
+            tmp_path_stub())
+
+
+def test_actions_named_branches_are_priced_one_plus_workflows_times_branches():
+    """`1 + W × B` in the guard, or it under-prices by exactly the branch count —
+    the factor the read's own loop multiplies by."""
+    check = _check(actions_branches=("release", "staging"))
+    check._workflow_counts = {"example-org/platform-a": 9,
+                              "example-org/platform-b": 1}
+    reads = check._priced_reads(_repos("platform-a", "platform-b"))
+    assert reads["actions/workflows"] == 2 + 2 * (9 + 1)
+    # and with no list the factor is one: the `1 + W` ADR-0007 has priced since
+    plain_check = _check()
+    plain_check._workflow_counts = dict(check._workflow_counts)
+    assert plain_check._priced_reads(
+        _repos("platform-a", "platform-b"))["actions/workflows"] == 2 + 10
+
+
+def test_actions_the_per_repository_guard_prices_the_branches_too():
+    """`_budget_covers` is the other half, and the one that decides per
+    repository: two workflows on two branches need 4 × 4, not 4 × 2."""
+    check = _check(actions_branches=("release", "staging"))
+    fake = FakeClient(
+        [_repo("platform-a")],
+        runs=_runs([_wf_run(name="ci", branch="release", wf_id=1)], 2),
+        workflows=_named((1, "ci"), (2, "deploy")),
+        rate=(5000, 15, 0),             # 4 × 2 workflows would pass, 4 × 4 does not
+    )
+    check._actions(fake, check._discover(fake))
+    assert not [p for p, _ in fake.get_calls if "/actions/workflows/" in p]
+    covering = _check(actions_branches=("release", "staging"))
+    fake_ok = FakeClient(
+        [_repo("platform-a")],
+        runs=_runs([_wf_run(name="ci", branch="release", wf_id=1)], 2),
+        workflows=_named((1, "ci"), (2, "deploy")),
+        rate=(5000, 16, 0),                                    # exactly 4 × 2 × 2
+    )
+    covering._actions(fake_ok, covering._discover(fake_ok))
+    assert [p for p, _ in fake_ok.get_calls if "/actions/workflows/" in p]
+
+
+def test_actions_named_branches_are_on_the_config_summary():
+    """The branches a check asks about decide whether an empty Actions leaf is an
+    estate with nothing to say or a list that matches nothing, so the page an
+    operator opens to find out says which."""
+    assert "release, staging" in _check(
+        actions_branches=("release", "staging")).config_summary()
+    assert "Actions branches" not in _check().config_summary()
 
 
 def test_actions_all_branches_omits_branch_param():
@@ -1833,8 +2553,13 @@ def test_run_returns_all_aspect_leaves(monkeypatch):
     assert pulls.stored_code is StatusCode.WARN
     assert result.stored_code is StatusCode.OK
     assert result.reason_texts == ["1 repository in scope"]
-    assert result.report == (
-        "- [platform-a](https://github.com/example-org/platform-a)")
+    assert result.report.startswith(
+        "- [platform-a](https://github.com/example-org/platform-a)\n\n")
+    # and the cache's own line, which is scope and never a status claim
+    assert result.report.endswith(
+        "conditional cache: 0 payload(s) held across 7 aspect(s) and discovery, "
+        "0 dropped; this run made 10 request(s) of which 0 were free, so it "
+        "spent 10 against the 7 the guard priced it at")
 
 
 def test_run_warns_on_empty_scope_but_keeps_every_aspect(monkeypatch):
@@ -1847,7 +2572,11 @@ def test_run_warns_on_empty_scope_but_keeps_every_aspect(monkeypatch):
     assert result.reason_texts == [
         'no repositories in scope (organization example-org, team platform,'
         ' prefix "platform")']
-    assert result.report == ""
+    # no scope to list, so the cache's line is the whole report
+    assert result.report == (
+        "conditional cache: 0 payload(s) held across 7 aspect(s) and discovery, "
+        "0 dropped; this run made 3 request(s) of which 0 were free, so it "
+        "spent 3 against the 7 the guard priced it at")
     assert [child.name for child in result.children] == list(check.ASPECTS)
 
 
@@ -1919,6 +2648,374 @@ def test_rate_limit_guard_skips(monkeypatch):
     assert "skipped" in result.reason_texts[0]
     assert result.reason_texts[1] == "1 repository in scope"
     assert "platform-a" in result.report
+
+
+# --- the guard, priced per counter (ADR-0007, decision 3) -----------------------
+
+#: What the logs showed each window serving (backlog #3 §6.1), as the reduced
+#: paths the ledger keeps — A the heavier one, B the one with discovery on it.
+_WINDOW_A = ("dependabot/alerts", "code-scanning/alerts", "actions/workflows")
+_WINDOW_B = ("pulls", "issues", "secret-scanning/alerts")
+
+
+def _window(token, served, *, left, minutes, resource="core", limit=5000,
+            paths_under="/repos/example-org/platform-00/"):
+    """Feed one window: a charged reading on each of `served`, `left` remaining,
+    ending `minutes` (and half of one, so the run's own seconds do not round it
+    down) from now."""
+    import time
+    now = time.time()
+    reset = int(now) + minutes * 60 + 30
+    for path in served:
+        full = (f"{paths_under}{path}" if "/" in path or path in
+                ("pulls", "issues") else f"/{path}/example-org/x")
+        ledger().record(token, full, resource=resource, limit=limit,
+                        remaining=left, used=limit - left, reset=reset, now=now)
+    return reset
+
+
+def _twenty():
+    return [_repo(f"platform-{i:02d}") for i in range(20)]
+
+
+def test_the_guard_prices_the_run_per_window_and_names_the_one_that_cannot_afford_it(
+        monkeypatch):
+    """The plan's *done when*: "a run against a fixture whose endpoint says 5000
+    and whose dependabot counter says 200 is skipped naming that window, and one
+    whose counters all clear the factor runs." Twenty repositories, three reads a
+    repository on window A: 4×60 is more than 200, whatever the endpoint says —
+    and the endpoint is not even asked, because the ledger priced the run."""
+    monkeypatch.setenv("GITHUB_TOKEN", "x")
+    _window("x", _WINDOW_A, left=200, minutes=12)
+    _window("x", (*_WINDOW_B, "orgs"), left=4000, minutes=17)
+    _window("x", ("graphql",), left=4900, minutes=40, resource="graphql")
+    check = _check(team="", name_prefix="platform")
+    fake = FakeClient(_twenty(), rate=(5000, 5000, 0))
+    monkeypatch.setattr(check, "_make_client", lambda token, deadline=None: fake)
+    result = check.run()
+    assert result.stored_code is StatusCode.WARN
+    assert result.reason_texts[0] == (
+        "skipped this run: 200 API calls left on the window GitHub charges the "
+        "dependabot, code-scanning and actions reads to (resets in 12min), need > "
+        "4×60 for 20 repo(s)")
+    assert result.reason_texts[1] == "20 repositories in scope"
+    assert fake.rate_limit_calls == 0
+    assert not result.children
+
+    _window("x", _WINDOW_A, left=3000, minutes=12)     # the same window, refilled
+    runs = _check(team="", name_prefix="platform")
+    monkeypatch.setattr(runs, "_make_client", lambda token, deadline=None: fake)
+    cleared = runs.run()
+    assert cleared.stored_code is StatusCode.OK and cleared.children
+    assert fake.rate_limit_calls == 0
+
+
+def test_the_guard_says_points_for_the_graphql_window_and_discovery_for_its_reads(
+        monkeypatch, caplog):
+    """A GraphQL budget is counted in points, not calls — the budget node has
+    always said so, and the guard's line about the same window says the same
+    word. And the paths that are nobody's aspect — `orgs`, `organizations` (the
+    `Link` header's spelling of the same read), `users` — are what discovery
+    reads, which is the word a reader has for them."""
+    monkeypatch.setenv("GITHUB_TOKEN", "x")
+    _window("x", _WINDOW_A, left=4000, minutes=12)
+    _window("x", (*_WINDOW_B, "orgs", "organizations", "users"), left=4000,
+            minutes=17)
+    _window("x", ("graphql",), left=3, minutes=40, resource="graphql")
+    check = _check(team="", name_prefix="platform")
+    fake = FakeClient(_twenty(), rate=(5000, 5000, 0))
+    result, lines = _traced_run(caplog, check, fake)
+    assert result.reason_texts[0] == (
+        "skipped this run: 3 points left on the window GitHub charges the graphql "
+        "reads to (resets in 40min), need > 4×20 for 20 repo(s)")
+    assert any(line.startswith(
+        "/github: 4000 API calls left on the window GitHub charges the "
+        "secret-scanning, pulls, issues and discovery reads to (resets in 17min)")
+        for line in lines)
+
+
+def test_after_a_rollover_a_rest_path_is_not_priced_against_the_graphql_window(
+        monkeypatch, caplog):
+    """Measured on a token whose two `core` windows roll over in the same minute:
+    the first run after that knows no `core` window, and every REST read was
+    priced against the one window still open — GraphQL's, *needs 4×192 there*.
+    The ledger remembers which resource a path was last charged to, so a path
+    whose resource has no window open is priced the way a first run prices
+    everything: by the endpoint, in that resource's own numbers; the `graphql`
+    window prices the queries alone."""
+    import time
+    monkeypatch.setenv("GITHUB_TOKEN", "x")
+    now = int(time.time())
+    for path in (*_WINDOW_A, *_WINDOW_B, "orgs"):
+        ledger().record("x", f"/repos/example-org/platform-00/{path}",
+                        resource="core", limit=5000, remaining=100, used=4900,
+                        reset=now - 5, now=float(now))           # gone, remembered
+    _window("x", ("graphql",), left=4925, minutes=15, resource="graphql")
+    check = _check(team="", name_prefix="platform")
+    check._last_run_seconds = 120.0
+    fake = FakeClient(_twenty(), rate=(5000, 300, 0))
+    result, lines = _traced_run(caplog, check, fake)
+    assert result.reason_texts[0] == (
+        "skipped this run: 300 API calls left, need > 4×120 for 20 repo(s)")
+    assert fake.rate_limit_calls == 1
+    assert any(line.startswith(
+        "/github: 4925 points left on the window GitHub charges the graphql "
+        "reads to (resets in 15min), this run needs 4×20 = 80 there")
+        for line in lines)
+    assert not [line for line in lines if "4×140" in line]
+
+    rich = _check(team="", name_prefix="platform")           # the endpoint affords it
+    affordable = FakeClient(_twenty(), rate=(5000, 4000, 0))
+    monkeypatch.setattr(rich, "_make_client", lambda token, deadline=None: affordable)
+    assert rich.run().stored_code is StatusCode.OK
+    assert affordable.rate_limit_calls == 1
+
+
+def test_a_path_the_ledger_has_not_seen_is_priced_against_the_tightest_window_known(
+        monkeypatch):
+    """"Where the ledger does not yet know a path … that path is priced against
+    the tightest counter known": only window B has been seen, with a hundred
+    left, so every read of the run — its own three a repository and the four it
+    has never seen — is priced there, and the sentence names that window."""
+    monkeypatch.setenv("GITHUB_TOKEN", "x")
+    _window("x", _WINDOW_B, left=100, minutes=9)
+    check = _check(team="", name_prefix="platform")
+    fake = FakeClient(_twenty(), rate=(5000, 5000, 0))
+    monkeypatch.setattr(check, "_make_client", lambda token, deadline=None: fake)
+    result = check.run()
+    assert result.reason_texts[0] == (
+        "skipped this run: 100 API calls left on the window GitHub charges the "
+        "secret-scanning, pulls and issues reads to (resets in 9min), need > "
+        "4×140 for 20 repo(s)")
+    assert fake.rate_limit_calls == 0
+
+
+def test_where_nothing_is_known_the_guard_reads_the_endpoint_as_it_always_did(
+        monkeypatch):
+    """"where nothing is known the guard reads the endpoint as it does today, so
+    a fresh process is never *less* guarded than the current one" — the bottom
+    rung of the ladder: the first run after a restart, and the sentence of
+    0.1.x."""
+    monkeypatch.setenv("GITHUB_TOKEN", "x")
+    check = _check(team="", name_prefix="platform")
+    fake = FakeClient(_twenty(), rate=(5000, 300, 0))
+    monkeypatch.setattr(check, "_make_client", lambda token, deadline=None: fake)
+    result = check.run()
+    assert result.reason_texts[0] == (
+        "skipped this run: 300 API calls left, need > 4×140 for 20 repo(s)")
+    assert fake.rate_limit_calls == 1
+
+
+def test_actions_is_priced_one_plus_the_workflows_the_last_run_saw(monkeypatch):
+    """Backlog #1 item 4, landing with this change: the guard prices `actions`
+    as `1 + W` from the workflow counts the last run remembered — exact after the
+    first run, and still a floor before it. Nine workflows: a window with 39 left
+    affords the floor's 4×1 and not the honest 4×10."""
+    monkeypatch.setenv("GITHUB_TOKEN", "x")
+    nine = {"workflows": [{"id": i, "name": f"wf{i}", "state": "active"}
+                          for i in range(1, 10)], "total_count": 9}
+    fake = FakeClient([_repo("platform-a")], rate=(5000, 5000, 0),
+                      workflows={"example-org/platform-a": nine})
+    check = _check()
+    monkeypatch.setattr(check, "_make_client", lambda token, deadline=None: fake)
+    _window("x", _WINDOW_A, left=39, minutes=12)
+    _window("x", (*_WINDOW_B, "orgs"), left=4000, minutes=17)
+    _window("x", ("graphql",), left=4900, minutes=40, resource="graphql")
+    assert check.run().stored_code is StatusCode.OK        # the floor: 4×3 ≤ 39
+    assert check._workflow_counts == {"example-org/platform-a": 9}
+    skipped = check.run()
+    assert skipped.reason_texts[0] == (
+        "skipped this run: 39 API calls left on the window GitHub charges the "
+        "dependabot, code-scanning and actions reads to (resets in 12min), need > "
+        "4×12 for 1 repo(s)")
+
+
+def test_the_foreign_rate_over_the_last_runs_length_comes_off_the_window_first(
+        monkeypatch):
+    """"… less the foreign rate of decision 2 over the length of the last run,
+    since a budget that is being spent by somebody else is smaller than it
+    reads." 250 left affords 4×60 on paper; at ~1230/h for the ten minutes a run
+    takes, 205 of it are somebody else's before this run is over."""
+    import time
+    monkeypatch.setenv("GITHUB_TOKEN", "x")
+    now = time.time()
+    reset = int(now) + 750
+    for path in _WINDOW_A:
+        ledger().record("x", f"/repos/example-org/platform-00/{path}",
+                        resource="core", limit=5000, remaining=3500, used=1500,
+                        reset=reset, now=now - 3600)
+    for step in range(268):
+        ledger().record("x", "/repos/example-org/platform-00/dependabot/alerts",
+                        resource="core", limit=5000, remaining=250, used=3000,
+                        reset=reset, now=now - 268 + step)
+    _window("x", (*_WINDOW_B, "orgs"), left=4000, minutes=17)
+    _window("x", ("graphql",), left=4900, minutes=40, resource="graphql")
+    fake = FakeClient(_twenty(), rate=(5000, 5000, 0))
+    check = _check(team="", name_prefix="platform")
+    monkeypatch.setattr(check, "_make_client", lambda token, deadline=None: fake)
+    check._last_run_seconds = 600.0
+    result = check.run()
+    assert result.reason_texts[0] == (
+        "skipped this run: 250 API calls left on the window GitHub charges the "
+        "dependabot, code-scanning and actions reads to (resets in 12min), need > "
+        "4×60 for 20 repo(s); ~1230/h of it is spent by something else using "
+        "this token")
+    fresh = _check(team="", name_prefix="platform")     # no last run to price by
+    monkeypatch.setattr(fresh, "_make_client", lambda token, deadline=None: fake)
+    assert fresh.run().stored_code is StatusCode.OK
+
+
+def test_a_run_remembers_its_length_for_the_next_guard_and_a_skipped_one_does_not(
+        monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "x")
+    check = _check()
+    fake = FakeClient([_repo("platform-a")], rate=(5000, 5000, 0))
+    monkeypatch.setattr(check, "_make_client", lambda token, deadline=None: fake)
+    assert check._last_run_seconds is None
+    check.run()
+    assert check._last_run_seconds is not None
+    _window("x", _WINDOW_A, left=1, minutes=12)
+    remembered = check._last_run_seconds
+    assert check.run().stored_code is StatusCode.WARN      # skipped
+    assert check._last_run_seconds == remembered
+
+
+# --- a window that ends before the run is through is outside the guard (ADR-0007 §3) --
+
+def _twenty_six():
+    return [_repo(f"platform-{i:02d}") for i in range(26)]
+
+
+def test_a_window_that_ends_before_the_run_would_is_not_priced(monkeypatch, caplog):
+    """The first scenario a review found (ADR-0007, decision 3), as first found on
+    the minute-long `dependency_sbom` window the package no longer spends
+    (ADR-0008) and as it stands on any window in its last seconds: 84 left on a
+    window that ends in
+    thirty seconds and twenty-six repositories used to skip the run — *need >
+    4×78* — though a window that resets before this run would end cannot lock the
+    next run out, which is what the guard is for. It is not priced, and the log
+    says so."""
+    monkeypatch.setenv("GITHUB_TOKEN", "x")
+    _window("x", _WINDOW_A, left=84, minutes=0)               # ends in 30 seconds
+    _window("x", (*_WINDOW_B, "orgs"), left=4000, minutes=17)
+    _window("x", ("graphql",), left=4900, minutes=40, resource="graphql")
+    check = _check(team="", name_prefix="platform")
+    check._last_run_seconds = 300.0                        # a run takes five minutes
+    fake = FakeClient(_twenty_six(), rate=(5000, 5000, 0))
+    result, lines = _traced_run(caplog, check, fake)
+    assert result.stored_code is StatusCode.OK and result.children
+    assert fake.rate_limit_calls == 0
+    assert any(line.startswith(
+        "/github: 84 API calls left on the window GitHub charges the dependabot, "
+        "code-scanning and actions reads to (resets in under a minute) — it ends "
+        "before this run would be through, so the run is not priced against it")
+        for line in lines)
+    assert not [line for line in lines if "need" in line and "dependabot" in line]
+
+
+def test_an_unseen_path_is_priced_against_the_tightest_window_the_guard_prices(
+        monkeypatch):
+    """The second scenario a review found (ADR-0007, decision 3): window A unseen,
+    a window in its last seconds live and the smallest, twenty repositories — the
+    unseen `core` paths
+    used to be priced against that window, *need > 4×80* on 84 left. The fallback
+    is the tightest window the guard prices, and the sentence names that one when
+    it fires."""
+    monkeypatch.setenv("GITHUB_TOKEN", "x")
+    _window("x", _WINDOW_B, left=4000, minutes=17)
+    _window("x", ("orgs",), left=84, minutes=0)                # ends in 30 seconds
+    _window("x", ("graphql",), left=4900, minutes=40, resource="graphql")
+    check = _check(team="", name_prefix="platform")
+    check._last_run_seconds = 300.0
+    fake = FakeClient(_twenty(), rate=(5000, 5000, 0))
+    monkeypatch.setattr(check, "_make_client", lambda token, deadline=None: fake)
+    assert check.run().stored_code is StatusCode.OK          # 4×120 ≤ 4000 on B
+    assert fake.rate_limit_calls == 0
+
+    _window("x", _WINDOW_B, left=300, minutes=17)
+    short = _check(team="", name_prefix="platform")
+    short._last_run_seconds = 300.0
+    monkeypatch.setattr(short, "_make_client", lambda token, deadline=None: fake)
+    assert short.run().reason_texts[0] == (
+        "skipped this run: 300 API calls left on the window GitHub charges the "
+        "secret-scanning, pulls and issues reads to (resets in 17min), need > "
+        "4×120 for 20 repo(s)")
+
+
+def test_before_a_run_has_been_measured_timeout_bounds_what_the_run_would_take(
+        monkeypatch):
+    """"… measured by the last run's length, and by `timeout:` before one has been
+    measured, since that is the most a run can take." A `core` window with one call
+    left that resets in twenty seconds is outside a sixty-second run's guard; one
+    that resets in a hundred is not."""
+    monkeypatch.setenv("GITHUB_TOKEN", "x")
+    import time
+    now = int(time.time())
+    for path in (*_WINDOW_A, *_WINDOW_B):
+        ledger().record("x", f"/repos/example-org/platform-00/{path}",
+                        resource="core", limit=5000, remaining=1, used=4999,
+                        reset=now + 20, now=float(now))
+    check = _check(timeout_seconds=60.0)
+    assert check._last_run_seconds is None
+    fake = FakeClient([_repo("platform-a")], rate=(5000, 5000, 0))
+    monkeypatch.setattr(check, "_make_client", lambda token, deadline=None: fake)
+    assert check.run().stored_code is StatusCode.OK
+    for path in (*_WINDOW_A, *_WINDOW_B):
+        ledger().record("x", f"/repos/example-org/platform-00/{path}",
+                        resource="core", limit=5000, remaining=1, used=4999,
+                        reset=now + 100, now=float(now))
+    later = _check(timeout_seconds=60.0)
+    monkeypatch.setattr(later, "_make_client", lambda token, deadline=None: fake)
+    assert later.run().reason_texts[0].startswith("skipped this run: 1 API call")
+
+
+def test_when_every_known_window_ends_before_the_run_the_endpoint_is_read(
+        monkeypatch):
+    """The ladder's bottom rung is still there: with nothing but a window in its
+    last seconds known, nothing prices the run, so the endpoint is read as before
+    the ledger."""
+    monkeypatch.setenv("GITHUB_TOKEN", "x")
+    _window("x", ("orgs",), left=84, minutes=0)                # ends in 30 seconds
+    check = _check(team="", name_prefix="platform")
+    check._last_run_seconds = 300.0
+    fake = FakeClient(_twenty_six(), rate=(5000, 300, 0))
+    monkeypatch.setattr(check, "_make_client", lambda token, deadline=None: fake)
+    assert check.run().reason_texts[0] == (
+        "skipped this run: 300 API calls left, need > 4×182 for 26 repo(s)")
+    assert fake.rate_limit_calls == 1
+
+
+def test_all_branches_is_priced_as_the_list_and_one_page_of_the_wide_read():
+    """In `all_branches` mode the aspect reads the workflow list and one page of
+    `/actions/runs` per repository — two reads, and the wide read lands wherever
+    GitHub charges that path, which the logs showed was the *other* window. And
+    `sbom_check` is one point a query and one query a repository — measured, `1
+    used` on every answer, which is what GitHub's formula gives a query under a
+    hundred requests — so two repositories are two points, and an ignored one
+    is not priced."""
+    check = _check(actions_all_branches=True)
+    check._workflow_counts = {"example-org/platform-a": 9}      # not priced here
+    reads = check._priced_reads(_repos("platform-a", "platform-b"))
+    assert reads["actions/workflows"] == 2 and reads["actions/runs"] == 2
+    exact = _check()
+    exact._workflow_counts = {"example-org/platform-a": 9}
+    assert exact._priced_reads(_repos("platform-a", "platform-b")) == {
+        "pulls": 2, "dependabot/alerts": 2, "code-scanning/alerts": 2,
+        "secret-scanning/alerts": 2, "graphql": 2,
+        "actions/workflows": 2 + 9, "issues": 2}
+    ignoring = _check(sbom_ignore=("platform-b",))
+    assert ignoring._priced_reads(_repos("platform-a", "platform-b"))["graphql"] == 1
+
+
+def test_the_actions_aspect_is_priced_by_the_read_it_makes():
+    """`ASPECT_ENDPOINT["actions"]` still said `/actions/runs`, the read 0.1.6
+    replaced; the ledger matches paths against this table, so it names the
+    workflow list the aspect reads — and the per-workflow runs reduce to the same
+    path."""
+    from little_sister_github.budget import reduce_path
+    assert GitHubCheck.ASPECT_ENDPOINT["actions"] == "/actions/workflows"
+    assert reduce_path("/repos/o/r/actions/workflows/7/runs?branch=main") == (
+        GitHubCheck.ASPECT_ENDPOINT["actions"].lstrip("/"))
 
 
 def test_config_loads_via_loader(tmp_path):
@@ -2247,7 +3344,7 @@ def test_a_repository_name_is_never_in_a_slug():
                 {"title": "x", "number": 1, "html_url": "https://gh/pr/1"}]}),
             [Repo.from_api(row)]),
         check._sbom_check(
-            FakeClient([row], sboms={"example-org/platform-a": _SBOM_EMPTY}),
+            FakeClient([row], graphs={"example-org/platform-a": _graph(0)}),
             [Repo.from_api(row)]),
         check._actions(FakeClient([row], runs=runs), [Repo.from_api(row)]),
     ]
@@ -2330,7 +3427,8 @@ def test_a_paused_run_says_so_on_the_node():
     """A pause is correct behavior, so it grades nothing — but a run that slept a
     minute was indistinguishable from a slow one, which is how a throttle hides."""
     check = _check()
-    code, reason = check._node_reading(StatusCode.OK, "1 repository in scope", "", 47.0)
+    code, reason = check._node_reading(StatusCode.OK, "1 repository in scope", "",
+                                       throttled=47.0)
     assert any("paused 47s for a GitHub rate limit" in line for line in reason)
     assert code is StatusCode.OK               # waiting when asked is not a fault
 
@@ -2339,8 +3437,89 @@ def test_a_run_that_did_not_pause_says_nothing():
     """The line appears only when there was a pause — a sentence on every run is a
     sentence nobody reads."""
     check = _check()
-    _code, reason = check._node_reading(StatusCode.OK, "1 repository in scope", "", 0.0)
+    _code, reason = check._node_reading(StatusCode.OK, "1 repository in scope", "",
+                                        0.0, 0.0)
     assert not [line for line in reason if "paused" in line]
+
+
+# --- a pause is named by its cause (ADR-0007, decision 4) ------------------------
+
+def test_a_run_whose_only_transient_failure_is_a_500_does_not_say_limit_on_its_node():
+    """"The test is the sentence: a run whose only transient failure is a 500 does
+    not say *limit* on its node" — the logs' case: eighty-six pauses after the
+    SBOM endpoint's 500s, every one rendered as a rate limit GitHub never
+    imposed. The wait is the library's own backoff, and the node says so."""
+    answers = [_http_error(500, b'{"message":"Failed to generate SBOM: Request '
+                                b'timed out"}'),
+               _Answer(body=b'{"sbom": {}}')]
+    slept = []
+    with _through(lambda _r, _t: _pop(answers)) as (build, _opener):
+        client = build(sleep=slept.append)
+        client.get("/repos/example-org/platform-a/dependency-graph/sbom")
+    assert slept == [RETRY_BACKOFF_SECONDS]
+    assert client.retried_seconds == RETRY_BACKOFF_SECONDS
+    assert client.throttled_seconds == 0.0
+    assert client.paused_seconds == RETRY_BACKOFF_SECONDS      # the receipt's sum
+    check = _check()
+    code, reason = check._node_reading(
+        StatusCode.OK, "1 repository in scope", "",
+        client.throttled_seconds, client.retried_seconds)
+    assert "paused 1s retrying after GitHub did not answer" in reason
+    assert not [line for line in reason if "limit" in line]
+    assert code is StatusCode.OK
+
+
+def test_a_run_that_read_a_retry_after_says_rate_limit():
+    """"… and a run that read a `retry-after` does": the seconds GitHub asked for
+    are a throttle, and only those are called one."""
+    answers = [_http_error(403, b'{"message":"secondary rate limit"}',
+                           {"retry-after": "2"}),
+               _Answer(body=b'{"ok": true}')]
+    with _through(lambda _r, _t: _pop(answers)) as (build, _opener):
+        client = build(sleep=lambda _s: None)
+        client.get("/x")
+    assert client.throttled_seconds == 2.0 and client.retried_seconds == 0.0
+    check = _check()
+    _code, reason = check._node_reading(
+        StatusCode.OK, "1 repository in scope", "",
+        client.throttled_seconds, client.retried_seconds)
+    assert "paused 2s for a GitHub rate limit" in reason
+    assert not [line for line in reason if "did not answer" in line]
+
+
+def test_an_exhausted_primary_limit_is_a_throttle_and_a_later_500_is_not():
+    """The flag the throttle path sets is read by the very next sleep and by no
+    later one: a throttle wait followed by a plain failure's wait lands in two
+    totals, not one."""
+    reset = _AHEAD + 30
+    answers = [_http_error(403, b'{"message":"API rate limit exceeded"}',
+                           {"x-ratelimit-remaining": "0",
+                            "x-ratelimit-reset": str(reset)}),
+               _Answer(body=b"{}"),
+               _http_error(502, b"{}"),
+               _Answer(body=b"{}")]
+    with _through(lambda _r, _t: _pop(answers)) as (build, _opener):
+        with mock.patch.object(mod_github.time, "time", lambda: float(reset - 45)):
+            client = build(sleep=lambda _s: None)
+            client.get("/a")
+            client.get("/b")
+    assert client.throttled_seconds == 45.0
+    assert client.retried_seconds == RETRY_BACKOFF_SECONDS
+
+
+def test_both_kinds_of_wait_are_said_apart_on_the_node(monkeypatch):
+    """"The node's sentence says whichever happened, or both" — through the run,
+    as the engine sees it."""
+    monkeypatch.setenv("GITHUB_TOKEN", "x")
+    check = _check()
+    fake = FakeClient([_repo("platform-a")], throttled_seconds=61.0,
+                      retried_seconds=3.0)
+    monkeypatch.setattr(check, "_make_client", lambda token, deadline=None: fake)
+    reason = check.run().reason_texts
+    assert "paused 61s for a GitHub rate limit" in reason
+    assert "paused 3s retrying after GitHub did not answer" in reason
+    assert reason.index("paused 61s for a GitHub rate limit") < reason.index(
+        "paused 3s retrying after GitHub did not answer")
 
 
 def test_the_pull_request_leaf_keeps_its_own_title():
@@ -2443,14 +3622,16 @@ def test_pull_requests_isolates_per_repository_like_every_other_aspect():
 # config states, with the values that sentence is about.
 
 def test_a_5xx_no_longer_paints_the_repository_amber():
-    """The sentence this whole item exists for. `sbom_check` answers *does this
-    repository have a dependency graph?* — and a 500 is not an answer to it, so
-    the line says the asking failed and the aspect stays green for the
-    repositories that did answer."""
+    """The sentence this whole item exists for. `pull_requests` answers *which
+    pull requests are open here?* — and a 500 is not an answer to it, so the line
+    says the asking failed and the aspect stays green for the repositories that
+    did answer. (The SBOM export that first made this routine is gone, ADR-0008;
+    the rule is every per-repository read's.)"""
     check = _check()
     repos = [_repo("platform-a"), _repo("platform-b")]
-    fake = FakeClient(repos, sboms={"example-org/platform-a": _transient()})
-    result = check._sbom_check(fake, check._discover(fake))
+    fake = FakeClient(repos, errors={("example-org/platform-a", "pulls"):
+                                     _transient()})
+    result = check._pull_requests(fake, check._discover(fake))
     lines = {e.slug: e for e in result.reason_entries}
     assert lines[_slug("platform-a", "unreadable")].code is StatusCode.UNDEFINED
     assert "could not ask GitHub" in lines[_slug("platform-a", "unreadable")].text
@@ -2467,20 +3648,21 @@ def test_the_split_is_by_status_and_a_permission_error_still_grades():
     act on it."""
     check = _check()
     fake = FakeClient([_repo("platform-a")],
-                      sboms={"example-org/platform-a": _denied()})
-    result = check._sbom_check(fake, check._discover(fake))
+                      errors={("example-org/platform-a", "pulls"): _denied()})
+    result = check._pull_requests(fake, check._discover(fake))
     line = result.reason_entries[0]
     assert line.code is StatusCode.WARN
     assert "could not read" in line.text and "could not ask" not in line.text
     assert result.stored_code is StatusCode.WARN
 
 
-def test_a_404_still_means_missing():
-    """Unchanged, and the ADR says so explicitly: a 404 is GitHub answering that
-    the thing is absent, which is a finding about the repository."""
+def test_an_absent_graph_still_means_missing():
+    """Unchanged in what it grades: the export's 404 was GitHub answering that
+    the thing is absent, a finding about the repository, and a manifest count of
+    zero is the same answer asked of the graph itself (ADR-0008, decision 2)."""
     check = _check()
-    fake = FakeClient([_repo("platform-a")], sboms={
-        "example-org/platform-a": _answered("nope", 404)})
+    fake = FakeClient([_repo("platform-a")],
+                      graphs={"example-org/platform-a": _graph(0)})
     result = check._sbom_check(fake, check._discover(fake))
     assert result.reason_entries[0].slug == _slug("platform-a", "sbom")
     assert result.stored_code is StatusCode.ERROR
@@ -2493,8 +3675,9 @@ def test_the_repositories_that_were_read_are_not_erased_by_the_one_that_was_not(
     with the unknown one. The `read` line is those clean readings."""
     check = _check()
     repos = [_repo(f"platform-{c}") for c in "abc"]
-    fake = FakeClient(repos, sboms={"example-org/platform-a": _transient()})
-    result = check._sbom_check(fake, check._discover(fake))
+    fake = FakeClient(repos, errors={("example-org/platform-a", "pulls"):
+                                     _transient()})
+    result = check._pull_requests(fake, check._discover(fake))
     assert result.stored_code is StatusCode.WARN         # not UNDEFINED
     read = [e for e in result.reason_entries if e.slug == "read"]
     assert len(read) == 1
@@ -2510,8 +3693,7 @@ def test_an_aspect_that_read_nothing_at_all_is_amber_not_grey():
     nothing."""
     check = _check()
     repos = [_repo("platform-a"), _repo("platform-b")]
-    fake = FakeClient(repos, sboms={"example-org/platform-a": _transient(),
-                                    "example-org/platform-b": _transient()})
+    fake = FakeClient(repos, graph_error=_transient())   # the one query, unanswered
     result = check._sbom_check(fake, check._discover(fake))
     assert result.stored_code is StatusCode.WARN
     assert all(e.code is StatusCode.UNDEFINED
@@ -2542,8 +3724,7 @@ def test_the_rule_is_the_same_in_every_aspect_that_reads_per_repository():
             ("example-org/platform-a", "issues"): _transient()}),
         "secret_scanning_alerts": FakeClient(repos, errors={
             ("example-org/platform-a", "secret_scanning"): _transient()}),
-        "sbom_check": FakeClient(repos, sboms={
-            "example-org/platform-a": _transient()}),
+        "sbom_check": FakeClient(repos, graph_error=_transient()),
     }
     for aspect, fake in cases.items():
         result = getattr(check, f"_{aspect}")(fake, check._discover(fake))
@@ -2586,8 +3767,8 @@ def test_the_check_node_is_where_an_outage_becomes_visible():
     check = _check()
     repos = [_repo("platform-a"), _repo("platform-b")]
     fake = FakeClient(repos,
-                      sboms={"example-org/platform-a": _transient()},
-                      errors={("example-org/platform-b", "issues"): _transient()})
+                      errors={("example-org/platform-a", "pulls"): _transient(),
+                              ("example-org/platform-b", "issues"): _transient()})
     check._make_client = lambda token, deadline=None: fake  # type: ignore[method-assign]
     result = check.run()
     assert result.stored_code is StatusCode.WARN
@@ -2602,7 +3783,7 @@ def test_a_permission_error_is_not_counted_on_the_node():
     condition twice and make the node's number mean two different things."""
     check = _check()
     fake = FakeClient([_repo("platform-a")],
-                      sboms={"example-org/platform-a": _denied()})
+                      graphs={"example-org/platform-a": "FORBIDDEN"})
     check._make_client = lambda token, deadline=None: fake  # type: ignore[method-assign]
     result = check.run()
     assert "could not be completed" not in " ".join(result.reason_texts)
@@ -2647,7 +3828,7 @@ def _client(opener, **over):
     calls = []
 
     class _Stub(GitHubClient):
-        def _attempt(self, url):
+        def _attempt(self, url, **_request):      # `method` and `body`: the seam's
             calls.append(url)
             return opener(url, self._timeout)
 
@@ -2727,6 +3908,185 @@ def _through(answer):
             kwargs.update(over)
             return GitHubClient("t", **kwargs)
         yield build, opener
+
+
+# --- conditional requests (ADR-0011) -----------------------------------------
+
+def _etag_opener(pages):
+    """An opener that answers from a list of `(expect_inm, _Answer)` in order, and
+    asserts what `If-None-Match` each request carried — the header is the whole
+    mechanism, so a test that does not look at it proves nothing."""
+    seen = []
+
+    def answer(request, _timeout):
+        expect, reply = pages[len(seen)]
+        seen.append(request.get_header("If-none-match"))
+        assert seen[-1] == expect, (seen[-1], expect)
+        return reply
+    return answer, seen
+
+
+def test_a_304_returns_the_held_payload_and_the_held_link():
+    """The correction to the sketch: `_attempt` returns `(payload, Link)` and
+    `get_paginated` walks that header, so a `304` that gave back the payload without
+    the Link would stop a paginated read after its first page and call it whole."""
+    nxt = '<https://api.example.test/p2>; rel="next"'
+    first = _Answer(200, b'[{"n": 1}]', {"ETag": 'W/"aaa"', "Link": nxt})
+    later = _Answer(304, b"", {"ETag": 'W/"aaa"'})
+    answer, _ = _etag_opener([(None, first), ('W/"aaa"', later)])
+    with _through(answer) as (build, _opener):
+        client = build(cache=mod_github._ConditionalCache())
+        got, link = client._request("/x")
+        assert got == [{"n": 1}] and "rel=\"next\"" in link
+        again, link_again = client._request("/x")
+    assert again == [{"n": 1}]
+    assert link_again == link              # the Link comes back with the payload
+    assert client.free_reads == 1
+
+
+def test_a_changed_etag_replaces_both_the_payload_and_the_link():
+    """The other direction, or the cache would serve the first answer forever."""
+    nxt = '<https://api.example.test/p2>; rel="next"'
+    first = _Answer(200, b'[{"n": 1}]', {"ETag": 'W/"aaa"', "Link": nxt})
+    moved = _Answer(200, b'[{"n": 2}]', {"ETag": 'W/"bbb"'})
+    third = _Answer(304, b"", {})
+    answer, _ = _etag_opener(
+        [(None, first), ('W/"aaa"', moved), ('W/"bbb"', third)])
+    with _through(answer) as (build, _opener):
+        client = build(cache=mod_github._ConditionalCache())
+        client._request("/x")
+        second, second_link = client._request("/x")
+        assert second == [{"n": 2}] and second_link == ""
+        third_payload, third_link = client._request("/x")
+    assert third_payload == [{"n": 2}] and third_link == ""
+
+
+def test_a_304_is_a_reading_of_the_window_that_spent_none_of_it():
+    """A `304` carries the whole `x-ratelimit-*` set — measured — so it is kept as a
+    reading; and GitHub charged nothing for it, so it is **no attempt**, or
+    `foreign_rate` (Δused − attempts) reads low and the *spent by something else*
+    clause with it."""
+    book = Ledger()
+    rate = {"X-RateLimit-Limit": "5000", "X-RateLimit-Remaining": "4000",
+            "X-RateLimit-Used": "1000", "X-RateLimit-Reset": "4000000000",
+            "X-RateLimit-Resource": "core"}
+    first = _Answer(200, b"[]", {"ETag": 'W/"aaa"', **rate})
+    free = _Answer(304, b"", {"ETag": 'W/"aaa"', **rate})
+    spent = _Answer(200, b"[]", {"ETag": 'W/"bbb"',
+                                 **{**rate, "X-RateLimit-Used": "1001",
+                                    "X-RateLimit-Remaining": "3999"}})
+    answer, _ = _etag_opener(
+        [(None, first), ('W/"aaa"', free), ('W/"aaa"', spent)])
+    with _through(answer) as (build, _opener):
+        client = build(cache=mod_github._ConditionalCache(), ledger=book)
+        client._request("/repos/example-org/platform-a/pulls")
+        counter, = book.counters("t", "core", 3_999_000_000.0)
+        opened = counter.attempts
+        client._request("/repos/example-org/platform-a/pulls")   # the 304
+        counter, = book.counters("t", "core", 3_999_000_000.0)
+        assert counter.attempts == opened          # the free one raised nothing
+        assert counter.used == 1000                # …and was still a reading
+        client._request("/repos/example-org/platform-a/pulls")   # a real 200
+        counter, = book.counters("t", "core", 3_999_000_000.0)
+    assert counter.attempts == opened + 1
+    assert counter.used == 1001
+
+
+def test_a_304_never_reaches_the_refusal():
+    """`fault_for(304)` reads *not modified* as an answer, so without the branch
+    before `_refusal` an unchanged repository gets a `could not read` WARN line."""
+    first = _Answer(200, b"[]", {"ETag": 'W/"aaa"'})
+    free = _Answer(304, b"", {})
+    answer, _ = _etag_opener([(None, first), ('W/"aaa"', free)])
+    with _through(answer) as (build, _opener):
+        client = build(cache=mod_github._ConditionalCache())
+        client._request("/x")
+        payload, _link = client._request("/x")       # no GitHubError raised
+    assert payload == []
+
+
+def test_the_budget_read_is_never_held():
+    """`/rate_limit`'s **body** is a budget reading — `Ledger.record` consumes one of
+    its rows as if it were a response's own headers — so a held body there would feed
+    the ledger a stale window as a current one, and the budget is what the guard
+    reasons from."""
+    rows = (b'{"resources": {"core": {"limit": 5000, "remaining": 4000,'
+            b' "used": 1000, "reset": 4000000000}}}')
+    answer, _ = _etag_opener([(None, _Answer(200, rows, {"ETag": 'W/"aaa"'})),
+                              (None, _Answer(200, rows, {"ETag": 'W/"aaa"'}))])
+    with _through(answer) as (build, _opener):
+        cache = mod_github._ConditionalCache()
+        client = build(cache=cache)
+        client._request("/rate_limit")
+        assert len(cache) == 0                 # nothing held…
+        client._request("/rate_limit")         # …so the second asks again, freshly
+    assert len(cache) == 0
+
+
+def test_an_entry_survives_one_missed_pass_and_goes_after_two():
+    """Two passes, not one: a run cut short by its deadline or a dead network touches
+    only a prefix of the repositories, and sweeping on one pass would throw away
+    exactly what the next run needs."""
+    cache = mod_github._ConditionalCache()
+    cache.started()
+    cache.reading("pull_requests")
+    cache.store("https://api/x", 'W/"a"', [1], "")
+    cache.sweep()
+    cache.reading("pull_requests")          # a partial pass that never reached it
+    cache.sweep()
+    assert len(cache) == 1 and cache.dropped == 0
+    cache.reading("pull_requests")          # a second pass without it
+    cache.sweep()
+    assert len(cache) == 0 and cache.dropped == 1
+    # and a pass that *does* reach it resets the count
+    cache.reading("issues")
+    cache.store("https://api/y", 'W/"b"', [2], "")
+    cache.sweep()
+    cache.reading("issues")
+    cache.sweep()
+    cache.reading("issues")
+    assert cache.hit("https://api/y") == ([2], "")
+    cache.sweep()
+    cache.reading("issues")
+    cache.sweep()
+    assert len(cache) == 1                  # the hit put it back to zero
+
+
+def test_a_reader_never_sweeps_another_readers_entries():
+    """The unit is the aspect, not the run (little-sister ADR-0078): once aspects are
+    paced separately, a run that exercised only `actions` must not age out every
+    alert payload it never asked for."""
+    cache = mod_github._ConditionalCache()
+    cache.started()
+    cache.reading("security_advisories")
+    cache.store("https://api/alerts", 'W/"a"', [1], "")
+    cache.sweep()
+    for _ in range(5):                       # five passes of a different reader
+        cache.reading("actions")
+        cache.sweep()
+    assert len(cache) == 1 and cache.dropped == 0
+    cache.reading("security_advisories")
+    assert cache.hit("https://api/alerts") == ([1], "")
+
+
+def test_the_report_says_what_is_held_and_what_the_run_spent(monkeypatch):
+    """Display text and never a status claim (little-sister ADR-0044). It is the
+    measurement this slice owes: the guard still prices a run at full cost while a
+    warm run spends a fraction, and this is what makes that rate readable."""
+    monkeypatch.setenv("GITHUB_TOKEN", "x")
+    check = _check()
+    fake = FakeClient([_repo("platform-a")])
+    fake.free_reads = 4
+    monkeypatch.setattr(check, "_make_client", lambda token, deadline=None: fake)
+    check._conditional.reading("pull_requests")
+    check._conditional.store("https://api/x", 'W/"a"', [1], "")
+    check._conditional.sweep()
+    report = check.run().report
+    assert "conditional cache: 1 payload(s) held across 7 aspect(s) and discovery" \
+        in report
+    assert "of which 4 were free" in report
+    # sbom_check reads POST /graphql, which carries no ETag — seven, not eight
+    assert len(check.active_aspects()) == 8
 
 
 def test_timeout_is_the_runs_budget_and_request_timeout_is_one_requests():
@@ -3195,7 +4555,7 @@ def test_the_run_receipt_names_the_slowest_read(caplog):
     check = _check(timeout_seconds=60.0)
     fake = FakeClient(_two_repos(), read_seconds=41.5, slowest_read=14.5,
                       slowest_path="/repos/example-org/platform-a/pulls",
-                      paused_seconds=3.0)
+                      retried_seconds=3.0)
     _result, lines = _traced_run(caplog, check, fake)
     assert ("/github: run ended after 0.0s of its 60s timeout — 17 read(s) in "
             "41.5s, slowest read 14.5s (/repos/example-org/platform-a/pulls), "
@@ -3526,6 +4886,31 @@ def test_a_secondary_limit_with_retry_after_is_not_now_and_is_waited_out():
     assert slept == [2.0]                 # GitHub's two seconds, not our one
 
 
+def test_an_html_error_page_is_reduced_to_its_title_on_the_line():
+    """GitHub's gateway answers a timed-out GraphQL request with nginx's HTML
+    page, and two hundred characters of markup used to land on the repository's
+    line. What a reader wants of such a page is its title."""
+    page = (b"<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n"
+            b"<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx"
+            b"</center>\r\n</body>\r\n</html>\r\n")
+    with _through(_http_error(502, page)) as (build, _opener):
+        with pytest.raises(GitHubError) as caught:
+            build(retries=0).get("/x")
+    assert str(caught.value) == (
+        "HTTP 502 for https://api.example.test/x: 502 Bad Gateway")
+    assert caught.value.fault is Fault.TRANSIENT
+    with _through(_http_error(500, b'{"message": "Failed to generate"}')) as (
+            build, _opener):
+        with pytest.raises(GitHubError) as caught:
+            build(retries=0).get("/y")
+    assert str(caught.value).endswith('{"message": "Failed to generate"}')
+    with _through(_http_error(502, b"<html><body>no title here</body></html>")) as (
+            build, _opener):
+        with pytest.raises(GitHubError) as caught:
+            build(retries=0).get("/z")
+    assert str(caught.value).endswith(": an HTML page, not an API answer")
+
+
 def test_a_throttle_that_survives_the_retry_grades_nothing():
     """What reaches an aspect when GitHub keeps saying *not now*: a transient
     failure carrying the number, which becomes the quiet UNDEFINED line rather than
@@ -3632,7 +5017,8 @@ def test_every_answer_leaves_its_budget_headers_on_the_client():
         resource="core", limit=5000, remaining=4841, used=159,
         reset=1_700_000_060)
     assert client.last_rate_limit.text(1_700_000_060 - 2280) == (
-        "core: 4841 of 5000 left, 159 used, resets in 38min")
+        f"core: 4841 of 5000 left, 159 used, resets in 38min "
+        f"({_clock(1_700_000_060)})")
 
 
 def test_a_refusal_carries_the_budget_too_and_is_kept():
@@ -3689,6 +5075,229 @@ def test_a_partial_reading_leaves_the_parts_it_does_not_have_out():
     assert RateLimitHeaders(resource="core", limit=5000, used=159,
                             reset=0).text() == "core: limit 5000, 159 used"
     assert RateLimitHeaders(remaining=1, limit=2).text() == "budget: 1 of 2 left"
+
+
+def _clock(reset):
+    """The window's end as the trace writes it: the log's own clock, which is the
+    machine's local time — the one the timestamp at the head of the line is in."""
+    import time
+    return time.strftime("%H:%M:%S", time.localtime(reset))
+
+
+def test_a_trace_line_names_the_windows_end_as_a_clock_time_beside_the_minutes():
+    """ADR-0007, decision 5: "every trace line that names a window names its end as
+    a clock time beside the minutes — `resets in 34min (21:50:07)` — so two lines
+    about two windows read as two windows, which `resets in Nmin` alone cannot
+    show." Two windows five minutes apart, two clock times; the node's own line
+    keeps the minutes and is not under test here."""
+    reset_a, reset_b = 1_700_000_060, 1_700_000_360
+    now = float(reset_a - 34 * 60)
+    a = RateLimitHeaders(resource="core", limit=5000, remaining=4841, used=159,
+                         reset=reset_a)
+    b = RateLimitHeaders(resource="core", limit=5000, remaining=3932, used=1068,
+                         reset=reset_b)
+    assert a.text(now).endswith(f"resets in 34min ({_clock(reset_a)})")
+    assert b.text(now).endswith(f"resets in 39min ({_clock(reset_b)})")
+    assert budget_said(a, now) != budget_said(b, now)
+
+
+def test_a_read_that_got_no_answer_leaves_no_budget_claim():
+    """ADR-0007, decision 5: "`last_rate_limit` is cleared before every attempt, so
+    a request that never reached a status reads on the trace as *no budget headers
+    on that read* rather than as the previous response's numbers." The logs' case:
+    an aspect whose every read failed on a dead network reported the previous
+    aspect's headers as its own."""
+    import urllib.error
+    answers = [_Answer(body=b"{}", headers={"x-ratelimit-limit": "5000",
+                                             "x-ratelimit-remaining": "4888",
+                                             "x-ratelimit-used": "112",
+                                             "x-ratelimit-reset": "1700000060",
+                                             "x-ratelimit-resource": "core"}),
+               urllib.error.URLError("nodename nor servname provided")]
+    with _through(lambda _r, _t: _pop(answers)) as (build, _opener):
+        client = build(retries=0)
+        client.get("/repos/example-org/platform-a/actions/workflows")
+        assert client.last_rate_limit is not None       # the answer that came
+        with pytest.raises(GitHubError):
+            client.get("/repos/example-org/platform-a/dependabot/alerts")
+    assert client.last_rate_limit is None
+    assert budget_said(client.last_rate_limit) == NO_BUDGET_HEADERS
+
+
+#: A window end far enough ahead that the real clock, which the ledger prunes
+#: against, never sees it as passed.
+_AHEAD = 4_000_000_000
+
+
+def _budget_headers(remaining, reset, *, resource="core", limit=5000):
+    return {"x-ratelimit-limit": str(limit),
+            "x-ratelimit-remaining": str(remaining),
+            "x-ratelimit-used": str(limit - remaining),
+            "x-ratelimit-reset": str(reset),
+            "x-ratelimit-resource": resource}
+
+
+def test_every_answer_feeds_the_ledger_with_the_path_it_was_charged_to():
+    """ADR-0007, decision 1: "The client already parses `RateLimitHeaders` off
+    every answer and throws all but the last away. It now hands each one to a
+    ledger" — per counter, with the path reduced to what it served. Two windows
+    minutes apart, as the logs showed, and a refusal feeds it too, because the
+    headers are read before the status."""
+    book = Ledger()
+    reset_a, reset_b = _AHEAD + 60, _AHEAD + 360
+    answers = [
+        _Answer(body=b"[]", headers=_budget_headers(4841, reset_a)),
+        _Answer(body=b"[]", headers=_budget_headers(3932, reset_b)),
+        _http_error(403, b'{"message":"nope"}',
+                    _budget_headers(3931, reset_b)),
+    ]
+    with _through(lambda _r, _t: _pop(answers)) as (build, _opener):
+        client = build(ledger=book, retries=0)
+        client.get("/repos/example-org/platform-a/dependabot/alerts",
+                   {"state": "open"})
+        client.get("/repos/example-org/platform-a/pulls", {"state": "open"})
+        with pytest.raises(GitHubError):
+            client.get("/repos/example-org/platform-a/secret-scanning/alerts")
+    now = float(reset_a - 600)
+    tighter, wider = book.counters("t", "core", now)
+    assert (tighter.reset, wider.reset) == (reset_b, reset_a)
+    assert wider.paths == {"dependabot/alerts"}
+    assert tighter.paths == {"pulls", "secret-scanning/alerts"}
+    assert tighter.remaining == 3931                       # the refusal's numbers
+    assert book.counter_for("t", "pulls", now) is not None
+
+
+# --- the GraphQL seam (ADR-0008, decision 3) ------------------------------------
+
+def test_a_graphql_query_is_a_post_to_the_graphql_endpoint_with_the_clients_headers():
+    """"a `POST` through the library's `fetch` to the API's GraphQL endpoint —
+    `{api_url}/graphql` for GitHub — with the headers … every REST request here
+    has", and the answer handed back whole: `data` and `errors` are the caller's
+    to read."""
+    import json
+    with _through(_Answer(body=b'{"data": {"viewer": {"login": "x"}}}')) as (
+            build, opener):
+        answer = build().graphql("query { viewer { login } }")
+    assert answer == {"data": {"viewer": {"login": "x"}}}
+    sent = opener.requests[0]
+    assert sent.get_method() == "POST"
+    assert sent.full_url == "https://api.example.test/graphql"
+    assert json.loads(sent.data) == {"query": "query { viewer { login } }",
+                                     "variables": {}}
+    assert sent.get_header("Authorization") == "Bearer t"
+    assert sent.get_header("Content-type") == "application/json"
+    assert sent.get_header("X-github-api-version") == "2022-11-28"
+
+
+def test_the_answers_budget_headers_land_in_the_ledger_under_graphql():
+    """"The response's budget headers feed the ledger as any response's do …
+    under the resource GitHub names, `graphql`, on the reduced path `graphql`."
+    """
+    book = Ledger()
+    reset = _AHEAD + 60
+    answer = _Answer(body=b'{"data": {}}',
+                     headers=_budget_headers(4995, reset, resource="graphql"))
+    with _through(answer) as (build, _opener):
+        build(ledger=book).graphql("query { viewer { login } }")
+    (counter,) = book.counters("t", "graphql", float(reset - 60))
+    assert counter.paths == {"graphql"} and counter.remaining == 4995
+    assert book.counter_for("t", "graphql", float(reset - 60)) is not None
+
+
+def test_a_graphql_5xx_and_a_throttle_read_as_they_do_for_a_rest_read():
+    """"with … the deadline, the retry and the throttle reading every REST
+    request here has": a 502 is retried once on the backoff, a 403 with
+    `retry-after` is waited out for GitHub's seconds and counted as a throttle."""
+    answers = [_http_error(502, b"{}"), _Answer(body=b'{"data": {}}')]
+    slept = []
+    with _through(lambda _r, _t: _pop(answers)) as (build, _opener):
+        assert build(sleep=slept.append).graphql("query { x }") == {"data": {}}
+    assert slept == [RETRY_BACKOFF_SECONDS]
+    throttled = [_http_error(403, b'{"message":"rate limit"}',
+                             {"retry-after": "3"}),
+                 _Answer(body=b'{"data": {}}')]
+    waited = []
+    with _through(lambda _r, _t: _pop(throttled)) as (build, _opener):
+        client = build(sleep=waited.append)
+        client.graphql("query { x }")
+    assert waited == [3.0] and client.throttled_seconds == 3.0
+
+
+def test_the_enterprise_graphql_endpoint_is_the_sibling_of_api_v3():
+    """"for a GitHub Enterprise Server `api_url` ending in `/api/v3`, its sibling
+    `/api/graphql`" — GitHub's own layout for a server, where the REST root is
+    not the host."""
+    with _through(_Answer(body=b'{"data": {}}')) as (build, opener):
+        build(api_url="https://ghe.example.test/api/v3").graphql("query { x }")
+    assert opener.requests[0].full_url == "https://ghe.example.test/api/graphql"
+    with _through(_Answer(body=b'{"data": {}}')) as (build, opener):
+        build(api_url="https://ghe.example.test/api/v3/").graphql("query { x }")
+    assert opener.requests[0].full_url == "https://ghe.example.test/api/graphql"
+
+
+def test_the_first_sight_of_a_window_with_spend_on_it_is_one_log_line(caplog):
+    """On the log, unconditionally — there the restart ambiguity is readable off
+    the timestamps — and marked when this process saw the window open, which is
+    the case the node then says."""
+    caplog.set_level(logging.INFO, logger=_LOGGER)
+    book = Ledger()
+    reset = _AHEAD + 60
+    answers = [
+        _Answer(body=b"[]", headers=_budget_headers(4900, reset)),
+        _Answer(body=b"[]", headers=_budget_headers(4899, reset)),
+        _Answer(body=b"[]", headers=_budget_headers(4954, reset + 3600)),
+    ]
+    with _through(lambda _r, _t: _pop(answers)) as (build, _opener):
+        client = build(ledger=book)
+        for _ in range(3):
+            client.get("/repos/example-org/platform-a/pulls")
+    lines = [line for line in _lines(caplog) if "first reading" in line]
+    assert len(lines) == 2
+    assert lines[0].startswith(
+        "pulls: first reading of the core window, resets in ") and (
+        ") — 99 used before this process read it" in lines[0])
+    assert "((" not in lines[0]
+    assert lines[0].endswith("before a restart, or by something else")
+    assert "— 45 used before this process read it — this process saw it open" \
+        in lines[1]
+
+
+def test_the_client_feeds_the_process_wide_ledger_unless_handed_another():
+    """Both check types read one ledger without either owning it — the process's
+    — so a client built without one feeds that one. The suite hands every test a
+    fresh one (`conftest.py`), which is what this reads back."""
+    reset = _AHEAD + 60
+    answer = _Answer(body=b"{}", headers=_budget_headers(4000, reset))
+    with _through(answer) as (build, _opener):
+        build().get("/repos/example-org/platform-a/issues")
+    (counter,) = ledger().counters("t", "core", float(reset - 60))
+    assert counter.paths == {"issues"}
+
+
+def test_a_rate_limit_read_is_a_free_sample_and_a_pristine_one_opens_nothing():
+    """"`/rate_limit` … it is free": the client passes the path through, so the
+    ledger can tell the endpoint's reading from a charged one — a sample of the
+    counter its `reset` names, no attempt, and a pristine reading of a window
+    nothing spent is not a counter at all."""
+    book = Ledger()
+    reset = _AHEAD + 360
+    answers = [
+        _Answer(body=b"[]", headers=_budget_headers(3932, reset)),
+        _Answer(body=b'{"resources": {}}',
+                headers=_budget_headers(3930, reset)),
+        _Answer(body=b'{"resources": {}}',
+                headers=_budget_headers(5000, reset + 3600)),
+    ]
+    with _through(lambda _r, _t: _pop(answers)) as (build, _opener):
+        client = build(ledger=book)
+        client.get("/repos/example-org/platform-a/pulls")
+        client.get("/rate_limit")
+        client.get("/rate_limit")
+    now = float(reset - 600)
+    (counter,) = book.counters("t", "core", now)
+    assert counter.reset == reset
+    assert counter.remaining == 3930 and counter.attempts == 0
+    assert counter.paths == {"pulls"}
 
 
 def test_a_bare_429_is_a_throttle_because_that_is_all_github_sends_it_for():
@@ -3814,9 +5423,8 @@ def test_an_unreadable_answer_still_grades_the_line():
     check cannot read is a defect in the check or in the API — waiting it out changes
     nothing, so it grades WARN and is not counted as an outage on the node."""
     check = _check()
-    fake = FakeClient([_repo("platform-a")], sboms={
-        "example-org/platform-a": GitHubError("not JSON", status=200,
-                                              fault=Fault.MALFORMED)})
+    fake = FakeClient([_repo("platform-a")], graph_error=GitHubError(
+        "not JSON", status=200, fault=Fault.MALFORMED))
     result = check._sbom_check(fake, _repos("platform-a"))
     line = result.reason_entries[0]
     assert line.code is StatusCode.WARN
@@ -3902,7 +5510,7 @@ def test_a_permission_error_alone_does_not_add_the_read_line():
     403 already grades WARN, so there is nothing to rescue and nothing to say."""
     check = _check()
     fake = FakeClient([_repo("platform-a"), _repo("platform-b")],
-                      sboms={"example-org/platform-a": _denied()})
+                      graphs={"example-org/platform-a": "FORBIDDEN"})
     result = check._sbom_check(fake, check._discover(fake))
     assert not [e for e in result.reason_entries if e.slug == "read"]
     assert result.stored_code is StatusCode.WARN
@@ -3952,9 +5560,9 @@ def test_the_read_count_includes_every_kind_of_miss_not_only_the_quiet_ones():
     repos = _repos("platform-a", "platform-b", "platform-c")
     fake = FakeClient(
         [_repo(n) for n in ("platform-a", "platform-b", "platform-c")],
-        sboms={"example-org/platform-a": _transient(),
-               "example-org/platform-b": _denied()})
-    result = check._sbom_check(fake, repos)
+        errors={("example-org/platform-a", "pulls"): _transient(),
+                ("example-org/platform-b", "pulls"): _denied()})
+    result = check._pull_requests(fake, repos)
     read = next(e for e in result.reason_entries if e.slug == "read")
     assert read.text == "GitHub did not answer for 1 of 3 repositories"
 
@@ -3963,16 +5571,14 @@ def test_the_nodes_count_reads_as_english_for_exactly_one():
     """It is the sentence an operator sees first on a bad morning; "1 repository
     reads could not be completed" is not it."""
     check = _check()
-    one = FakeClient([_repo("platform-a")],
-                     sboms={"example-org/platform-a": _transient()})
+    one = FakeClient([_repo("platform-a")], graph_error=_transient())
     check._make_client = lambda token, deadline=None: one  # type: ignore[method-assign]
     assert "1 repository read could not be completed" in \
         " ".join(check.run().reason_texts)
 
     other = _check()
     two = FakeClient([_repo("platform-a"), _repo("platform-b")],
-                     sboms={"example-org/platform-a": _transient(),
-                            "example-org/platform-b": _transient()})
+                     graph_error=_transient())
     other._make_client = lambda token, deadline=None: two  # type: ignore[method-assign]
     assert "2 repository reads could not be completed" in \
         " ".join(other.run().reason_texts)

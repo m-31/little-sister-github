@@ -59,6 +59,15 @@ from little_sister.transport import (
     ask,
 )
 
+from little_sister_github.budget import (
+    FREE_PATHS,
+    Counter,
+    Ledger,
+    reduce_path,
+    unit_of,
+)
+from little_sister_github.budget import ledger as shared_ledger
+
 #: This package's own logger. little-sister does not promise its ``logger`` to
 #: check authors and does not need to: the library configures the root handlers,
 #: so an ordinary module logger's records land in the same place, under a name
@@ -205,11 +214,17 @@ RETIRED_ASPECTS = {
 
 
 def _severity_map(value: object, field: str) -> dict[str, StatusCode]:
-    """One configured source-severity → dashboard-code mapping."""
+    """One configured source-severity → dashboard-code mapping.
+
+    ``field`` is the **whole** key path, because not every map of this shape is
+    spelled `<block>.severity_map`: the one that grades a disabled workflow is
+    `actions.disabled_severity_map`, and a refusal has to name the key the
+    deployment actually typed.
+    """
     if value is None:
         return {}
     if not isinstance(value, dict):
-        raise CheckError(f"github '{field}.severity_map' must be a mapping")
+        raise CheckError(f"github '{field}' must be a mapping")
     return {str(severity).lower(): coerce_code(code)
             for severity, code in value.items()}
 
@@ -377,7 +392,8 @@ repo's Settings → Code security and analysis at "Secret Protection".
         "title": "SBOM presence",
         "about": """\
 Every repository with code must have a dependency graph (SBOM) so its libraries
-can be checked for known issues. A repository listed here has none. Some repos
+can be checked for known issues. A repository listed here has none, or none of
+its manifests could be parsed, so Dependabot has nothing to check. Some repos
 are exempt — see `sbom_check.ignore` in this check's config.
 
 {pin_note}
@@ -403,10 +419,14 @@ run → ERROR, a run awaiting approval → WARN. Workflows matching
 `actions.ignore_workflow_name_patterns` are skipped.
 
 Each workflow is asked about on its own, so a workflow with nothing here does not
-run on this branch — that is an answer rather than a gap (ADR-0005). Three cases
-still read one shared page of runs and cannot be exact: `actions.all_branches`, a
-repository with more workflows than one page of the workflow list, and a budget too
-thin to pay for a read per workflow. One WARN line then names those repositories,
+run on this branch — that is an answer rather than a gap (ADR-0005). `actions.branches`
+replaces the default branch with the branches you name and asks each workflow about
+each of them, exactly as it asks about the default one (ADR-0009); where none of them
+matched a repository at all, one WARN line says so and names the default branch it saw.
+Cases that still read one shared page of runs and cannot be exact:
+`actions.all_branches`, a repository with more workflows than one page of the workflow
+list, a budget too thin to pay for a read per workflow, and more than one named branch
+once the budget has made it fall back. One WARN line then names those repositories,
 because a workflow whose newest run falls outside a shared page has no state here and
 would otherwise be indistinguishable from a passing one.
 
@@ -551,9 +571,9 @@ def _entry_slug(repo: Repo, kind: str, number: int = 0, url: str = "") -> str:
     The **rendered line** still opens with the name, which is where a person reads
     it; a slug is for machines and pins.
 
-    A payload with no number falls back to the API's own URL, which is unique per
-    finding, and finally to ``<repo-id>-<kind>`` for the aspects that report at most
-    one line per repository (a missing SBOM, secret scanning switched off). What it
+    A payload with no number falls back to the finding's ``html_url``, which is unique
+    per finding, and finally to ``<repo-id>-<kind>`` for the aspects that report at
+    most one line per repository (a missing SBOM, secret scanning switched off). What it
     never falls back to is the line's position: an entry above it closing would slide
     the pin onto somebody else's finding.
     """
@@ -621,6 +641,16 @@ class _Coverage:
             f"{name}: could not read{what} ({plain(str(error))})",
             code=StatusCode.WARN))
 
+    def gone(self, repo: Repo, what: str) -> None:
+        """A repository the question no longer applies to: GitHub answered
+        `NOT_FOUND` about it between discovery and the read (ADR-0008, decision 4).
+        A line that grades nothing — `UNDEFINED`, displayed and pinnable — and a
+        read, because it *was* answered: it is not a coverage gap."""
+        self.read += 1
+        self.notes.append(Entry(_entry_slug(repo, "unreadable"),
+                                f"{plain(repo.name)}: {what}",
+                                code=StatusCode.UNDEFINED))
+
     @property
     def missed(self) -> int:
         return len(self.notes)
@@ -652,6 +682,163 @@ class _Coverage:
             code=StatusCode.WARN))
 
 
+#: The disabled workflow states GitHub's own schema names today
+#: (`github/rest-api-description`, `components.schemas.workflow.properties.state`,
+#: whose enum is `active`, `deleted` and these three). The documentation pages show
+#: only `active` and `disabled_manually` in their examples, which is how a read
+#: written from the prose alone misses two. This tuple is what the shipped map
+#: grades and nothing more — whether a workflow *is* disabled is the `disabled_`
+#: prefix (`_Workflow.disabled`), so a state added later is graded rather than
+#: missed. `deleted` is handled where it always was: such a workflow is dropped, and
+#: its last failure is not a fact about the repository today (ADR-0004 §9).
+DISABLED_STATES = ("disabled_manually", "disabled_inactivity", "disabled_fork")
+
+#: What a disabled workflow grades, before a deployment's `severity_map` (ADR-0010).
+#:
+#: **`disabled_manually` is WARN**: somebody switched a workflow off and the
+#: repository still has it, which is the switched-off nightly job this line exists
+#: to find. **`disabled_inactivity` is WARN** for the case it fires at all — GitHub
+#: disables *scheduled* workflows after sixty days without activity **in a public
+#: repository**, so on a private estate it is rare, and the line is worth its amber
+#: where it does appear. **`disabled_fork` is OK**: GitHub disables scheduled
+#: workflows on a fork by default, `include_forks` is true unless a deployment says
+#: otherwise (ADR-0003 §3), so grading it would put one standing amber on the leaf
+#: per fork — a state nobody chose, on repositories nobody is going to act on.
+#:
+#: A state this map does not name grades WARN, as an undeclared severity does
+#: (ADR-0004 §6) — a state GitHub adds later is seen rather than silently green.
+DEFAULT_ACTIONS_DISABLED_MAP: dict[str, StatusCode] = {
+    "disabled_manually": StatusCode.WARN,
+    "disabled_inactivity": StatusCode.WARN,
+    "disabled_fork": StatusCode.OK,
+}
+
+
+@dataclass
+class _Held:
+    """One URL's answer, kept so the next run can ask whether it still holds.
+
+    The `link` is here and not forgotten on purpose: `_attempt` returns
+    ``(payload, Link header)`` and `get_paginated` walks that header, so a `304`
+    that returned the held payload without the held `Link` would stop a paginated
+    read after its first page and call the result complete.
+    """
+
+    etag: str
+    payload: Any
+    link: str
+    #: Which reader asked for this URL — an aspect's name, or `discovery`. The
+    #: sweep is keyed to it rather than to the run because an aspect is the
+    #: engine's unit (little-sister ADR-0078): once aspects are paced separately, a
+    #: run that exercised only `actions` must not age out every alert payload.
+    reader: str
+    #: Passes of *that reader* since this entry was last used. Dropped at two, not
+    #: one: a run cut short by its deadline, its pause budget or a dead network
+    #: touches only a prefix of the repositories, and sweeping on one pass would
+    #: throw away exactly what the next run needs — the run least able to afford
+    #: full reads, because it runs in whatever condition broke the last one.
+    idle: int = 0
+
+
+class _ConditionalCache:
+    """ETags and payloads held on the **check**, so the next run can send
+    `If-None-Match` (ADR-0011).
+
+    Private transport state, and deliberately not a record in little-sister's
+    sense (its ADR-0082): a record is published state on an entry — snapshotted,
+    copied on every poll, serialized to every API client, rendered on the node
+    page and capped at 2 KB — and whole API payloads are exactly what that cap
+    exists to keep out of the tree. Nothing here reaches `data`.
+
+    **Per check, and that is why a bare URL is a sufficient key.** GitHub's answers
+    differ by credential, and a check resolves exactly one `self.token`, so two
+    checks on two tokens keep two caches and no read can be served another
+    credential's payload. The ledger next door is shared across tokens and keys by
+    token internally; this is the other shape, and lifting it into the library
+    later means putting the identity in the key first.
+    """
+
+    def __init__(self) -> None:
+        self._held: dict[str, _Held] = {}
+        self._reader = ""
+        self._touched: set[str] = set()
+        #: Entries dropped by the sweep since the last `started()`, for the report.
+        self.dropped = 0
+
+    def started(self) -> None:
+        """A run is beginning: reset what this run will report."""
+        self.dropped = 0
+
+    def reading(self, reader: str) -> None:
+        """The reader whose pass is beginning — an aspect's name, or `discovery`."""
+        self._reader = reader
+        self._touched = set()
+
+    def etag_for(self, url: str) -> str | None:
+        held = self._held.get(url)
+        return held.etag if held is not None else None
+
+    def hit(self, url: str) -> tuple[Any, str] | None:
+        """The held answer for a URL GitHub says has not changed, or ``None``."""
+        held = self._held.get(url)
+        if held is None:
+            return None
+        held.idle = 0
+        self._touched.add(url)
+        return held.payload, held.link
+
+    def store(self, url: str, etag: str, payload: Any, link: str) -> None:
+        """Keep this answer against the reader whose pass is running."""
+        self._touched.add(url)
+        self._held[url] = _Held(etag=etag, payload=payload, link=link,
+                                reader=self._reader)
+
+    def sweep(self) -> None:
+        """End the current reader's pass: age its untouched entries, drop the
+        ones that have now missed two of its passes."""
+        reader = self._reader
+        for url, held in list(self._held.items()):
+            if held.reader != reader or url in self._touched:
+                continue
+            held.idle += 1
+            if held.idle >= 2:
+                del self._held[url]
+                self.dropped += 1
+        self._reader = ""
+        self._touched = set()
+
+    def __len__(self) -> int:
+        return len(self._held)
+
+
+@dataclass(frozen=True)
+class _Workflow:
+    """One row of `/actions/workflows` — what the aspect reads off the list itself.
+
+    The state is why this is a record rather than a name: it says whether this
+    workflow's runs are worth a request at all, and that is known **before** the
+    read it would pay for.
+    """
+
+    name: str
+    state: str
+    url: str
+
+    @property
+    def disabled(self) -> bool:
+        """Whether this workflow is switched off, **by the prefix and not by the
+        list**.
+
+        GitHub names every such state `disabled_…`, and the three in
+        `DISABLED_STATES` are the ones the shipped map grades. Matching the prefix
+        rather than that tuple is what makes a state GitHub adds later arrive as an
+        amber line naming it — an undeclared state grades WARN (ADR-0004 §6) — where
+        an exact list would quietly treat it as active and spend a request reading
+        the runs of a workflow that cannot run.
+        """
+        return self.state.startswith("disabled")
+
+
 @dataclass(frozen=True)
 class _WorkflowList:
     """One page of ``/actions/workflows``, and whether it was the whole answer.
@@ -663,8 +850,8 @@ class _WorkflowList:
     one, and every conclusion drawn from it inherits that silence.
     """
 
-    #: Workflow id -> its name, for the ones that still exist.
-    by_id: dict[int, str]
+    #: Workflow id -> what the list said about it, for the ones that still exist.
+    by_id: dict[int, _Workflow]
     listed: int
     total: int
 
@@ -846,6 +1033,36 @@ def _resets_in(reset_epoch: int, now: float) -> str:
     return f"resets in {minutes}min" if minutes else "resets in under a minute"
 
 
+def _resets_at(reset_epoch: int, now: float) -> str:
+    """The **trace's** form of the same clause: the minutes, and the window's end
+    as a clock time beside them — `resets in 34min (21:50:07)`.
+
+    A token has more than one window per resource (ADR-0007), and two trace lines
+    saying `resets in 34min` and `resets in 39min` read as one window that moved
+    until the clock time shows they are two. The clock is the log's own — the
+    machine's local time, which the timestamp at the head of the line is written
+    in — so the two are compared on one clock. The node keeps `_resets_in`: a
+    reader there wants the wait, not the hour.
+    """
+    return (f"{_resets_in(reset_epoch, now)} "
+            f"({time.strftime('%H:%M:%S', time.localtime(reset_epoch))})")
+
+
+def _detail_of(body: str) -> str:
+    """What of a refusal's body goes on the line: the first two hundred
+    characters, or — when the body is an HTML page rather than an API answer,
+    which is what GitHub's gateway sends for a request it ended at ten seconds —
+    that page's title alone. Two hundred characters of nginx's markup on a
+    repository's line said nothing its title does not."""
+    stripped = body.lstrip()
+    if stripped[:6].lower().startswith(("<html", "<!doct")):
+        title = re.search(r"<title>(.*?)</title>", stripped, re.IGNORECASE | re.DOTALL)
+        if title:
+            return " ".join(title.group(1).split())[:200]
+        return "an HTML page, not an API answer"
+    return body[:200]
+
+
 def _header_int(response: Response, name: str) -> int | None:
     """One integer budget header, or ``None`` when it is absent or unreadable.
 
@@ -923,10 +1140,34 @@ class RateLimitHeaders:
         if self.used is not None:
             parts.append(f"{self.used} used")
         if self.reset:
-            parts.append(_resets_in(self.reset,
+            parts.append(_resets_at(self.reset,
                                     time.time() if now is None else now))
         return (f"{self.resource or 'budget'}: "
                 f"{', '.join(parts) or 'no numbers stated'}")
+
+
+def _first_sight(counter: Counter | None, now: float, where: str) -> None:
+    """One INFO line the first time a window is seen with spend already on it.
+
+    Unconditional on the log — a reader there has the timestamps, which say
+    whether the spend was this deployment's own before a restart or somebody
+    else's — and marked when this process saw the window open, the one case the
+    node then states (`Counter.before_us`). Written by whoever recorded the
+    reading, because the ledger keeps no logger of its own.
+    """
+    if counter is None or counter.read_at != now or counter.first_at != now:
+        return                                  # not the reading that opened it
+    if counter.before_us is not None:
+        spent, seen = counter.before_us, " — this process saw it open"
+    else:
+        # Less the opening reading where GitHub charged for it — `first_charged`,
+        # not `charged`: a `304` lands on the counter without spending (ADR-0011).
+        spent = max(0, (counter.used or 0) - (1 if counter.first_charged else 0))
+        seen = " — before a restart, or by something else"
+    if spent:
+        logger.info("%s: first reading of the %s window, %s — %d used before "
+                    "this process read it%s", where, counter.resource or "budget",
+                    _resets_at(counter.reset, now), spent, seen)
 
 
 #: What the trace says when GitHub sent no budget headers at all. A sentence and
@@ -980,7 +1221,9 @@ class GitHubClient:
                  retries: int = TRANSIENT_RETRIES,
                  backoff: float = RETRY_BACKOFF_SECONDS,
                  max_pause: float | None = None,
-                 sleep: Callable[[float], None] = time.sleep) -> None:
+                 sleep: Callable[[float], None] = time.sleep,
+                 ledger: Ledger | None = None,
+                 cache: _ConditionalCache | None = None) -> None:
         self._token = token
         self._api = api_url.rstrip("/")
         self._timeout = timeout
@@ -989,13 +1232,44 @@ class GitHubClient:
         self._backoff = backoff
         self._max_pause = max_pause
         self._sleep = sleep
-        #: Seconds this client actually spent waiting on a throttle. Measured
-        #: where the waiting happens — `ask` decides to wait and calls the sleep
-        #: injected here, so wrapping it is the only place that can tell a wait
-        #: that happened from one the deadline refused. Read by the check for the
-        #: node's sentence; a paused run is otherwise indistinguishable from a
-        #: slow one.
-        self.paused_seconds = 0.0
+        #: Where every response's budget headers go (ADR-0007, decision 1). The
+        #: process's own ledger unless a caller hands one in, which only a test
+        #: does: the point of the ledger is that both check types read one
+        #: memory, and a client keeping its own would be the `github` check
+        #: reporting the budget itself — the design ADR-0001 refused.
+        self._ledger = ledger if ledger is not None else shared_ledger()
+        #: The conditional-request cache, or ``None`` for a client that makes
+        #: none. Injected the way the ledger is and **not** defaulted to a shared
+        #: one, which is the whole difference between them: the ledger is one
+        #: memory for every token and keys by token inside, while a cache keyed by
+        #: bare URL is only sound for as long as it belongs to a single
+        #: credential (ADR-0011).
+        self._cache = cache
+        #: Attempts GitHub answered `304` — asked for, and charged for by nobody.
+        #: `reads_made` counts them, because they are attempts and they took time;
+        #: this says how many of those cost nothing, which is what a reader
+        #: comparing the guard's estimate against the spend needs.
+        self.free_reads = 0
+        #: Seconds this client actually spent asleep, **by cause** (ADR-0007,
+        #: decision 4): because GitHub asked — a `retry-after`, or an exhausted
+        #: primary window with its reset, the throttle path of `_refusal` — and
+        #: on the library's backoff after a failure GitHub did not explain, a 5xx
+        #: or a connection that never answered. Measured where the waiting
+        #: happens — `ask` decides to wait and calls the sleep injected here, so
+        #: wrapping it is the only place that can tell a wait that happened from
+        #: one the deadline refused. Two totals and not one, because the node
+        #: says which happened: for two weeks one deployment's node said *rate
+        #: limit* eighty-six times about waits that were every one of them our
+        #: own one-second backoff after a 500.
+        self.throttled_seconds = 0.0
+        self.retried_seconds = 0.0
+        #: Set by `_refusal` when the response it is reading is a throttle, read
+        #: and cleared by the very next `_slept`, and cleared before every
+        #: attempt: `ask` calls the sleep straight after the operation raised, so
+        #: the flag set by that refusal is the flag the sleep reads, and a wait the
+        #: deadline refused instead leaves nothing behind for a later sleep to
+        #: misread.
+        self._asked_to_wait = False
         #: What this client has spent, for the run's own trace. **Attempts**, not
         #: logical reads: a retried request counts twice, because the question
         #: these answer is where the run's seconds went and a retry spends them
@@ -1009,13 +1283,21 @@ class GitHubClient:
         #: `ASPECT_ENDPOINT`, and it is stable across `api_url`.
         self.slowest_read = 0.0
         self.slowest_path = ""
-        #: What GitHub said the budget was on the **most recent response**, or
-        #: ``None`` when that response carried no budget headers. Overwritten by
-        #: every answer rather than accumulated: the question it exists for is
-        #: *what is GitHub charging these reads to, right now*, and a remembered
-        #: older reading would answer it with a number nothing is spending
-        #: against any more. Read by both check types for their trace lines.
+        #: What GitHub said the budget was on the **most recent attempt**, or
+        #: ``None`` when it carried no budget headers — or never reached a status
+        #: at all. Cleared before every attempt and set by its answer, never
+        #: carried over (ADR-0007, decision 5): the question it exists for is
+        #: *what is GitHub charging these reads to, right now*, and a read that
+        #: got no answer must not trace as the previous response's numbers, which
+        #: is how three aspects on a dead network once reported the fourth's
+        #: window as their own. The history is the ledger's; this is one reading.
         self.last_rate_limit: RateLimitHeaders | None = None
+
+    @property
+    def paused_seconds(self) -> float:
+        """Both kinds of wait together — what the pause budget is spent against
+        and what the run's receipt states; the node states the two apart."""
+        return self.throttled_seconds + self.retried_seconds
 
     def _now(self) -> float:
         """The clock this run measures with.
@@ -1029,25 +1311,34 @@ class GitHubClient:
         return (self._deadline.clock() if self._deadline is not None
                 else time.monotonic())
 
+    def _path_of(self, url: str) -> str:
+        """The API path of a URL this client built or was handed by a `Link`
+        header — what a reader compares against `ASPECT_ENDPOINT`, and what the
+        ledger reduces to the resource a read was of; stable across `api_url`."""
+        return url[len(self._api):] if url.startswith(self._api) else url
+
     def _counted(self, url: str, seconds: float) -> None:
         """Add one attempt to what this client has spent."""
         self.reads_made += 1
         self.read_seconds += seconds
         if seconds > self.slowest_read:
             self.slowest_read = seconds
-            self.slowest_path = (url[len(self._api):] if url.startswith(self._api)
-                                 else url)
+            self.slowest_path = self._path_of(url)
 
-    def _headers(self) -> dict[str, str]:
+    def _headers(self, *, json_body: bool = False) -> dict[str, str]:
         """What every request to this API carries. The ``User-Agent`` is
         `fetch`'s — ``little-sister/<version>`` — which is a name a GitHub support
         thread can do something with, unlike the ``Python-urllib`` this used to
-        send."""
-        return {"Authorization": f"Bearer {self._token}",
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28"}
+        send. A request with a body says what the body is."""
+        headers = {"Authorization": f"Bearer {self._token}",
+                   "Accept": "application/vnd.github+json",
+                   "X-GitHub-Api-Version": "2022-11-28"}
+        if json_body:
+            headers["Content-Type"] = "application/json"
+        return headers
 
-    def _attempt(self, url: str) -> tuple[Any, str]:
+    def _attempt(self, url: str, *, method: str = "GET",
+                 body: bytes | None = None) -> tuple[Any, str]:
         """One request, as the ``(payload, Link header)`` pair the readers want.
 
         The socket timeout is the request's own, **clamped by `fetch` to what is
@@ -1060,10 +1351,31 @@ class GitHubClient:
         answered. Counting only what succeeded would leave a run that spent its
         whole budget on timeouts looking like a run that made no requests.
         """
+        # Cleared **before** the request rather than in the `except` below, so
+        # that every way out of this method — an answer, a refusal, a request
+        # that never reached a status — leaves it saying what *this* attempt
+        # read. For the last of those that is *no budget headers on that read*,
+        # which is the truth about it (ADR-0007, decision 5).
+        self.last_rate_limit = None
+        self._asked_to_wait = False
         started = self._now()
+        headers = self._headers(json_body=body is not None)
+        # **The budget read is never held** (ADR-0011). `/rate_limit`'s *body* is a
+        # budget reading — `Ledger.record` consumes one of its resource rows as if
+        # it were a response's own headers — so serving a held body there would
+        # feed the ledger a stale window as a current one, and the budget is what
+        # the guard reasons from. Its headers on a `304` elsewhere are fine: those
+        # come with the live response.
+        cache = (self._cache if method == "GET" and body is None
+                 and reduce_path(self._path_of(url)) not in FREE_PATHS else None)
+        held_etag = cache.etag_for(url) if cache is not None else None
+        if held_etag is not None:
+            headers["If-None-Match"] = held_etag
         try:
             response = fetch(url, timeout=self._timeout, follow_redirects=True,
-                             headers=self._headers(), deadline=self._deadline)
+                             method=method, data=body,
+                             headers=headers,
+                             deadline=self._deadline)
         except RemoteError as error:
             # `fetch` raises only for a request that never reached a status, and
             # attaches urllib's own exception as `__cause__` so the sentence a
@@ -1079,7 +1391,31 @@ class GitHubClient:
         # numbers that say whether the budget ran out or something else did. Not in
         # the `finally` above, where a request that never reached a status has no
         # response to read.
-        self.last_rate_limit = RateLimitHeaders.from_response(response)
+        self.last_rate_limit = stated = RateLimitHeaders.from_response(response)
+        if stated is not None:
+            # Every reading, to the ledger, with the path it was charged for: the
+            # split between GitHub's counters is by path and the ledger observes
+            # it here, one response at a time. The wall clock rather than `_now`,
+            # because a window's `reset` is an epoch and a counter is compared
+            # against it (ADR-0007, decision 1).
+            read_at = time.time()
+            _first_sight(self._ledger.record(
+                self._token, self._path_of(url), resource=stated.resource,
+                limit=stated.limit, remaining=stated.remaining,
+                used=stated.used, reset=stated.reset, now=read_at,
+                status=response.status),
+                read_at, reduce_path(self._path_of(url)))
+        # **Before the refusal**, or `fault_for(304)` reads *not modified* as an
+        # answer and the repository gets a `could not read` line for not having
+        # changed. A `304` is only ever received because this client sent the
+        # `If-None-Match` the cache handed it, so the held answer is there; if a
+        # sweep has taken it since, there is nothing to return and the refusal
+        # below is the honest outcome rather than an empty payload.
+        if response.status == 304 and self._cache is not None:
+            answer = self._cache.hit(url)
+            if answer is not None:
+                self.free_reads += 1
+                return answer
         if not 200 <= response.status < 300:
             raise self._refusal(response, url)
         try:
@@ -1092,7 +1428,14 @@ class GitHubClient:
             raise GitHubError(f"GitHub answered {url} with something that is not "
                               f"JSON: {error}", status=response.status,
                               fault=Fault.MALFORMED) from error
-        return data, response.headers.get("Link", "")
+        link = response.headers.get("Link", "")
+        etag = response.headers.get("ETag", "")
+        # A read that carries no `ETag` is simply never held, which is what makes
+        # "cache only what comes back unchanged" an outcome rather than a rule
+        # somebody has to keep per endpoint.
+        if cache is not None and etag:
+            cache.store(url, etag, data, link)
+        return data, link
 
     def _refusal(self, response: Response, url: str) -> GitHubError:
         """A status GitHub refused with, read as one of the three faults.
@@ -1102,8 +1445,9 @@ class GitHubClient:
         as *answered* is reported as though GitHub had said **no** about the
         repository, and is never retried.
         """
-        detail = response.text()[:200]
+        detail = _detail_of(response.text())
         wait = _throttle_wait(response)
+        self._asked_to_wait = wait is not None
         if wait is not None:
             return GitHubError(
                 f"HTTP {response.status} for {url} — GitHub asked us to wait "
@@ -1129,9 +1473,37 @@ class GitHubClient:
                else f"{self._api}{path_or_url}")
         if params:
             url = f"{url}?{urllib.parse.urlencode(params)}"
-        return ask(lambda: self._attempt(url), deadline=self._deadline,
-                   retries=self._retries, backoff=self._backoff,
-                   sleep=self._slept)
+        return self._ask(url)
+
+    def _ask(self, url: str, *, method: str = "GET",
+             body: bytes | None = None) -> tuple[Any, str]:
+        """`ask`, with this client's policy — the one place the retry, the
+        deadline and the counted sleep are wired, for both dialects."""
+        return ask(lambda: self._attempt(url, method=method, body=body),
+                   deadline=self._deadline, retries=self._retries,
+                   backoff=self._backoff, sleep=self._slept)
+
+    def _graphql_url(self) -> str:
+        """`{api_url}/graphql` — and for a GitHub Enterprise Server, whose REST
+        root is `…/api/v3`, its sibling `…/api/graphql` (ADR-0008, decision 3)."""
+        if self._api.endswith("/api/v3"):
+            return f"{self._api[:-len('/v3')]}/graphql"
+        return f"{self._api}/graphql"
+
+    def graphql(self, query: str, variables: dict[str, Any] | None = None) -> Any:
+        """One GraphQL query, answered as the JSON body GitHub sent — `data` and
+        `errors` both, because a `200` carries either or both and the caller
+        reads them the way ADR-0002 reads a status (ADR-0008, decision 4).
+
+        A `POST` through the same `_attempt` every REST read takes: the headers,
+        the deadline, the retry, the throttle reading and the ledger's feed are
+        the client's and not the dialect's, which is why this is a method here and
+        not a second client (ADR-0008, decision 3; ADR-0001's own argument).
+        """
+        payload = json.dumps({"query": query,
+                              "variables": variables or {}}).encode("utf-8")
+        data, _ = self._ask(self._graphql_url(), method="POST", body=payload)
+        return data
 
     def _slept(self, wait: float) -> None:
         """`ask`'s sleep, counted and said out loud.
@@ -1142,6 +1514,8 @@ class GitHubClient:
         it, and added to :attr:`paused_seconds` so the check can put it on the
         node afterwards.
         """
+        asked = self._asked_to_wait
+        self._asked_to_wait = False
         if (self._max_pause is not None
                 and self.paused_seconds + wait > self._max_pause):
             # Refused whole rather than trimmed to what is left: a wait shorter
@@ -1150,8 +1524,14 @@ class GitHubClient:
             raise _PauseBudgetSpent(wait)
         left = (f"{self._deadline.remaining():.0f}s of the run left"
                 if self._deadline is not None else "no run deadline")
-        logger.warning("paused %.0fs before retrying (%s)", wait, left)
-        self.paused_seconds += wait
+        logger.warning("paused %.0fs before retrying (%s; %s)", wait,
+                       "GitHub asked" if asked
+                       else "our backoff after a failure GitHub did not explain",
+                       left)
+        if asked:
+            self.throttled_seconds += wait
+        else:
+            self.retried_seconds += wait
         self._sleep(wait)
 
     def get(self, path: str, params: dict[str, Any] | None = None) -> Any:
@@ -1223,29 +1603,62 @@ class GitHubCheck(Check):
         "issues": "issues",
     }
 
-    #: The per-repository endpoint each aspect reads, for the pre-run rate estimate
-    #: alone. **Two aspects share one**: the code-scanning split partitions a single
-    #: `/code-scanning/alerts` payload, so counting aspects would claim a request per
-    #: repository that the run never makes — and the guard would grow more cautious
-    #: on a number that is not true.
+    #: The per-repository endpoint each aspect reads, for the pre-run guard — and,
+    #: less its leading slash, the reduced form the ledger keeps a path in
+    #: (`budget.reduce_path`), which is how the guard asks which window this
+    #: token's reads of an endpoint were charged to. **Two aspects share one**: the
+    #: code-scanning split partitions a single `/code-scanning/alerts` payload, so
+    #: counting aspects would claim a request per repository that the run never
+    #: makes — and the guard would grow more cautious on a number that is not true.
     #:
-    #: **`actions` is a floor here and no longer an approximation.** It reads its
-    #: workflow list once per repository and then once per workflow, a number this
-    #: estimate cannot know: it runs before any aspect, and the workflow count is
-    #: not in until the aspect has read the list. So the estimate counts the one
-    #: endpoint it can, and the aspect prices the rest itself against the budget
-    #: GitHub states on the response already in hand (`_budget_covers`), degrading
-    #: that repository to the wide read rather than walking through the guard.
+    #: **`actions` names the workflow list**, the read 0.1.6 made the aspect's
+    #: first; the per-workflow runs it then reads reduce to the same path. The
+    #: guard prices it as one plus the workflows each repository had the last
+    #: time the aspect read its list, times the branches it names (`1 + W × B`,
+    #: `_workflow_counts` and `actions.branches`) — exact after the first run, a
+    #: floor before it — and the aspect still prices the per-workflow read itself
+    #: against the headers in hand (`_budget_covers`), degrading that repository
+    #: to the wide read rather than walking through the guard.
+    #:
+    #: **`sbom_check` is the one aspect that reads through GraphQL**: one query
+    #: per repository, and the ledger keeps that on the path `graphql` under the
+    #: resource of the same name — so the guard prices it as its queries' points
+    #: there (ADR-0008, decisions 1 and 5).
     ASPECT_ENDPOINT: ClassVar[dict[str, str]] = {
         "pull_requests": "/pulls",
         "security_advisories": "/dependabot/alerts",
         "code_scanning_security": "/code-scanning/alerts",
         "code_scanning_quality": "/code-scanning/alerts",
         "secret_scanning_alerts": "/secret-scanning/alerts",
-        "sbom_check": "/dependency-graph/sbom",
-        "actions": "/actions/runs",
+        "sbom_check": "/graphql",
+        "actions": "/actions/workflows",
         "issues": "/issues",
     }
+
+    #: `sbom_check` asks the dependency graph, not the SBOM export (ADR-0008,
+    #: decision 1): this many repositories per query, and this many manifests
+    #: read per repository, which is where the cause a red line names comes
+    #: from; a graph with more than that many has content whatever the first ten
+    #: say. **One repository a query, because GitHub ends a GraphQL request at
+    #: ten seconds and a query costs one point whatever it carries.** Measured
+    #: live: nineteen repositories in one query were cut in twenty of
+    #: twenty-nine runs, fourteen of them on the retry too; ten in one still
+    #: took four to ten seconds, one chunk per organization twice the other,
+    #: because a few heavy repositories dominate whichever chunk holds them.
+    #: Alone, no query is slower than its own repository, a cut costs exactly
+    #: that repository's line, and there is no chunk size left to move. The
+    #: query builder still aliases, so a reader who ever wants more than one
+    #: per query changes this number and nothing else.
+    _GRAPH_REPOS_PER_QUERY: ClassVar[int] = 1
+    _GRAPH_MANIFESTS: ClassVar[int] = 10
+    #: What one such query costs on the `graphql` budget: **one point**, measured
+    #: — `1 used` on every answer — and what GitHub's formula gives it: the
+    #: requests the query stands for (a repository lookup and a manifest
+    #: connection), divided by a hundred and rounded, is nothing, and the minimum
+    #: is one. The guard prices the aspect at this per query (ADR-0008,
+    #: decision 5): a point a repository, some eighty an hour on a budget of
+    #: five thousand for a scope of nineteen.
+    _GRAPH_QUERY_POINTS: ClassVar[int] = 1
 
     def __init__(self, *, owner: str, kind: str = "organization",
                  advanced_security_on_private: bool = True,
@@ -1265,6 +1678,8 @@ class GitHubCheck(Check):
                  sbom_ignore: tuple[str, ...] = (),
                  actions_ignore_patterns: tuple[re.Pattern[str], ...] = (),
                  actions_all_branches: bool = False,
+                 actions_branches: tuple[str, ...] = (),
+                 actions_disabled_map: dict[str, StatusCode] | None = None,
                  actions_show_healthy: bool = False,
                  issues_ignore: tuple[str, ...] = (),
                  disabled_aspects: tuple[str, ...] = (),
@@ -1283,6 +1698,8 @@ class GitHubCheck(Check):
                              **(code_scanning_security_map or {})}
         scanning_quality = {**DEFAULT_CODE_SCANNING_QUALITY_MAP,
                             **(code_scanning_quality_map or {})}
+        disabled_map = {**DEFAULT_ACTIONS_DISABLED_MAP,
+                        **(actions_disabled_map or {})}
         super().__init__(
             subnode_defaults=SUBNODES,
             label_tokens=_subnode_tokens(
@@ -1346,6 +1763,25 @@ class GitHubCheck(Check):
         self.sbom_ignore = sbom_ignore
         self.actions_ignore_patterns = actions_ignore_patterns
         self.actions_all_branches = actions_all_branches
+        #: The branches `actions` asks about by name, in the order the config gave
+        #: them, or empty for the default-branch mode (ADR-0009).
+        self.actions_branches = actions_branches
+        #: What each disabled workflow state grades — the shipped map with the
+        #: deployment's own entries on top (ADR-0010).
+        self.actions_disabled_map = disabled_map
+        if actions_all_branches and actions_branches:
+            # **A refusal, not a precedence rule.** The two keys ask different
+            # questions — one watches every branch and says where it is incomplete,
+            # the other asks exactly the branches it is given and is exact — so
+            # picking a winner would silently answer a question this config did not
+            # ask, and the deployment would read the mode it did not get off the
+            # leaf. Here it is a startup error naming both keys instead.
+            raise CheckError(
+                "github 'actions.all_branches' and 'actions.branches' ask two "
+                "different questions and cannot both be set: 'all_branches' "
+                "watches every branch and reports where that answer is short, "
+                "'branches' asks exactly the branches you name and is exact. "
+                "Keep one of them")
         self.actions_show_healthy = actions_show_healthy
         self.issues_ignore = issues_ignore
         # Aspects this check does **not** run, by name. Stored as what is switched
@@ -1363,7 +1799,7 @@ class GitHubCheck(Check):
         # `/users/{login}/repos` is public-only however privileged the token is.
         self._sees_private = True
         # Where the next run's roster starts: the last aspect that **finished**, or
-        # `None` before the first run (ADR-0002 §7's 2026-09-06 update). Run state
+        # `None` before the first run (ADR-0002 §7). Run state
         # like the two below, and deliberately in memory only — a restart beginning
         # at the head again costs one cycle, and the engine never runs one check
         # twice at once, so a plain attribute is the whole of it.
@@ -1381,6 +1817,30 @@ class GitHubCheck(Check):
         self._collected: dict[
             tuple[str, tuple[str, ...]],
             tuple[list[tuple[Repo, list[Any]]], _Coverage, list[Repo]]] = {}
+        #: How many workflows the `actions` aspect watched in each repository the
+        #: last time it read that repository's list, by full name — what the guard
+        #: prices the per-workflow read from (`1 + W`). Run state that outlives the
+        #: run on purpose: the count is free to remember, and a guard that priced
+        #: the aspect as one read per repository grew looser with every workflow
+        #: added. Unknown before the first run, which prices the floor.
+        self._workflow_counts: dict[str, int] = {}
+        #: This check's conditional-request cache (ADR-0011). Beside
+        #: `_workflow_counts` because it is the same kind of memory: across runs,
+        #: in this process only, and belonging to this check's one credential. A
+        #: cache on the client would be empty every run — `_make_client` builds a
+        #: fresh one inside `run` — and so would buy nothing at all.
+        self._conditional = _ConditionalCache()
+        #: What the pre-run guard priced this run at, for the report line that puts
+        #: it beside what the run actually spent. The guard is **not** changed to
+        #: account for conditional requests in this slice: it would be tuned
+        #: against a hit rate nobody has measured, and this line is what makes that
+        #: rate measurable (this package's backlog #6).
+        self._priced_total = 0
+        #: How long the last run that ran took, in seconds, or `None` before one
+        #: has — the length the guard multiplies a window's foreign rate by, since
+        #: a budget somebody else is spending is smaller by the end of this run
+        #: than it reads at the start. A skipped run spent nothing and sets nothing.
+        self._last_run_seconds: float | None = None
 
     @classmethod
     def _extra_from_config(cls, config: dict[str, Any],
@@ -1431,7 +1891,7 @@ class GitHubCheck(Check):
         if not isinstance(severities, list):
             raise CheckError("security_advisories.severities must be a list")
         advisory_severity_map = _severity_map(
-            security.get("severity_map"), "security_advisories")
+            security.get("severity_map"), "security_advisories.severity_map")
         if config.get("code_scanning_alerts") is not None:
             # Refused at load rather than ignored, in the same shape as `org:` →
             # `owner:`. A silently dropped block would take a deployment's whole
@@ -1446,10 +1906,12 @@ class GitHubCheck(Check):
                 "do not want")
         security_scanning = _block(config, "code_scanning_security")
         code_scanning_security_map = _severity_map(
-            security_scanning.get("severity_map"), "code_scanning_security")
+            security_scanning.get("severity_map"),
+            "code_scanning_security.severity_map")
         quality_scanning = _block(config, "code_scanning_quality")
         code_scanning_quality_map = _severity_map(
-            quality_scanning.get("severity_map"), "code_scanning_quality")
+            quality_scanning.get("severity_map"),
+            "code_scanning_quality.severity_map")
         secret_scanning = _block(config, "secret_scanning")
         sbom = _block(config, "sbom_check")
         sbom_ignore = sbom.get("ignore") or []
@@ -1466,6 +1928,30 @@ class GitHubCheck(Check):
         except re.error as error:
             raise CheckError(
                 f"actions.ignore_workflow_name_patterns: {error}") from error
+        # **Named branches** (ADR-0009). The list *replaces* the default branch
+        # rather than adding to it: the key says "ask about these", and resolving
+        # each repository's own default branch into a list the deployment believes
+        # it controls would make `main` against `master` this check's problem
+        # instead of the config's. A repeated name is dropped rather than refused —
+        # the intent is not ambiguous, and keeping it would buy an identical second
+        # read of every workflow.
+        actions_disabled_map = _severity_map(
+            actions.get("disabled_severity_map"),
+            "actions.disabled_severity_map")
+        branches = actions.get("branches") or []
+        if not isinstance(branches, list):
+            raise CheckError("actions.branches must be a list")
+        named_branches: list[str] = []
+        for branch in branches:
+            name = str(branch).strip()
+            if not name:
+                # Not skipped: an empty entry is a deployment that meant to name a
+                # branch, and silently asking about one branch fewer than the config
+                # lists is how a check answers a question nobody asked.
+                raise CheckError(
+                    "actions.branches: a branch name cannot be empty")
+            if name not in named_branches:
+                named_branches.append(name)
         issues = _block(config, "issues")
         issues_ignore = issues.get("ignore") or []
         if not isinstance(issues_ignore, list):
@@ -1562,6 +2048,8 @@ class GitHubCheck(Check):
             "sbom_ignore": tuple(str(r) for r in sbom_ignore),
             "actions_ignore_patterns": action_patterns,
             "actions_all_branches": bool(actions.get("all_branches", False)),
+            "actions_branches": tuple(named_branches),
+            "actions_disabled_map": actions_disabled_map,
             "actions_show_healthy": bool(actions.get("show_healthy", False)),
             "issues_ignore": tuple(str(r) for r in issues_ignore),
             "disabled_aspects": disabled,
@@ -1580,6 +2068,12 @@ class GitHubCheck(Check):
             "expected repositories": str(self.expect_min_repos),
             "pause budget": f"{self.max_pause_seconds:.0f}s",
             "show healthy Actions": "yes" if self.actions_show_healthy else "no",
+            # Only when the default-branch mode was replaced: the branches a check
+            # asks about are what decides whether an empty Actions leaf is an
+            # estate with nothing to say or a list that matches no repository, and
+            # that is the first thing to look at when the unmatched line appears.
+            "Actions branches": (", ".join(self.actions_branches)
+                                 if self.actions_branches else None),
             # Only when there are any: a disabled aspect leaves no node, so without
             # this line the difference between "that aspect is off" and "somebody
             # broke the check" is invisible on the very page an operator opens to
@@ -1597,7 +2091,7 @@ class GitHubCheck(Check):
 
     def run_order(self) -> tuple[str, ...]:
         """The roster this run walks: :meth:`active_aspects` rotated to start after
-        the last aspect that **finished** (ADR-0002 §7's 2026-09-06 update).
+        the last aspect that **finished** (ADR-0002 §7).
 
         A run that never fits refreshed the same head and starved the same tail
         forever, while those nodes kept their last reading and looked answered. So
@@ -1651,7 +2145,7 @@ class GitHubCheck(Check):
         value — so the documented per-run budget was spent afresh on every one of
         the hundreds of requests a run makes, and bounded nothing (ADR-0002).
         """
-        return GitHubClient(token, api_url=self.api_url,
+        return GitHubClient(token, api_url=self.api_url, cache=self._conditional,
                             timeout=self.request_timeout, deadline=deadline,
                             max_pause=self.max_pause_seconds)
 
@@ -2111,42 +2605,169 @@ class GitHubCheck(Check):
             "Open secret-scanning alerts (and repos with it disabled)",
             entries, coverage, report)
 
-    def _sbom_check(self, client: GitHubClient,
-                    repos: list[Repo]) -> CheckResult:
-        """A repo with code but no dependency graph (SBOM) → ERROR. Repos in
-        ``sbom_ignore`` are skipped; a 404 counts as missing, a permission error
-        is surfaced."""
-        entries: list[Entry] = []
-        coverage = _Coverage()
-        for repo in repos:
-            if repo.name in self.sbom_ignore:
+    @classmethod
+    def _graph_query(cls, repos: list[Repo]) -> str:
+        """The aliased query for one chunk of repositories: `r0`, `r1`, … in the
+        chunk's order, each asking one repository for the count of its dependency
+        manifests and the first ten of them (ADR-0008, decision 1). Owner and
+        name are JSON-quoted, which is GraphQL's string syntax too."""
+        fields = (f"dependencyGraphManifests(first: {cls._GRAPH_MANIFESTS}) "
+                  "{ totalCount nodes { filename parseable exceedsMaxSize } }")
+        parts = []
+        for position, repo in enumerate(repos):
+            owner, _, name = repo.full_name.partition("/")
+            parts.append(f"r{position}: repository(owner: {json.dumps(owner)}, "
+                         f"name: {json.dumps(name)}) {{ {fields} }}")
+        return "query { " + " ".join(parts) + " }"
+
+    @staticmethod
+    def _graph_errors(answer: object) -> tuple[dict[str, tuple[str, str]],
+                                               list[str]]:
+        """The `errors` of a GraphQL answer, split by what they are about: those
+        whose `path` names one alias, as ``{alias: (type, message)}``, and the
+        rest, which are about the query as a whole, as their messages."""
+        by_alias: dict[str, tuple[str, str]] = {}
+        whole: list[str] = []
+        for error in (values.rows(answer, "errors", where="graphql")
+                      if isinstance(answer, dict) else []):
+            kind = values.text(error, "type")
+            message = values.text(error, "message")
+            path = error.get("path") if isinstance(error, dict) else None
+            alias = (path[0] if isinstance(path, list) and path
+                     and isinstance(path[0], str) else None)
+            if alias is not None:
+                by_alias.setdefault(alias, (kind, message))
+            elif kind or message:
+                whole.append(f"{kind}: {message}" if kind else message)
+        return by_alias, whole
+
+    def _graph_verdict(self, repo: Repo, total: int,
+                       manifests: list[Any]) -> Entry | None:
+        """One repository's line, or nothing (ADR-0008, decision 2).
+
+        No manifests is no dependency graph and grades **ERROR**, as a `404` and
+        an empty SBOM did. Manifests that exist but none of them parseable grade
+        **ERROR** too, and the line names the cause — Dependabot cannot alert from
+        a manifest it could not parse, which is why this aspect is red at all
+        (ADR-0004 §4). More manifests than were read is a graph with content,
+        whatever the first ten say. At most one line per repository, so the
+        repository and the aspect are the whole identity: the slug `sbom` a pin
+        was held against before this record holds (decision 6).
+        """
+        name = plain(repo.name)
+        network = f"https://github.com/{repo.full_name}/network/dependencies"
+        if total <= 0:
+            return Entry(_entry_slug(repo, "sbom"),
+                         _link(f"{name}: no dependency graph (0 manifests)",
+                               network),
+                         code=StatusCode.ERROR)
+        if total > self._GRAPH_MANIFESTS or not manifests:
+            return None
+        if any(values.flag(manifest, "parseable") for manifest in manifests):
+            return None
+        causes = "; ".join(
+            plain(values.text(manifest, "filename", default="a manifest"))
+            + (" exceeds the size limit"
+               if values.flag(manifest, "exceedsMaxSize")
+               else " could not be parsed")
+            for manifest in manifests)
+        count = (f"{total} manifests, none parseable" if total != 1
+                 else "1 manifest, not parseable")
+        return Entry(_entry_slug(repo, "sbom"),
+                     _link(f"{name}: {count} ({causes})", network),
+                     code=StatusCode.ERROR)
+
+    def _read_graph_answer(self, chunk: list[Repo], answer: object,
+                           entries: list[Entry], coverage: _Coverage) -> None:
+        """One query's answer, read as ADR-0002 reads a REST one (ADR-0008,
+        decision 4): a `200` whose `errors` name one alias is about that
+        repository alone; a `200` with `errors` and no `data` is the query failing
+        whole, which is *could not ask* for every repository it carried; an
+        answer with neither is one this check cannot read."""
+        try:
+            by_alias, whole = self._graph_errors(answer)
+        except CheckError as error:
+            unreadable = GitHubError(
+                f"GitHub answered the dependency-graph query with something "
+                f"this check cannot read ({plain(str(error))})",
+                fault=Fault.MALFORMED)
+            for repo in chunk:
+                coverage.failed(repo, unreadable)
+            return
+        data = answer.get("data") if isinstance(answer, dict) else None
+        if not isinstance(data, dict):
+            if whole or by_alias:
+                failed = GitHubError(
+                    "GitHub answered the dependency-graph query with errors and "
+                    "no data (" + ("; ".join(whole) or "per-repository errors "
+                                                        "only") + ")",
+                    fault=Fault.TRANSIENT)
+            else:
+                failed = GitHubError(
+                    "GitHub answered the dependency-graph query with neither "
+                    "data nor errors", fault=Fault.MALFORMED)
+            for repo in chunk:
+                coverage.failed(repo, failed)
+            return
+        for position, repo in enumerate(chunk):
+            alias = f"r{position}"
+            if alias in by_alias:
+                kind, message = by_alias[alias]
+                if kind == "NOT_FOUND":
+                    coverage.gone(repo, f"not found — gone since discovery "
+                                        f"({plain(message)})")
+                elif kind in ("FORBIDDEN", "INSUFFICIENT_SCOPES"):
+                    # The token being told no about this repository: an answer,
+                    # and it grades, as a 403 on the export did.
+                    coverage.failed(repo, GitHubError(
+                        f"{kind}: {message}", status=403, fault=Fault.ANSWERED))
+                else:
+                    coverage.failed(repo, GitHubError(
+                        f"{kind or 'error'}: {message}", fault=Fault.MALFORMED))
                 continue
-            name = plain(repo.name)
-            network = f"https://github.com/{repo.full_name}/network/dependencies"
-            # At most one line per repository, so the repo and the aspect are the
-            # whole identity — no number to hang it on and none needed.
-            missing = Entry(_entry_slug(repo, "sbom"),
-                            _link(f"{name}: missing SBOM", network),
-                            code=StatusCode.ERROR)
+            node = data.get(alias)
             try:
-                sbom = client.get(
-                    f"/repos/{repo.full_name}/dependency-graph/sbom")
-            except GitHubError as error:
-                if error.status == 404:
-                    entries.append(missing)
-                    coverage.read_one()
-                    continue
-                # The endpoint this whole rule was written for: it 500s with
-                # `Failed to generate SBOM: Request timed out.` often enough that
-                # the amber repository line it used to produce was routine.
-                coverage.failed(repo, error)
+                if not isinstance(node, dict):
+                    raise CheckError(f"{repo.full_name}: no repository object "
+                                     f"under {alias} in the answer")
+                total = values.number(node, "dependencyGraphManifests",
+                                      "totalCount", where=repo.full_name,
+                                      required=True)
+                manifests = values.rows(node, "dependencyGraphManifests",
+                                        "nodes", where=repo.full_name)
+            except CheckError as error:
+                coverage.failed(repo, GitHubError(plain(str(error)),
+                                                  fault=Fault.MALFORMED))
                 continue
             coverage.read_one()
-            if not values.rows(sbom, "sbom", "relationships", where="sbom"):
-                entries.append(missing)
-        return self._finalize("sbom_check",
-                              "Repositories missing an SBOM (dependency graph)",
-                              entries, coverage)
+            line = self._graph_verdict(repo, total, manifests)
+            if line is not None:
+                entries.append(line)
+
+    def _sbom_check(self, client: GitHubClient,
+                    repos: list[Repo]) -> CheckResult:
+        """A repository with code but no dependency graph Dependabot can read →
+        ERROR (ADR-0004 §4), asked of the graph itself rather than read off an
+        SBOM export (ADR-0008): one GraphQL query per repository. Repositories in
+        ``sbom_ignore`` are not asked. A query that fails
+        as a request — a 5xx, a throttle, a 401 — is one fault for every
+        repository it carried (ADR-0002); what a `200` says is read per alias."""
+        entries: list[Entry] = []
+        coverage = _Coverage()
+        asked = [repo for repo in repos if repo.name not in self.sbom_ignore]
+        for start in range(0, len(asked), self._GRAPH_REPOS_PER_QUERY):
+            chunk = asked[start:start + self._GRAPH_REPOS_PER_QUERY]
+            try:
+                answer = client.graphql(self._graph_query(chunk))
+            except GitHubError as error:
+                for repo in chunk:
+                    coverage.failed(repo, error)
+                continue
+            self._read_graph_answer(chunk, answer, entries, coverage)
+        return self._finalize(
+            "sbom_check",
+            "Repositories without a dependency graph Dependabot can read",
+            entries, coverage)
 
     #: Workflow-run conclusions that count as a failure.
     _ACTIONS_FAIL = ("failure", "timed_out", "startup_failure")
@@ -2194,6 +2815,84 @@ class GitHubCheck(Check):
             text += f" · {_link(label, running_url)}"
         return text
 
+    @staticmethod
+    def _run_record(run: object) -> dict[str, Any]:
+        """One run, as the fields a surface renders or grades on rather than as the
+        sentence they were folded into (little-sister ADR-0082).
+
+        ``started`` is one of the three names the library reads as an **instant**,
+        and GitHub's own field says exactly that, so it is safe to claim.
+        ``updated`` deliberately is **not** ``ended``: a workflow run carries no
+        completion time at all, and ``updated_at`` is when anything about it last
+        changed — near enough to be worth keeping, not near enough to publish under
+        a name that means *finished*. An empty field becomes ``None`` rather than
+        ``""``: the library refuses a timed name whose value is not a time, and an
+        absent time is a fact of its own.
+        """
+        return {
+            "run_number": values.number(run, "run_number") or None,
+            "url": values.text(run, "html_url") or None,
+            "status": values.text(run, "status") or None,
+            "conclusion": values.text(run, "conclusion") or None,
+            "started": values.text(run, "run_started_at") or None,
+            "updated": values.text(run, "updated_at") or None,
+        }
+
+    @classmethod
+    def _action_record(cls, repo: Repo, workflow: str, branch: str,
+                       completed: object | None, running: object | None,
+                       verdict: tuple[StatusCode, str] | None) -> dict[str, Any]:
+        """What this run read about one workflow on one branch.
+
+        **Two words for the outcome, and they are not the same field.**
+        ``conclusion`` is GitHub's own — ``success``, ``failure``,
+        ``action_required`` — and it is what a grading seam will map; ``verdict`` is
+        the word this check chose for the line, which is what a line template will
+        substitute. A template cannot compute *failed* from *failure*, and a grading
+        map must not read a word we invented, so both ride and each says which job
+        it has.
+
+        The names a human reads are **raw** — escaping is a render-time step
+        (little-sister ADR-0018), and this is the half of the change that lets the
+        check stop escaping them itself.
+        """
+        record: dict[str, Any] = {
+            "repository": repo.full_name,
+            "workflow": workflow,
+            "branch": branch,
+            "verdict": verdict[1] if verdict is not None else None,
+        }
+        if completed is not None:
+            record["completed"] = cls._run_record(completed)
+        if running is not None:
+            record["running"] = cls._run_record(running)
+        return record
+
+    #: How each disabled state reads on the line. GitHub's own wording, because an
+    #: operator who wants to turn the workflow back on will meet these words in the
+    #: Actions tab and nowhere else.
+    _DISABLED_WORDS: ClassVar[dict[str, str]] = {
+        "disabled_manually": "disabled manually",
+        "disabled_inactivity": "disabled by GitHub after 60 days without "
+                               "repository activity",
+        "disabled_fork": "disabled by GitHub on this fork",
+    }
+
+    @classmethod
+    def _disabled_text(cls, repo: Repo, workflow: _Workflow) -> str:
+        """One disabled workflow's line: where it is, and **why it is off**.
+
+        The cause is the whole value of the line — *somebody switched this off* and
+        *GitHub switched this off* are different facts with different answers — and a
+        state this package has not met is said as GitHub spelled it rather than
+        flattened to `disabled`, so a new state arrives as a word to look up instead
+        of as silence.
+        """
+        where = f"{plain(repo.name)} / {plain(workflow.name)}"
+        word = cls._DISABLED_WORDS.get(
+            workflow.state, f"disabled ({plain(workflow.state)})")
+        return f"{_link(where, workflow.url)}: {word}, no runs read"
+
     #: Rows asked for per workflow. The scan needs the newest in-flight run **and**
     #: the newest useful completed verdict, which one row cannot carry and which a
     #: `status=` filter would need two reads to get — so it asks for a few and finds
@@ -2227,6 +2926,14 @@ class GitHubCheck(Check):
         page is the only bounded question there is; and a repository whose remaining
         budget will not cover a read per workflow, which degrades to it rather than
         reporting nothing.
+
+        **`actions.branches` is the third mode** (ADR-0009): the named list replaces
+        the default branch and every watched workflow is asked about every name,
+        which keeps the construction above — nothing back means no run on that
+        branch — at `W × B` reads. Where the budget will not cover that, the same
+        degradation applies, and with more than one name the wide page is taken
+        unfiltered and cut to the named branches, which is a cut by construction and
+        is reported as one.
         """
         problem_entries: list[Entry] = []
         running_entries: list[Entry] = []
@@ -2236,6 +2943,10 @@ class GitHubCheck(Check):
         # the line says *this answer is incomplete here* and not how many ways it
         # is, and a pair of `not in` checks leaves one of them dead.
         partial: dict[int, Repo] = {}
+        # Repositories where the branches this config names matched nothing at all.
+        # Only ever filled from an **exact** read, for the reason stated where it
+        # is filled: a degraded page cannot tell an unmatched branch from a cut.
+        unmatched: dict[int, Repo] = {}
         coverage = _Coverage()
         for repo in repos:
             full = repo.full_name
@@ -2244,6 +2955,7 @@ class GitHubCheck(Check):
             except GitHubError as error:
                 if error.status == 404:
                     coverage.read_one()
+                    self._workflow_counts[full] = 0   # next run: the list alone
                     continue                        # Actions not enabled
                 coverage.failed(repo, error, "workflows-unreadable", "workflows")
                 continue
@@ -2252,19 +2964,65 @@ class GitHubCheck(Check):
             # Filtered **before** the reads, not after: an ignored workflow should
             # not cost a request either. The one-page read could not do this — it
             # asked for runs, not for a workflow.
-            watched = {
-                workflow_id: name for workflow_id, name in workflows.by_id.items()
-                if not any(p.search(name or str(workflow_id))
+            kept = {
+                workflow_id: workflow
+                for workflow_id, workflow in workflows.by_id.items()
+                if not any(p.search(workflow.name or str(workflow_id))
                            for p in self.actions_ignore_patterns)}
-            branch_asked = ("" if self.actions_all_branches
-                            else repo.default_branch)
+            # **A disabled workflow's runs are not read** (ADR-0010). Its newest run
+            # is frozen at whatever it was when somebody switched the workflow off,
+            # so the request buys a verdict that cannot change and says nothing the
+            # list already in hand does not. It gets a line of its own below, naming
+            # the state, and the saved read is one per disabled workflow per run.
+            disabled = {workflow_id: workflow
+                        for workflow_id, workflow in kept.items()
+                        if workflow.disabled}
+            watched = {workflow_id: workflow.name
+                       for workflow_id, workflow in kept.items()
+                       if not workflow.disabled}
+            # What the next run's guard prices this repository's per-workflow
+            # read at: the workflows whose runs will actually be read — after the
+            # ignore patterns, because an ignored workflow costs no request, and
+            # after the disabled ones, because a disabled workflow costs none
+            # either. Counting `kept` here would over-price every run after this
+            # change by the number of workflows it stopped reading.
+            self._workflow_counts[full] = len(watched)
+            # Which branches this repository is asked about, and the whole of the
+            # difference between the three modes. `all_branches` names none and
+            # reads the wide page; a configured list replaces the default branch
+            # (ADR-0009); and a repository GitHub named no default branch for falls
+            # to the wide read exactly as it did before there was a list.
+            if self.actions_all_branches:
+                asked: tuple[str, ...] = ()
+            elif self.actions_branches:
+                asked = self.actions_branches
+            else:
+                asked = (repo.default_branch,) if repo.default_branch else ()
             try:
-                if branch_asked and self._budget_covers(client, len(watched)):
-                    runs = self._workflow_runs(client, repo, watched, branch_asked)
+                if asked and self._budget_covers(
+                        client, len(watched) * len(asked)):
+                    runs = self._workflow_runs(client, repo, watched, asked)
+                    # **Only an exact read may claim this.** Nothing back from a
+                    # read that asked per workflow per named branch means no run on
+                    # any of them — the same construction ADR-0005 rests on. The
+                    # degraded page below cannot say it: no row on a named branch
+                    # there is as likely to be the cut as the branch.
+                    if self.actions_branches and watched and not runs:
+                        unmatched[repo.id] = repo
                 else:
-                    rows, window_total = self._repository_runs(
-                        client, repo, branch_asked)
+                    # The wide read filters **one** branch, and a named list may
+                    # hold several: with one it asks GitHub for it, with more it
+                    # takes the page unfiltered and keeps the rows on a named
+                    # branch — which makes that page a cut by construction, so the
+                    # repository is short whatever `total_count` says about it.
+                    one = asked[0] if len(asked) == 1 else ""
+                    rows, window_total = self._repository_runs(client, repo, one)
                     if window_total > len(rows):
+                        partial[repo.id] = repo
+                    if self.actions_branches and not one:
+                        rows = [row for row in rows
+                                if values.text(row, "head_branch")
+                                in self.actions_branches]
                         partial[repo.id] = repo
                     runs = rows
             except GitHubError as error:
@@ -2274,6 +3032,38 @@ class GitHubCheck(Check):
                 coverage.failed(repo, error, "runs-unreadable")
                 continue
             coverage.read_one()
+            for workflow_id, switched_off in sorted(disabled.items()):
+                code = self.actions_disabled_map.get(switched_off.state,
+                                                     StatusCode.WARN)
+                # An `OK` disabled line follows `show_healthy`, exactly as a
+                # passing idle workflow does (ADR-0004 §9): with `disabled_fork`
+                # graded `OK` by default and forks discovered by default, a leaf
+                # that showed them all would fill with green lines nobody chose.
+                if code is StatusCode.OK and not self.actions_show_healthy:
+                    continue
+                # **Keyed without a branch**, because this line is not about one:
+                # the workflow is off everywhere. That is a different slug from the
+                # frozen verdict this line replaces, so a pin held on that line
+                # stops matching and has to be made again (PL10, ADR-0010).
+                entry = Entry(
+                    slug(repo.id, "workflow", workflow_id),
+                    self._disabled_text(repo, switched_off),
+                    code=code,
+                    # The repository is what this line is **about**, as the id a
+                    # rename cannot change — the same value the slug is keyed on
+                    # (ADR-0004, little-sister ADR-0050). The name a human reads
+                    # rides the record instead.
+                    subject=str(repo.id),
+                    # `state` is GitHub's own word and is free-form here: the
+                    # library types three names and this is not one of them.
+                    data={"repository": repo.full_name,
+                          "workflow": switched_off.name,
+                          "url": switched_off.url,
+                          "state": switched_off.state})
+                if code in (StatusCode.ERROR, StatusCode.WARN):
+                    problem_entries.append(entry)
+                else:
+                    healthy_entries.append(entry)
             for (workflow_id, branch), state in self._run_states(
                     runs, watched).items():
                 workflow, completed, running, verdict = state
@@ -2289,6 +3079,9 @@ class GitHubCheck(Check):
                         repo, workflow, branch, completed, running, verdict),
                     code=entry_code,
                     running=running is not None,
+                    subject=str(repo.id),
+                    data=self._action_record(
+                        repo, workflow, branch, completed, running, verdict),
                 )
                 if entry_code in (StatusCode.ERROR, StatusCode.WARN):
                     problem_entries.append(entry)
@@ -2315,6 +3108,30 @@ class GitHubCheck(Check):
                 + ", ".join(plain(repo.name)
                             for repo in partial.values()),
                 code=StatusCode.WARN))
+        # **The branches this config names matched nothing here.** A configuration
+        # line rather than a coverage line, and the only thing the per-entry
+        # rendering cannot show: a branch that produced no entry produces no line
+        # either, so an estate asked about a branch none of its repositories runs
+        # renders exactly like one with nothing to report. It names the default
+        # branch it *did* see, because `main` against `master` is what this nearly
+        # always is, and it says *no run on* rather than *no such branch*, which is
+        # the half of it the read cannot support (ADR-0009).
+        branch_entries: list[Entry] = []
+        if unmatched:
+            named = ", ".join(plain(branch) for branch in self.actions_branches)
+            branch_entries.append(Entry(
+                "branches-unmatched",
+                f"no workflow run on any branch this check names ({named}) in "
+                f"{len(unmatched)} of {len(repos)} "
+                + ("repository" if len(repos) == 1 else "repositories")
+                + " — the branch may not exist there, or nothing has run on it "
+                "yet: "
+                + ", ".join(
+                    f"{plain(repo.name)} (default branch "
+                    + (plain(repo.default_branch) if repo.default_branch
+                       else "not named by GitHub") + ")"
+                    for repo in unmatched.values()),
+                code=StatusCode.WARN))
         # The unreadable lines go **last**, after the healthy ones: they are the
         # least actionable thing on the leaf, and one of them is not news. The
         # window line sits with them and above them, for the same reason in the
@@ -2323,10 +3140,12 @@ class GitHubCheck(Check):
         return self._finalize(
             "actions", "Latest completed and in-flight workflow-run state",
             [*problem_entries, *running_entries, *healthy_entries,
-             *window_entries], coverage)
+             *branch_entries, *window_entries], coverage)
 
-    def _budget_covers(self, client: GitHubClient, workflows: int) -> bool:
-        """Whether the budget GitHub last stated covers a read per workflow here.
+    def _budget_covers(self, client: GitHubClient, reads: int) -> bool:
+        """Whether the budget GitHub last stated covers this repository's exact
+        read — one per watched workflow **per named branch** (ADR-0009), which is
+        one per workflow in the default-branch mode.
 
         **Read from the headers of the response already in hand**, which cost
         nothing: `/rate_limit` would spend a request to ask a question this run has
@@ -2347,7 +3166,7 @@ class GitHubCheck(Check):
         stated = client.last_rate_limit
         if stated is None or stated.remaining is None:
             return True
-        return stated.remaining >= self.rate_limit_safety_factor * workflows
+        return stated.remaining >= self.rate_limit_safety_factor * reads
 
     def _repository_runs(self, client: GitHubClient, repo: Repo,
                          branch: str) -> tuple[list[Any], int]:
@@ -2366,20 +3185,30 @@ class GitHubCheck(Check):
                 values.number(data, "total_count"))
 
     def _workflow_runs(self, client: GitHubClient, repo: Repo,
-                       watched: dict[int, str], branch: str) -> list[Any]:
-        """The newest rows of each watched workflow on ``branch``, as one list.
+                       watched: dict[int, str],
+                       branches: tuple[str, ...]) -> list[Any]:
+        """The newest rows of each watched workflow on each of ``branches``, as one
+        list.
 
         Returned in the shape the repository-wide read returns so that one scan
         serves both. A workflow with no rows contributes none and is **not** an
-        omission: it does not run on this branch, and that is the whole difference
+        omission: it does not run on that branch, and that is the whole difference
         between this read and the one it replaced.
+
+        The cost is one read per pair, `W × B`, and both the pre-run guard and
+        :meth:`_budget_covers` price it that way — a branch count left out of either
+        is a guard that under-prices by exactly the factor this loop multiplies by.
+        The order is workflow-major and does not matter: :meth:`_run_states` keys
+        every row by `(workflow, branch)` and GitHub returns each read newest first.
         """
         rows: list[Any] = []
         for workflow_id in sorted(watched):
-            data = client.get(
-                f"/repos/{repo.full_name}/actions/workflows/{workflow_id}/runs",
-                {"per_page": self._ACTIONS_WORKFLOW_ROWS, "branch": branch})
-            rows.extend(values.rows(data, "workflow_runs"))
+            for branch in branches:
+                data = client.get(
+                    f"/repos/{repo.full_name}/actions/workflows/"
+                    f"{workflow_id}/runs",
+                    {"per_page": self._ACTIONS_WORKFLOW_ROWS, "branch": branch})
+                rows.extend(values.rows(data, "workflow_runs"))
         return rows
 
     def _run_states(self, runs: list[Any],
@@ -2437,9 +3266,12 @@ class GitHubCheck(Check):
                           {"per_page": 100})
         listed = values.rows(data, "workflows")
         return _WorkflowList(
-            by_id={values.number(workflow, "id"): values.text(workflow, "name")
-                   for workflow in listed
-                   if values.text(workflow, "state") != "deleted"},
+            by_id={values.number(workflow, "id"): _Workflow(
+                name=values.text(workflow, "name"),
+                state=values.text(workflow, "state"),
+                url=values.text(workflow, "html_url"))
+                for workflow in listed
+                if values.text(workflow, "state") != "deleted"},
             listed=len(listed),
             total=values.number(data, "total_count"))
 
@@ -2525,6 +3357,39 @@ class GitHubCheck(Check):
             f"- [{plain(repo.name)}](https://github.com/{repo.full_name})"
             for repo in repos)
 
+    def _with_cache_report(self, scope: str, client: GitHubClient) -> str:
+        """The scope report, plus what the conditional cache holds and what this
+        run cost against what the guard priced it at.
+
+        **Display text, never a status claim** (little-sister ADR-0044): it is
+        scope, it never alarms, and nothing derives a code from it. It is here
+        because this cache is invisible to everything the library can attribute —
+        it is not entries, so `entry_limit` never sees it, and ADR-0075's
+        declarations cover worker seconds and entry counts, not held bytes. The
+        engine's own observed limit is the backstop (`limits.py` measures resident
+        size and speaks at 80 %); this line is so that a reader can see the thing
+        that grew.
+
+        The estimate beside the spend is the measurement this slice owes. The guard
+        still prices a run at full cost while a run with a warm cache spends a
+        fraction of it, which is conservative and refuses nothing it should not —
+        but it is now a number somebody can read rather than a sentence in a
+        backlog item (backlog #6).
+        """
+        spent = client.reads_made - client.free_reads
+        # `sbom_check` is **not** among them: it reads `POST /graphql` (ADR-0008),
+        # conditional requests are a `GET`/`HEAD` mechanism and GitHub's GraphQL
+        # answers carry no `ETag`. Counted rather than assumed, so a config that
+        # switches an aspect off says the smaller number.
+        covered = sum(1 for name in self.active_aspects() if name != "sbom_check")
+        line = (f"conditional cache: {len(self._conditional)} payload(s) held "
+                f"across {covered} aspect(s) and discovery, "
+                f"{self._conditional.dropped} dropped; this run made "
+                f"{client.reads_made} request(s) of which {client.free_reads} were "
+                f"free, so it spent {spent} against the "
+                f"{self._priced_total} the guard priced it at")
+        return f"{scope}\n\n{line}" if scope else line
+
     def run(self) -> CheckResult:
         # `timeout:` is the whole run's budget and this is where it starts ticking
         # — discovery included, since a run that cannot discover has spent it too.
@@ -2541,9 +3406,15 @@ class GitHubCheck(Check):
                     "max pause %gs, %d aspect(s)", self.path, self.timeout_seconds,
                     self.request_timeout, self.max_pause_seconds,
                     len(self.active_aspects()))
+        self._conditional.started()
         try:
             client = self._make_client(self.token, deadline)
+            # Discovery is a reader of its own: it asks for the repository list and
+            # nothing else does, so its entries age on its own passes rather than
+            # on whichever aspect ran last.
+            self._conditional.reading("discovery")
             repos = self._discover(client)
+            self._conditional.sweep()
         except DeadlineExceeded as cut:
             # Nothing was read, so there is nothing partial to keep: this is the one
             # place the deadline is the whole answer rather than a footnote.
@@ -2583,42 +3454,16 @@ class GitHubCheck(Check):
         scope_report = self._scope_report(repos)
 
         try:
-            _limit, remaining, _reset = client.rate_limit()
-            # Distinct **endpoints**, not aspects: see `ASPECT_ENDPOINT`.
-            reads = {self.ASPECT_ENDPOINT[name]
-                     for name in self.active_aspects()}
-            needed = max(1, len(repos)) * len(reads)
-            # What the run is about to ask for against what the token has, on the
-            # line whether or not it stops the run: the interesting case is the one
-            # that *just* cleared the factor, which is invisible when only the
-            # refusal is logged.
-            logger.info("%s: %d API calls left, this run needs %d×%d = %d",
-                        self.path, remaining, self.rate_limit_safety_factor,
-                        needed, self.rate_limit_safety_factor * needed)
-            # **The same response, read twice.** The line above is `/rate_limit`'s
-            # body; this one is the `x-ratelimit-*` headers on the very response
-            # that carried it. They are supposed to agree, and where they do not,
-            # the budget this run is about to reason about is not the budget it is
-            # spending. Nothing else in a log can show that: two readings taken
-            # apart could always be blamed on the seconds between them, and one
-            # response has no seconds between them.
-            logger.info("%s: the same response's own headers say %s", self.path,
-                        budget_said(client.last_rate_limit))
-            if remaining < self.rate_limit_safety_factor * needed:
-                return CheckResult(
-                    StatusCode.WARN,
-                    [f"skipped this run: {remaining} API calls left, need > "
-                     f"{self.rate_limit_safety_factor}×{needed} "
-                     f"for {len(repos)} repo(s)", scope_reason],
-                    report=scope_report)
-        except GitHubError:
-            pass   # rate-limit endpoint unavailable — proceed rather than block
+            short = self._budget_short(client, repos)
         except DeadlineExceeded as cut:
-            # The one client call outside the aspect loop, so it needs its own
-            # catch: `DeadlineExceeded` is deliberately not a `RemoteError`,
-            # and letting it out of `run` here would hand the engine an
-            # all-or-nothing check error instead of the reading below.
+            # The one client call outside the aspect loop — the guard's endpoint
+            # rung — so it needs its own catch: `DeadlineExceeded` is deliberately
+            # not a `RemoteError`, and letting it out of `run` here would hand the
+            # engine an all-or-nothing check error instead of the reading below.
             return CheckResult(StatusCode.WARN, [plain(str(cut)), scope_reason],
+                               report=scope_report)
+        if short:
+            return CheckResult(StatusCode.WARN, [short, scope_reason],
                                report=scope_report)
 
         builders: dict[str, Callable[[GitHubClient, list[Repo]], CheckResult]] = {
@@ -2672,12 +3517,22 @@ class GitHubCheck(Check):
                 if deadline.expired():
                     raise DeadlineExceeded(name)
                 started = True
+                # **The cache's unit is the reader, not the run** (ADR-0011): the
+                # aspect is the engine's unit (little-sister ADR-0078), and once
+                # aspects are paced separately a run that exercised only `actions`
+                # must not age out every alert payload it never asked for.
+                self._conditional.reading(name)
                 # The rank is set **here** and not in the seven builders: it is a
                 # property of the aspect roster, not of anything a builder measured,
                 # and seven copies of `ASPECTS.index(...)` is how a row ends up
                 # disagreeing with the constant it claims to follow.
                 children.append(replace(builders[name](client, repos),
                                         order=self.aspect_rank(name)))
+                # Swept only where the pass **finished**: an aspect the deadline or
+                # the pause budget cut off read a prefix of the repositories, and
+                # ageing its entries on that would be the partial-run defect the
+                # two-pass rule exists to avoid, arriving one level down.
+                self._conditional.sweep()
                 # Only a *finished* aspect moves the resume point: one cut off by
                 # the deadline is where the next run has to start, not where it
                 # has to start after.
@@ -2737,13 +3592,219 @@ class GitHubCheck(Check):
                     self.timeout_seconds, client.reads_made, client.read_seconds,
                     slowest, client.paused_seconds,
                     self._aspects_reported(children))
+        # For the next run's guard: how long a run of this scope takes is how
+        # long somebody else's spend has to eat into a window before this run is
+        # through with it.
+        self._last_run_seconds = deadline.elapsed()
         code, reason = self._node_reading(scope_code, scope_reason, cut_short,
-                                          client.paused_seconds)
+                                          client.throttled_seconds,
+                                          client.retried_seconds)
         return CheckResult(
             code, reason,
             children=tuple(children),
-            report=scope_report,
+            report=self._with_cache_report(scope_report, client),
         )
+
+    def _priced_reads(self, repos: list[Repo]) -> dict[str, int]:
+        """What this run will ask for, per path in the ledger's reduced form.
+
+        One read per repository per endpoint — two aspects on one endpoint are one
+        read (`ASPECT_ENDPOINT`) — and for `actions` the workflow list plus one
+        read per workflow the last run saw in that repository per branch it is
+        asked about (`1 + W × B`, and `B` is one in the default-branch mode), or
+        plus the one page of the wide read in `all_branches` mode, which is charged
+        wherever GitHub charges `/actions/runs`. ``max(1, …)`` so an empty scope
+        still prices one read per endpoint: the guard is a floor, and a skip
+        saying `need > 4×0` would be no sentence at all.
+        """
+        count = max(1, len(repos))
+        reads: dict[str, int] = {}
+        for name in self.active_aspects():
+            served = self.ASPECT_ENDPOINT[name].lstrip("/")
+            if name == "sbom_check":
+                # One query per repository asked, priced at its point on the
+                # `graphql` window (ADR-0008, decision 5); an ignored repository
+                # is not asked and not priced.
+                asked = sum(1 for repo in repos if repo.name not in self.sbom_ignore)
+                queries = max(1, -(-asked // self._GRAPH_REPOS_PER_QUERY))
+                reads[served] = queries * self._GRAPH_QUERY_POINTS
+                continue
+            reads[served] = count
+            if name == "actions":
+                if self.actions_all_branches:
+                    reads["actions/runs"] = count
+                else:
+                    # A read per workflow **per named branch** (ADR-0009). With no
+                    # list the one branch asked about is the repository's own
+                    # default, so the factor is one and this stays the `1 + W` the
+                    # guard has priced since ADR-0007.
+                    branches = max(1, len(self.actions_branches))
+                    reads[served] += branches * sum(
+                        self._workflow_counts.get(repo.full_name, 0)
+                        for repo in repos)
+        return reads
+
+    def _serves(self, counter: Counter) -> str:
+        """The only name a window has: what it serves — the first segment of
+        each aspect's path this token's reads were charged to it on, in the
+        roster's order, `dependabot, code-scanning and actions` — and
+        `discovery` for whatever else landed there, which is the account and
+        team reads (`/orgs/…`, `/users/…`, and `/organizations/…`, the `Link`
+        header's spelling of the same page). Empty for a window nothing here was
+        charged to."""
+        roster = [self.ASPECT_ENDPOINT[name].lstrip("/") for name in self.ASPECTS]
+        words: list[str] = []
+        for served in sorted(counter.paths, key=lambda path: (
+                roster.index(path) if path in roster else len(roster), path)):
+            word = served.split("/")[0] if served in roster else "discovery"
+            if word not in words:
+                words.append(word)
+        if len(words) <= 1:
+            return "".join(words)
+        return ", ".join(words[:-1]) + " and " + words[-1]
+
+    def _budget_short(self, client: GitHubClient,
+                      repos: list[Repo]) -> str | None:
+        """The pre-run guard: the sentence that skips this run, or ``None`` when
+        every window the run will spend can afford it (ADR-0007, decision 3).
+
+        Priced **per counter**, in three rungs. Each path this run will read is
+        looked up in the ledger, which says which window this token's reads of it
+        were charged to in the current hour; a path the ledger has not seen this
+        window — the first run after a restart, an aspect switched on, the run
+        after a rollover — is priced against the tightest window known **of the
+        resource that path was last charged to** (`Ledger.resource_of`), or of
+        any resource for a path never seen; and a path whose resource has no
+        window open, like every path where nothing is known at all, is priced by
+        the endpoint as it always was, so a fresh process is never *less* guarded
+        than the one before it. Of the resource, because a token's two `core`
+        windows can roll over in one minute, and the first run after that once
+        priced every REST read against the one window still open — GraphQL's —
+        which is a number about a different budget. A window somebody else is
+        smaller by the end of this run than it reads at the start, so the foreign
+        rate measured on it, over the length of the last run, comes off first.
+        `rate_limit_safety_factor` keeps its meaning and its name; it is applied
+        per window instead of once.
+
+        **A window that ends before this run would is outside the guard** —
+        neither priced nor the fallback for an unseen path. The guard exists for
+        the lockout ADR-0001 describes: exhaust an hourly window and every aspect
+        is blind until it rolls over, so a WARN now beats a 403 in twenty
+        minutes. A window that resets inside the run cannot do that — exhausting
+        it costs a wait the throttle path reads off the 403 and `max_pause`
+        bounds, and at worst the run is cut short with what finished kept — while
+        skipping every aspect to protect a minute of `dependency_sbom` reads
+        would trade the whole run for nothing. *Before the run would end* is
+        measured by the last run's length, and by `timeout:` before one has been
+        measured, since that is the most a run can take. A run shorter than the
+        minute such a window may still have ahead of it prices it with the
+        factor; that is a scope small enough that `factor × repositories` sits
+        under the window's hundred anyway, and if it ever bites, a window's
+        period is the difference between two successive resets on one path,
+        which the ledger sees.
+
+        Every window is on the log whether or not it stops the run: the
+        interesting case is the one that *just* cleared the factor, which is
+        invisible when only the refusal is logged.
+        """
+        reads = self._priced_reads(repos)
+        self._priced_total = sum(reads.values())
+        factor = self.rate_limit_safety_factor
+        now = time.time()
+        book = shared_ledger()
+        horizon = (self.timeout_seconds if self._last_run_seconds is None
+                   else self._last_run_seconds)
+        tightest = book.tightest(self.token, now, outlasting=horizon)
+        if tightest is None:
+            return self._budget_short_by_endpoint(client, repos,
+                                                  sum(reads.values()))
+        landing: dict[tuple[str, int], tuple[Counter, int]] = {}
+        unpriced: set[tuple[str, int]] = set()
+        by_endpoint = 0       # reads of a resource with no window open: rung three
+        for served, count in reads.items():
+            counter = book.counter_for(self.token, served, now)
+            if counter is not None and counter.reset <= now + horizon:
+                key = (counter.resource, counter.reset)
+                if key not in unpriced and counter.remaining is not None:
+                    unpriced.add(key)
+                    logger.info("%s: %d API calls left on the window GitHub "
+                                "charges the %s reads to (%s) — it ends before "
+                                "this run would be through, so the run is not "
+                                "priced against it", self.path,
+                                counter.remaining, self._serves(counter),
+                                _resets_in(counter.reset, now))
+                continue
+            if counter is None or counter.remaining is None:
+                resource = book.resource_of(self.token, served)
+                counter = (tightest if resource is None else book.tightest(
+                    self.token, now, outlasting=horizon, resource=resource))
+                if counter is None:
+                    by_endpoint += count
+                    continue
+            key = (counter.resource, counter.reset)
+            held, total = landing.get(key, (counter, 0))
+            landing[key] = (held, total + count)
+        for counter, needed in landing.values():
+            assert counter.remaining is not None       # `tightest` has one
+            rate = counter.foreign_rate()
+            meanwhile = (0.0 if rate is None or self._last_run_seconds is None
+                         else rate * self._last_run_seconds / 3600.0)
+            serves = self._serves(counter)
+            window = (f"the window GitHub charges the {serves} reads to"
+                      if serves else "the tightest window known for this token")
+            when = _resets_in(counter.reset, now)
+            # The word the budget node uses for this resource: a GraphQL window
+            # is counted in points, and "API calls" on it would be a number in
+            # the wrong unit beside a node saying the right one.
+            unit = ("points" if unit_of(counter.resource) == "points"
+                    else "API calls")
+            logger.info("%s: %d %s left on %s (%s)%s, this run needs "
+                        "%d×%d = %d there", self.path, counter.remaining, unit,
+                        window, when,
+                        (f" — of which ~{meanwhile:.0f} will be spent by "
+                         f"something else during this run"
+                         if meanwhile else ""), factor, needed, factor * needed)
+            if counter.remaining - meanwhile < factor * needed:
+                said = counter.foreign_rate_said()
+                return (f"skipped this run: {counter.remaining} {unit} left "
+                        f"on {window} ({when}), need > {factor}×{needed} for "
+                        f"{len(repos)} repo(s)"
+                        + (f"; ~{said}/h of it is spent by something else "
+                           f"using this token" if said is not None else ""))
+        if by_endpoint:
+            return self._budget_short_by_endpoint(client, repos, by_endpoint)
+        return None
+
+    def _budget_short_by_endpoint(self, client: GitHubClient, repos: list[Repo],
+                                  needed: int) -> str | None:
+        """The guard's bottom rung: nothing in the ledger, so `/rate_limit`, read
+        and priced the way every release before ADR-0007 did it.
+
+        Its answer is one counter of the token's — for some tokens one nothing
+        spends — which is why it is the last rung and not the first. The read
+        itself feeds the ledger like any other response, so a real counter it
+        reports is known from here on.
+        """
+        try:
+            _limit, remaining, _reset = client.rate_limit()
+        except GitHubError:
+            return None    # rate-limit endpoint unavailable — proceed rather than block
+        logger.info("%s: %d API calls left, this run needs %d×%d = %d",
+                    self.path, remaining, self.rate_limit_safety_factor,
+                    needed, self.rate_limit_safety_factor * needed)
+        # **The same response, read twice.** The line above is `/rate_limit`'s
+        # body; this one is the `x-ratelimit-*` headers on the very response that
+        # carried it. They agreed in every reading behind ADR-0007 — the
+        # disagreement this line was built to catch is between the endpoint and
+        # the ordinary reads, which is the ledger's to show — and the line stays
+        # because one response has no seconds between its two halves to blame.
+        logger.info("%s: the same response's own headers say %s", self.path,
+                    budget_said(client.last_rate_limit))
+        if remaining < self.rate_limit_safety_factor * needed:
+            return (f"skipped this run: {remaining} API calls left, need > "
+                    f"{self.rate_limit_safety_factor}×{needed} "
+                    f"for {len(repos)} repo(s)")
+        return None
 
     @staticmethod
     def _where_it_stopped(name: str, position: int, roster: tuple[str, ...],
@@ -2772,8 +3833,8 @@ class GitHubCheck(Check):
                 f"reported")
 
     def _node_reading(self, scope_code: StatusCode, scope_reason: str,
-                      cut_short: str, paused: float = 0.0
-                      ) -> tuple[StatusCode, list[str]]:
+                      cut_short: str, throttled: float = 0.0,
+                      retried: float = 0.0) -> tuple[StatusCode, list[str]]:
         """The check's own node: coverage, and only coverage.
 
         Two facts live here rather than on the aspects, because both are about
@@ -2796,13 +3857,20 @@ class GitHubCheck(Check):
                 f"{'' if unreachable == 1 else 's'} could not be completed this "
                 f"run — GitHub did not answer")
             code = StatusCode.WARN if code is StatusCode.OK else code
-        if paused:
-            # A fact about the run, not a claim about anybody's repository, so it
-            # sits here with the other two and grades nothing on its own: waiting
-            # when a service asks is correct behavior. What it stops is a paused
-            # run being indistinguishable from a slow one.
+        # A pause is a fact about the run, not a claim about anybody's
+        # repository, so it sits here with the other two and grades nothing on
+        # its own: waiting when a service asks is correct behavior, and so is a
+        # second ask after a failure. What the lines stop is a paused run being
+        # indistinguishable from a slow one — and each is **named by its cause**
+        # (ADR-0007, decision 4): *rate limit* only when a throttle was read, the
+        # backoff after an unexplained failure as what it is. A reason string,
+        # not a slug or a key, so nothing a deployment stores moves with it.
+        if throttled:
             reason.append(
-                f"paused {paused:.0f}s for a GitHub rate limit")
+                f"paused {throttled:.0f}s for a GitHub rate limit")
+        if retried:
+            reason.append(
+                f"paused {retried:.0f}s retrying after GitHub did not answer")
         if cut_short:
             reason.append(cut_short)
             code = StatusCode.WARN if code is StatusCode.OK else code

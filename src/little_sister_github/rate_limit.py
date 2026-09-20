@@ -39,10 +39,15 @@ from little_sister.checks import (
 from little_sister.reasons import slug
 from little_sister.status import StatusCode
 
+from little_sister_github.budget import DEFAULT_UNIT as budget_default_unit
+from little_sister_github.budget import RESOURCE_UNITS as budget_units
+from little_sister_github.budget import Counter
+from little_sister_github.budget import ledger as shared_ledger
 from little_sister_github.github import (
     GITHUB_API,
     GitHubClient,
     GitHubError,
+    _first_sight,
     _resets_in,
     budget_said,
 )
@@ -51,13 +56,27 @@ logger = logging.getLogger(__name__)
 
 #: The endpoint. Reading it **does not count against the budget it reports**,
 #: which is what lets this check run every minute beside a `github` check that
-#: runs every fifteen — and why it needs no rate-limit guard of its own.
+#: runs every fifteen — and why it needs no rate-limit guard of its own. It is no
+#: longer the line's *source* where the ledger has one (ADR-0007): it reports one
+#: counter per resource where a token has two, and for some tokens one nothing
+#: spends. It is still read every run, because it is free, because it is the
+#: only source for a resource nothing in this process spends, and because where
+#: it does report a real counter it samples that counter between runs.
 RATE_LIMIT_PATH = "/rate_limit"
 
+#: The clause a line carries when its numbers are the endpoint's and nothing in
+#: this process has been charged to that resource — `graphql`, `search`, or
+#: `core` before the first `github` run after a restart. Said, because the
+#: endpoint's number is the weaker reading and a reader comparing it with the
+#: `github` check's trace should know which one they are looking at.
+ENDPOINT_SAYS = "— as /rate_limit reports it; nothing here has spent it"
+
 #: Watched when a config names no `resources:` block. `core` is what this
-#: package's other check type spends; `graphql` is in the default set because a
-#: token is rarely used by one tool alone, and a GraphQL budget nobody watches is
-#: the one that runs out during an incident. Everything else GitHub reports —
+#: package's other check type spends, and since ADR-0008 so is `graphql` — a few
+#: points a run for the dependency-graph query; it was in the default set before
+#: that because a token is rarely used by one tool alone, and a GraphQL budget
+#: nobody watches is the one that runs out during an incident. Everything else
+#: GitHub reports —
 #: `search`, `code_search`, `dependency_snapshots`, `code_scanning_upload`,
 #: `integration_manifest`, `actions_runner_registration`, `dependency_sbom`,
 #: `scim` — is one line of config away.
@@ -71,12 +90,10 @@ DEFAULT_RESOURCES = ("core", "graphql")
 DEFAULT_WARN_BELOW = 1000
 DEFAULT_ERROR_BELOW = 500
 
-#: What a budget is counted in. GitHub's REST budgets are requests; the GraphQL
-#: budget is **points**, and one query can cost many of them — so "500 left"
-#: means something different there, and the word is the only thing on the line
-#: that says so.
-RESOURCE_UNITS: dict[str, str] = {"graphql": "points"}
-DEFAULT_UNIT = "requests"
+#: What a budget is counted in — the ledger's table, which the `github` guard
+#: reads too, so the two lines about one window say one word.
+RESOURCE_UNITS = budget_units
+DEFAULT_UNIT = budget_default_unit
 
 
 def _non_negative_int(value: object, field: str) -> int:
@@ -262,19 +279,39 @@ class GitHubRateLimitCheck(Check):
         return GitHubClient(token, api_url=self.api_url,
                             timeout=self.timeout_seconds)
 
-    def _entry(self, budget: Budget, row: dict[str, Any], now: float) -> Entry:
-        """One resource's line, coded with that resource's own verdict."""
+    def _row(self, budget: Budget,
+             row: object) -> tuple[int, int, int, int] | Entry:
+        """The endpoint's row for one resource as its four numbers — `limit`,
+        `remaining`, `used`, `reset` — or the line that says why it is not one.
+
+        A resource this config watches and GitHub did not answer for is a typo,
+        or a name this installation does not have; either way the watched line
+        must not simply be absent — a missing line reads as a budget that is
+        fine. The two shapes are worded apart because they send a reader to
+        different places: one to their own config, the other to the payload.
+        """
         name = plain(budget.name)
+        if not isinstance(row, dict):
+            return Entry(
+                slug(budget.name),
+                f"{name}: GitHub did not report this resource"
+                if row is None else
+                f"{name}: GitHub reported this resource in a shape this check "
+                f"cannot read",
+                code=StatusCode.WARN)
         try:
             # **Required**, both of them, and the asymmetry is the reason: an
             # absent `remaining` would default to 0 and grade red, which is
             # survivable, but an absent `limit` would default to 0 and take the
-            # "no limit" path below — an exhausted budget reading green because a
-            # key went missing. A structural field's absence means the shape
-            # changed, and that is a read failure, not a reading.
+            # "no limit" path — an exhausted budget reading green because a key
+            # went missing. A structural field's absence means the shape changed,
+            # and that is a read failure, not a reading. `used` and `reset` are
+            # not structural: a row without them is still a budget.
             limit = values.number(row, "limit", where=budget.name, required=True)
             remaining = values.number(row, "remaining", where=budget.name,
                                       required=True)
+            used = values.number(row, "used", where=budget.name,
+                                 default=limit - remaining)
             reset = values.number(row, "reset", where=budget.name)
         except CheckError as error:
             # Per-resource isolation, as every aspect of the `github` type does it:
@@ -285,6 +322,13 @@ class GitHubRateLimitCheck(Check):
                          f"{name}: could not read this resource "
                          f"({plain(str(error))})",
                          code=StatusCode.WARN)
+        return limit, remaining, used, reset
+
+    def _line(self, budget: Budget, limit: int, remaining: int, reset: int,
+              now: float, *, tail: str = "") -> Entry:
+        """One resource's line, coded with that resource's own verdict on
+        ``remaining`` — whichever source the numbers came from."""
+        name = plain(budget.name)
         if limit <= 0:
             # A limit of zero is not a budget of nothing, it is the **absence** of
             # a budget — and grading it would paint a permanent red on an
@@ -298,7 +342,70 @@ class GitHubRateLimitCheck(Check):
         text = f"{name}: {remaining} of {limit} {budget.unit} left"
         if reset:
             text = f"{text}, {_resets_in(reset, now)}"
+        if tail:
+            text = f"{text}{tail}"
         return Entry(slug(budget.name), text, code=budget.code(remaining))
+
+    def _from_ledger(self, budget: Budget, counters: list[Counter],
+                     now: float) -> Entry | None:
+        """One resource's line **written from the ledger**, or ``None`` when the
+        ledger holds no counter with numbers for it (ADR-0007, decision 2).
+
+        The tightest counter grades the resource and opens the line; when it is
+        one of several the line says so and what the others hold, because a
+        token whose endpoint reports one window of two has been hiding the one
+        spent twice as fast. The clause about what something else spends is the
+        tightest counter's own: measured between this process's readings, and
+        said with a tilde because it assumes the others keep their pace. A
+        counter nothing here was charged to — the endpoint's, and only ever one
+        per resource — is a reading all the same, and the line says whose.
+        """
+        gradable = [counter for counter in counters
+                    if counter.limit is not None and counter.remaining is not None]
+        if not gradable:
+            return None
+        tightest, *others = gradable          # tightest first: the ledger's order
+        tail = ""
+        # **What this process spent**, said first because it is the one number on
+        # this line the reader can act on directly, and because the three clauses
+        # together are what makes a window add up: its own, somebody else's rate,
+        # and what it carried before this process saw it. A count rather than a
+        # rate, and with no tilde: it is what the ledger recorded, not an estimate
+        # of anybody's pace. Said only when it is not zero — a window this process
+        # has not spent is the endpoint's clause below, or nothing worth a word.
+        ours = tightest.own_spend
+        if ours:
+            tail += f"; {ours} of it this process's own"
+        foreign = tightest.foreign_rate_said()
+        before = tightest.before_us or 0
+        # Two clauses about the same somebody: the rate, measured between this
+        # process's own readings, and what the window carried before its first
+        # reading, said only when this process saw the window open and then
+        # without a floor — with the rollover seen it is a count, not an
+        # estimate, and the hourly job it exists for spends forty-five.
+        if foreign is not None and before:
+            tail += (f"; ~{foreign}/h of it is spent by something else using "
+                     f"this token, and {before} of it before this process first "
+                     f"read this window")
+        elif foreign is not None:
+            tail += (f"; ~{foreign}/h of it is spent by something else using "
+                     f"this token")
+        elif before:
+            tail += (f"; {before} of it were spent by something else before "
+                     f"this process first read this window")
+        if not any(counter.charged for counter in gradable):
+            tail += f" {ENDPOINT_SAYS}"
+        elif others:
+            held = ", and ".join(
+                f"{counter.remaining} left, {_resets_in(counter.reset, now)}"
+                for counter in others)
+            tail += (f" — the tightest of {len(gradable)} windows GitHub keeps "
+                     f"for this token; "
+                     + ("the other has " if len(others) == 1 else
+                        "the others have ") + held)
+        assert tightest.limit is not None and tightest.remaining is not None
+        return self._line(budget, tightest.limit, tightest.remaining,
+                          tightest.reset, now, tail=tail)
 
     def run(self) -> CheckResult:
         client = self._make_client(self.token)
@@ -319,25 +426,32 @@ class GitHubRateLimitCheck(Check):
                 [f"GitHub answered {RATE_LIMIT_PATH} without a 'resources' "
                  f"object — nothing to read"])
         now = time.time()
+        book = shared_ledger()
         entries: list[Entry] = []
         for budget in self.budgets:
-            row = resources.get(budget.name)
-            if not isinstance(row, dict):
-                # A resource this config watches and GitHub did not answer for: a
-                # typo, or a name this installation does not have. Either way the
-                # watched line must not simply be absent — a missing line reads as
-                # a budget that is fine. The two cases are worded apart because
-                # they send a reader to different places: one to their own config,
-                # the other to the payload.
-                entries.append(Entry(
-                    slug(budget.name),
-                    f"{plain(budget.name)}: GitHub did not report this resource"
-                    if row is None else
-                    f"{plain(budget.name)}: GitHub reported this resource in a "
-                    f"shape this check cannot read",
-                    code=StatusCode.WARN))
-                continue
-            entries.append(self._entry(budget, row, now))
+            reading = self._row(budget, resources.get(budget.name))
+            if not isinstance(reading, Entry):
+                # The body's row, merged as **one more reading** of whichever
+                # counter its `reset` names — free, so it counts as no attempt.
+                # A pristine row of a window nothing spent opens no counter; the
+                # ledger says why.
+                limit, remaining, used, reset = reading
+                _first_sight(book.record(
+                    self.token, RATE_LIMIT_PATH, resource=budget.name,
+                    limit=limit, remaining=remaining, used=used,
+                    reset=reset or None, now=now), now, self.path)
+            # The line is the ledger's wherever the ledger has one: the counters
+            # the reads of this process were charged to, or the endpoint's own
+            # counter where that is all there is. Only a resource the ledger
+            # holds nothing for — pristine on the endpoint, or unreadable there —
+            # is written from the row itself, and then says so.
+            entry = self._from_ledger(
+                budget, book.counters(self.token, budget.name, now), now)
+            if entry is None:
+                entry = (reading if isinstance(reading, Entry) else self._line(
+                    budget, reading[0], reading[1], reading[3], now,
+                    tail=f" {ENDPOINT_SAYS}"))
+            entries.append(entry)
         # The reading, and then the **same response's** own budget headers. This
         # check reads a bucket GitHub looked up by identity; the headers say which
         # bucket it charged for that very lookup and what is left of *that* one.

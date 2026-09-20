@@ -1,7 +1,7 @@
 # ADR-0001 — The API budget is a check type of its own, not an eighth aspect
 
 - **Status:** Accepted
-- **Date:** 2026-08-09 (accepted 2026-08-15)
+- **Date:** 2026-09-20 (accepted 2026-08-15)
 - **Related:** [`../../README.md`](../../README.md) (how both types are configured),
   little-sister ADR-0042 (an entry carries its own code), little-sister ADR-0050 (a
   slug is an identifier, never a position), little-sister ADR-0051 (one bare type
@@ -62,9 +62,13 @@ or make the expensive check run too often.
 
 The cost is a second `type:` name — claimed once, family-wide (little-sister ADR-0051)
 — and a package whose name no longer describes exactly one type. It stays **one
-package**: both types read one API, through one client, with one credential shape, and
-they version together. Splitting them would duplicate `GitHubClient` and a release
-pipeline for one endpoint.
+package**: both types read one **host**, through one client, with one credential shape,
+and they version together. Splitting them would duplicate `GitHubClient` and a release
+pipeline for one endpoint. One host rather than one API: from
+[ADR-0008](0008-the-dependency-graph-is-asked-not-exported.md) on, the `sbom_check`
+aspect asks GitHub's GraphQL API whether a repository has dependency manifests, through
+that same client and token — and the argument against a second package is the same
+argument against a second client for one query.
 
 **Spelled with hyphens.** `github-rate-limit`, matching the family's multi-word type
 names (`ssh-command`, `host-metrics`) rather than inventing a second convention.
@@ -152,7 +156,7 @@ right now; the reader who wants to know whether to wait can see the clause and d
   monitor's threshold and a run's policy in one number.
 - The package's rulebook now describes two types, and a third would have to argue
   against this record rather than beside it: what makes these two one package is a
-  shared API, client and credential — not a shared vendor.
+  shared host, client and credential — not a shared vendor.
 
 Two limits this decision does not cover, both of them things an operator meets while
 looking at these two nodes side by side.
@@ -176,15 +180,22 @@ along with `x-ratelimit-remaining` / `x-ratelimit-reset`; see
 [ADR-0002](0002-a-read-failure-is-not-a-finding.md) decision 2 for the precedence and
 for why the reading has to live in this package.
 
-**2. The `github` check's guard reads `core`, and only `core`.** Its pre-run estimate
-consults `resources.core` from the same endpoint this check reads, which is the budget
-every REST call that check makes is charged to — so the guard is right today, and a
-`graphql` or `search` resource going red beside it correctly does not stop a `github`
-run, because that type issues neither kind of request. Two consequences follow. The
-number on this check's `core` line and the number the guard acted on are the **same
-reading taken at different moments**, so a dashboard can legitimately show a skipped
-run beside a budget that has since refilled. And if GitHub ever meters one of the
-endpoints those aspects call under a resource of its own, the guard would go on reading
-a budget that is no longer the one being spent — worth naming, because that failure
-would look like the guard not working rather than like the guard watching the wrong
-number.
+**2. What this record said about `core` was measured false, and
+[ADR-0007](0007-the-budget-is-read-where-it-is-spent.md) carries the correction.** The
+`github` check's pre-run guard consulted `resources.core` from the same endpoint this
+check reads, on two assumptions: that every REST call that check makes is charged to
+`core`, and that the endpoint reports that budget. Both are wrong, and the first was
+wrong when this record was written — the SBOM read is charged to `dependency_sbom`, a
+hundred a minute rather than five thousand an hour, and `core` itself is not one
+counter but two, split by request path, of which `/rate_limit` reports one, on some
+tokens one that nothing spends. So the guard's `remaining` and this check's `core` line
+were never the budget the run was spending.
+
+Half of that had been named here as a thing to watch for — *if GitHub ever meters one
+of those endpoints under a resource of its own, the guard would go on reading a budget
+that is no longer the one being spent* — and it had already happened. What ADR-0007
+replaces is where the numbers come from: the budget is read from the headers of every
+response and kept per counter, and the guard prices a run against the counters it will
+actually spend. What this record decided stands — the budget is the token's, the
+reading is a type of its own, the thresholds are counts, and the endpoint is free to
+read.

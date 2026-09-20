@@ -69,16 +69,18 @@ error_below: 500
 # which is the only place that can tell a typo from a resource GitHub added last
 # week.
 #
-#   core                          the general REST budget — most of what `github`
-#                                 spends, though not all: some endpoints it calls
-#                                 draw on their own budgets below
-#   graphql                       the GraphQL budget, counted in points
+#   core                          the REST budget the `github` check spends — two
+#                                 windows of it per token, split by request path,
+#                                 and the line grades the tighter one (ADR-0007)
+#   graphql                       the GraphQL budget, counted in points; the `github`
+#                                 check's `sbom_check` spends a point per repository
+#                                 of it (ADR-0008)
 #   search / code_search          the search endpoints, on their own small budgets
 #   dependency_snapshots          dependency-graph submissions
 #   code_scanning_upload          SARIF uploads
 #   integration_manifest          GitHub App manifest conversions
 #   actions_runner_registration   self-hosted runner registration
-#   dependency_sbom               SBOM requests
+#   dependency_sbom               SBOM export requests (nothing here spends it)
 #   scim                          SCIM provisioning
 #
 # resources:

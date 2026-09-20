@@ -1,6 +1,6 @@
 [project]
 name = "little-sister-github"
-version = "0.1.7"
+version = "0.1.8"
 description = "GitHub check types for little-sister: repository overview, and API rate limit."
 authors = [
     { name = "Michael Meyling" }
@@ -51,7 +51,7 @@ requires-python = ">=3.11"
 # redirect further down — and restores `uv.lock` with it. See `### Requires` in the
 # CHANGELOG for when the floor last moved.
 dependencies = [
-    "little-sister>=0.3.13",
+    "little-sister>=0.3.17",
 ]
 
 # public-urls:begin

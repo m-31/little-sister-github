@@ -1,7 +1,7 @@
 # ADR-0005 — The `actions` aspect asks per workflow
 
 - **Status:** Accepted
-- **Date:** 2026-08-30
+- **Date:** 2026-09-20 (accepted 2026-08-30)
 - **Related:** [ADR-0003](0003-an-aspect-is-one-question-asked-of-the-whole-scope.md)
   (an aspect is one question asked of the whole scope, which this changes the *asking*
   of), [ADR-0002](0002-a-read-failure-is-not-a-finding.md) (a line that grades nothing,
@@ -57,6 +57,16 @@ also did.
 question is the newest state per `(workflow, branch)` over an unbounded set of
 branches, and no per-workflow query bounds it. One page remains the only bounded
 question available, so that mode stays incomplete and says so.
+
+**`actions.branches:` names the branches, and replaces the default.**
+[ADR-0009](0009-named-branches-replace-the-default-branch.md) adds a third mode: every
+watched workflow is asked about every branch that key names — the construction above,
+once per name — and the named set **replaces** the repository's default branch rather
+than adding to it. Nothing decided here changes: the default-branch mode is what a
+config without that key gets, `all_branches` keeps the wide page and its coverage line,
+and the per-workflow read is still priced against the headers in hand, now per workflow
+*per named branch*. The two keys together are refused at startup, so the modes do not
+compose.
 
 **The aspect prices its own budget.** The pre-run guard multiplies repositories by
 endpoints and runs before any aspect, while the number of workflows in a repository is
