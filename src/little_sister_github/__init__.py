@@ -5,7 +5,7 @@ Importing this package registers **both** types in little-sister's
 it imports ``little_sister.app``::
 
     import little_sister_github          # noqa: F401  registers its types
-    from little_sister.app import app    # noqa: E402  builds the engine
+    from little_sister.app import app    # noqa: E402  its start builds the engine
 
 Two types, one package, because they read one API through one client with one
 credential and version together; why the budget is a type of its own rather than
@@ -21,7 +21,7 @@ from importlib.metadata import PackageNotFoundError, version
 
 from little_sister.checks import require_api
 
-require_api(2)
+require_api(3)
 
 from little_sister_github import (  # noqa: E402  both register their type
     github,

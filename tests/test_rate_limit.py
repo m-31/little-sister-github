@@ -6,14 +6,26 @@ rather than from the branch that implements it.
 """
 from __future__ import annotations
 
+import inspect
+import io
+import json
 import logging
 import re
+import urllib.error
+import urllib.parse
+from datetime import UTC, datetime
+from email.message import Message
+from unittest import mock
 
 import pytest
+from little_sister import fetch as ls_fetch
 from little_sister.checks import CHECK_TYPES, CheckError
+from little_sister.reasons import RECORD_TIMESTAMP_KEYS
 from little_sister.status import StatusCode
-from little_sister.transport import Fault
+from little_sister.transport import Deadline, Fault
+from running import measured, record_times, run_check
 
+from little_sister_github import budget, rate_limit
 from little_sister_github.budget import ledger
 from little_sister_github.github import (
     NO_BUDGET_HEADERS,
@@ -47,8 +59,12 @@ class FakeClient:
     "could not ask" path is exercised without a network.
     """
 
-    def __init__(self, payload, last_rate_limit=None):
+    def __init__(self, payload, last_rate_limit=None, user=None):
         self._payload = payload
+        # What `GET /user` answers: a personal access token's account unless a
+        # test says otherwise, or a `GitHubError` — an installation token, which
+        # GitHub refuses there, or a moment GitHub did not answer.
+        self._user = {"login": "example-user", "type": "User"} if user is None else user
         self.calls: list[str] = []
         # What the real client keeps from the answering response's own headers.
         # `None` — *GitHub sent no budget headers* — is this double's default
@@ -58,6 +74,10 @@ class FakeClient:
 
     def get(self, path, params=None):
         self.calls.append(path)
+        if path == "/user":
+            if isinstance(self._user, GitHubError):
+                raise self._user
+            return self._user
         if isinstance(self._payload, GitHubError):
             raise self._payload
         return self._payload
@@ -86,8 +106,8 @@ def _check(**over):
 
 def _run(check, payload, last_rate_limit=None):
     fake = FakeClient(payload, last_rate_limit)
-    check._make_client = lambda token: fake        # type: ignore[method-assign]
-    return check.run(), fake
+    check._make_client = lambda token, deadline=None: fake  # type: ignore[method-assign]
+    return run_check(check), fake
 
 
 def _from_config(**over):
@@ -617,12 +637,16 @@ def test_a_response_that_stated_no_budget_headers_says_so_in_the_line(caplog):
         f"| that response's own headers: {NO_BUDGET_HEADERS}")
 
 
-def test_the_check_spends_nothing_but_the_one_call():
-    """"Reading it does not count against the budget it reports" — which is only
-    true while this is the *only* endpoint the check reads."""
-    _result, fake = _run(_check(), _resources(core=(5000, 4000),
-                                              graphql=(5000, 4000)))
-    assert fake.calls == ["/rate_limit"]
+def test_the_check_asks_whose_token_once_and_then_only_the_free_endpoint():
+    """"Reading it does not count against the budget it reports" — true of every
+    run but the first, which also asks `GET /user` whose budget it is (ADR-0014
+    §6): one `core` request per process, and before the budget is read, so the
+    budget read includes it."""
+    check = _check()
+    _result, first = _run(check, _resources(core=(5000, 4000), graphql=(5000, 4000)))
+    _result, second = _run(check, _resources(core=(5000, 4000), graphql=(5000, 4000)))
+    assert first.calls == ["/user", "/rate_limit"]
+    assert second.calls == ["/rate_limit"]
 
 
 # --- pin identity -------------------------------------------------------------
@@ -833,3 +857,550 @@ def test_the_summary_shows_this_deployments_numbers_not_the_shipped_ones():
     summary = _check(budgets=(Budget("core", 42, 7),)).config_summary()
     assert "WARN below 42, ERROR below 7 requests" in summary
     assert "1000" not in summary
+
+
+# --- the two halves (little-sister ADR-0086; ADR-0014) -------------------------
+
+def _measured(check, payload, user=None):
+    fake = FakeClient(payload, user=user)
+    check._make_client = lambda token, deadline=None: fake  # type: ignore[method-assign]
+    return measured(check)
+
+
+def test_each_watched_resource_is_one_reading_in_the_declared_order():
+    """One reading per watched resource, in the order the configuration declared
+    them — and none for a resource GitHub reports that nobody watches."""
+    readings = _measured(_check(), _resources(
+        graphql=(5000, 4900), core=(5000, 4800), search=(30, 30)))
+    assert [r.record["resource"] for r in readings] == ["core", "graphql"]
+    assert all(set(r.record) == set(readings[0].record) for r in readings)
+
+
+def test_a_failed_ask_is_one_reading_and_it_says_why():
+    (reading,) = _measured(_check(), GitHubError(
+        "HTTP 503 for /rate_limit", status=503, fault=Fault.TRANSIENT))
+    assert reading.record["source"] == "unanswered"
+    assert "HTTP 503" in reading.record["error"]
+
+
+def test_the_grading_reads_the_ledger_through_the_reading_and_not_again():
+    """The ledger is state this process keeps about the world, so it is read in
+    the measuring half; the grading of the same readings says the same once the
+    ledger is gone."""
+    import time
+    now = int(time.time())
+    check = _check()
+    # two windows, one of them this process's own spend: a line only the ledger
+    # can write, so a grading that looked again would say something else
+    _spent(check, _ON_A, remaining=3932, reset=now + 400)
+    _spent(check, _ON_B, remaining=800, reset=now + 100)
+    readings = _measured(check, _resources(core=(5000, 5000, now + 3600),
+                                           graphql=(5000, 5000, now + 3600)))
+    assert readings[0].record["source"] == "ledger"
+    when = datetime.fromtimestamp(now, UTC)
+    first = run_check(check, measurements=readings, now=when)
+    budget._LEDGER = budget.Ledger()
+    assert run_check(check, measurements=readings, now=when) == first
+
+
+def test_how_long_until_a_reset_is_read_off_the_instant_the_grading_is_given():
+    """The one number a line reads the clock for comes from ``now``, so an old
+    reading graded again says how long its window had then, not today."""
+    check = _check()
+    readings = _measured(check, _resources(core=(5000, 4800, _RESET),
+                                           graphql=(5000, 4900, _RESET)))
+    early = run_check(check, measurements=readings,
+                      now=datetime.fromtimestamp(_RESET - 30 * 60, UTC))
+    late = run_check(check, measurements=readings,
+                     now=datetime.fromtimestamp(_RESET - 5 * 60, UTC))
+    assert "resets in 30min" in early.reason_entries[0].text
+    assert "resets in 5min" in late.reason_entries[0].text
+
+
+# --- whose budget: the object of a reading (ADR-0014 §6) ------------------------
+
+def test_each_resource_is_its_own_budget_and_its_own_object():
+    """"The object is account plus resource": `core` and `graphql` of one account
+    have their own limit and their own reset, so one run hands back two named
+    objects — never one named twice (little-sister ADR-0086 decision 8)."""
+    readings = _measured(_check(), _resources(core=(5000, 4800), graphql=(5000, 4900)))
+    assert [r.subject for r in readings] == [
+        "example-user;resource=core", "example-user;resource=graphql"]
+    assert all(r.record["account"] == "example-user" for r in readings)
+
+
+def test_a_budget_reading_names_no_event_so_every_poll_appends():
+    """Every poll really is a new reading of that budget (ADR-0014 §6): no reading
+    names an identity, on the first poll or the next, so each is a new point in
+    the budget's series rather than a record an earlier poll wrote
+    (little-sister ADR-0087 decision 3)."""
+    check = _check()
+    first = _measured(check, _resources(core=(5000, 4800), graphql=(5000, 4900)))
+    again = _measured(check, _resources(core=(5000, 4700), graphql=(5000, 4900)))
+    assert [r.subject for r in again] == [
+        "example-user;resource=core", "example-user;resource=graphql"]
+    assert [r.identity for r in (*first, *again)] == ["", "", "", ""]
+
+
+def test_a_resource_github_did_not_report_is_still_that_budgets_reading():
+    """A failed reading is a reading (little-sister ADR-0085 decision 3): the
+    watched `search` line GitHub left out is about the same object a good reading
+    of it would be."""
+    readings = _measured(_check(budgets=(
+        Budget("search", DEFAULT_WARN_BELOW, DEFAULT_ERROR_BELOW),)),
+        _resources(core=(5000, 4800)))
+    (search,) = readings
+    assert search.record["source"] == "absent"
+    assert search.subject == "example-user;resource=search"
+
+
+def test_an_installation_token_has_no_subject_and_is_not_asked_again():
+    """"The budget belongs to the installation", which nothing at run time names —
+    so no subject and no history, rather than a stand-in; and GitHub's refusal is
+    an answer, so the question is not asked on every run."""
+    check = _check()
+    refused = GitHubError("HTTP 403 for /user: Resource not accessible by "
+                          "integration", status=403, fault=Fault.ANSWERED)
+    readings = _measured(check, _resources(core=(5000, 4800), graphql=(5000, 4900)),
+                         user=refused)
+    assert [r.subject for r in readings] == ["", ""]
+    assert all(r.record["account"] is None for r in readings)
+    _result, again = _run(check, _resources(core=(5000, 4800), graphql=(5000, 4900)))
+    assert again.calls == ["/rate_limit"]
+
+
+def test_a_question_github_did_not_answer_is_asked_again_next_run():
+    """A 503 says nothing about whose token it is: this run's readings go without a
+    subject, and the next run asks again and has one."""
+    check = _check()
+    unanswered = GitHubError("HTTP 503 for /user", status=503, fault=Fault.TRANSIENT)
+    first = _measured(check, _resources(core=(5000, 4800), graphql=(5000, 4900)),
+                      user=unanswered)
+    assert [r.subject for r in first] == ["", ""]
+    second = _measured(check, _resources(core=(5000, 4800), graphql=(5000, 4900)))
+    assert second[0].subject == "example-user;resource=core"
+
+
+def test_a_budget_on_another_github_names_its_host():
+    """One login on two GitHubs is two accounts, so off GitHub's own API the host
+    follows — the rule the estate's subject keeps."""
+    readings = _measured(_check(api_url="https://ghe.example.test/api/v3"),
+                         _resources(core=(5000, 4800), graphql=(5000, 4900)))
+    assert readings[0].subject == ("example-user;resource=core;"
+                                   "host=ghe.example.test")
+
+
+def test_a_failed_ask_for_the_budget_names_no_resource_and_no_object():
+    """Nothing was read about any resource, so the one reading is about none."""
+    (reading,) = _measured(_check(), GitHubError(
+        "HTTP 503 for /rate_limit", status=503, fault=Fault.TRANSIENT))
+    assert reading.subject == ""
+
+
+# --- the finished line carries its reading (little-sister ADR-0086 decision 2;
+# ADR-0014 §6) ---------------------------------------------------------------
+# Asserted on the **line** the run writes, not on the measurement: the readings
+# carried their subject all along, and the lines dropped it.
+
+def _finished(check, payload, user=None):
+    fake = FakeClient(payload, user=user)
+    check._make_client = lambda token, deadline=None: fake  # type: ignore[method-assign]
+    readings = measured(check)
+    return readings, run_check(check, measurements=readings)
+
+
+def test_every_line_carries_its_reading_and_its_budget():
+    """`core` from the ledger, `graphql` from the endpoint's row alone: both lines
+    name one account's budget for their resource and carry that reading whole."""
+    import time
+    check = _check()
+    _spent(check, _ON_A, remaining=3932, reset=int(time.time()) + 400)
+    readings, result = _finished(check, _resources(core=(5000, 5000),
+                                                   graphql=(5000, 5000)))
+    core, graphql = result.reason_entries
+    assert core.data["source"] == "ledger" and graphql.data["source"] == "endpoint"
+    assert (core.subject, graphql.subject) == (
+        "example-user;resource=core", "example-user;resource=graphql")
+    assert [core.data, graphql.data] == [dict(r.record) for r in readings]
+
+
+def test_a_line_for_a_resource_github_did_not_report_carries_its_reading_too():
+    """The failed lines are about the same budget a good reading would be, so they
+    carry the subject and the record, whose `source` says what went wrong."""
+    check = _check(budgets=(
+        Budget("core", DEFAULT_WARN_BELOW, DEFAULT_ERROR_BELOW),
+        Budget("search", DEFAULT_WARN_BELOW, DEFAULT_ERROR_BELOW),
+        Budget("graphql", DEFAULT_WARN_BELOW, DEFAULT_ERROR_BELOW)))
+    payload = _resources(core=(5000, 4800))
+    payload["resources"]["graphql"] = ["not", "a", "row"]
+    _readings, result = _finished(check, payload)
+    by_slug = {entry.slug: entry for entry in result.reason_entries}
+    assert by_slug["search"].subject == "example-user;resource=search"
+    assert by_slug["search"].data["source"] == "absent"
+    assert by_slug["graphql"].subject == "example-user;resource=graphql"
+    assert by_slug["graphql"].data["source"] == "shape"
+
+
+def test_an_installation_tokens_lines_name_no_budget_but_keep_the_reading():
+    """No login, so no subject and no history — but what was read is still on the
+    line, which is what the grading was built from."""
+    refused = GitHubError("HTTP 403 for /user: Resource not accessible by "
+                          "integration", status=403, fault=Fault.ANSWERED)
+    _readings, result = _finished(_check(), _resources(core=(5000, 4800),
+                                                       graphql=(5000, 4900)),
+                                  user=refused)
+    assert [entry.subject for entry in result.reason_entries] == ["", ""]
+    assert all(entry.data is not None and entry.data["account"] is None
+               and entry.data["resource"] == entry.slug
+               for entry in result.reason_entries)
+
+
+def test_a_failed_ask_is_still_the_nodes_own_error_with_no_line():
+    """The two node-level paths are untouched: nothing was read about any budget."""
+    result = _run(_check(), GitHubError("HTTP 503 for /rate_limit", status=503,
+                                        fault=Fault.TRANSIENT))[0]
+    assert result.code is StatusCode.ERROR
+    assert result.reason_entries == () or all(
+        entry.data is None for entry in result.reason_entries)
+
+
+def test_the_heaviest_reading_fits_one_record():
+    """Every resource GitHub reports, watched at once, each with the three windows
+    a token has been seen to keep and the longest login GitHub allows: every line's
+    record stays inside the default 2 KB `record_limit`."""
+    import json
+    import time
+    now = int(time.time())
+    names = ("core", "search", "graphql", "integration_manifest",
+             "source_import", "code_scanning_upload", "code_scanning_autofix",
+             "actions_runner_registration", "scim", "dependency_snapshots",
+             "dependency_sbom", "code_search", "audit_log",
+             "audit_log_streaming")
+    check = _check(budgets=tuple(
+        Budget(name, DEFAULT_WARN_BELOW, DEFAULT_ERROR_BELOW) for name in names))
+    for name in names:
+        for offset in (100, 400, 900):
+            _spent(check, f"/{name}/x/{offset}", resource=name,
+                   remaining=4000 - offset, reset=now + offset)
+    login = "x" * 39
+    _readings, result = _finished(
+        check, _resources(**dict.fromkeys(names, (5000, 5000))),
+        user={"login": login, "type": "User"})
+    sizes = [len(json.dumps(entry.data).encode("utf-8"))
+             for entry in result.reason_entries]
+    assert len(sizes) == len(names)
+    assert max(sizes) <= 2048
+
+
+# --- a time is typed, in every reading (little-sister ADR-0082) ----------------
+
+def _sources_written():
+    """Every `source` this type's readings name, read off its source, so a source
+    added there is one the test below has to meet."""
+    found = re.findall(r'\bsource="(\w+)"(?: if [^"\n]* else "(\w+)")?',
+                       inspect.getsource(rate_limit))
+    return {name for pair in found for name in pair if name}
+
+
+def _every_source():
+    """Readings of every source a run can name: the ledger's, with a second
+    window beside the tightest; the endpoint's; a resource GitHub did not report,
+    one in a shape this check cannot read and one without a structural field —
+    and a run whose question went unanswered, and one answered without a
+    `resources` object."""
+    import time
+    now = int(time.time())
+    names = ("core", "graphql", "search", "code_search", "scim")
+    check = _check(budgets=tuple(
+        Budget(name, DEFAULT_WARN_BELOW, DEFAULT_ERROR_BELOW) for name in names))
+    _spent(check, _ON_A, remaining=3932, reset=now + 400)
+    _spent(check, _ON_B, remaining=2441, reset=now + 100)
+    payload = _resources(core=(5000, 2441), graphql=(5000, 5000))
+    payload["resources"]["code_search"] = "not a row"
+    payload["resources"]["scim"] = {"remaining": 1}
+    readings = list(_finished(check, payload)[0])
+    for answer in (GitHubError("HTTP 503 for /rate_limit", status=503,
+                               fault=Fault.TRANSIENT), {}):
+        readings += _finished(_check(), answer)[0]
+    return readings
+
+
+def test_every_time_a_reading_carries_is_typed():
+    """A window's reset — the tightest one's and each other one's — is an
+    instant, and sits under `at`, where little-sister reads one, as every other
+    time a reading carries does. `reset` is named here because GitHub counts it
+    in epoch seconds, a number `record_times` cannot tell from any other count;
+    and every source the type names is among the readings that say so."""
+    readings = _every_source()
+    assert {reading.record["source"] for reading in readings} == _sources_written()
+    resets = [reading.record["reset"] for reading in readings]
+    others = [other["reset"] for reading in readings
+              for other in reading.record["others"] or []]
+    assert others, "a reading with a second window beside the tightest"
+    for reset in [*resets, *others]:
+        assert isinstance(reset, dict) and set(reset) == {"at"}, reset
+    untyped = [path for reading in readings
+               for path, name in record_times(reading.record)
+               if name not in RECORD_TIMESTAMP_KEYS]
+    assert untyped == []
+
+
+def test_a_reset_that_is_not_an_instant_is_null_and_the_run_stands():
+    """A reset in the year 11476, which no ISO-8601 time can hold, and one past
+    anything the platform's clock can count are kept as `null`, as a reset GitHub
+    did not send is: each resource is still read and graded, and its line says
+    nothing about when it resets."""
+    payload = _resources(core=(5000, 4000, 3 * 10**11), graphql=(5000, 5000, 10**20))
+    payload["resources"]["search"] = {"limit": 5000, "remaining": 5000, "used": 0}
+    check = _check(budgets=tuple(
+        Budget(name, DEFAULT_WARN_BELOW, DEFAULT_ERROR_BELOW)
+        for name in ("core", "graphql", "search")))
+    readings, result = _finished(check, payload)
+    for reading in readings:
+        assert reading.record["reset"] == {"at": None}, reading.record["resource"]
+    assert _lines(result) == {
+        "core": (f"core: 4000 of 5000 requests left {_ENDPOINT_SAYS}",
+                 StatusCode.OK),
+        "graphql": (f"graphql: 5000 of 5000 points left {_ENDPOINT_SAYS}",
+                    StatusCode.OK),
+        "search": (f"search: 5000 of 5000 requests left {_ENDPOINT_SAYS}",
+                   StatusCode.OK)}
+
+
+# --- a reset GitHub sends neither ends nor stalls a run (ADR-0007, ADR-0002) ----
+
+#: Window ends GitHub could send that the machine's clock cannot hold: on the
+#: device VM `time.localtime` refuses the first with `OSError` and the other two
+#: with `OverflowError`, and `time.sleep` refuses the waits the first two ask for.
+_UNWRITABLE_RESETS = (10**18, 10**20, -10**20)
+
+#: A window's end as a clock time, the way `_resets_at` writes one beside the minutes.
+_CLOCK_TIME = re.compile(r"\(\d{2}:\d{2}:\d{2}\)")
+
+
+class _Answer:
+    """One HTTP answer as the library's `fetch` reads it off its opener — a status,
+    headers and a body read with `read1` — and a clock to spend while it is read:
+    `midway` runs on the first read, which hands back one byte, and `at_end` on the
+    read that finds the body gone."""
+
+    def __init__(self, body=b"{}", headers=None, *, midway=None, at_end=None):
+        self.status = 200
+        self.url = "https://api.github.com/"
+        self.headers = Message()
+        for name, value in (headers or {}).items():
+            self.headers[name] = value
+        self._body = body
+        self._midway, self._at_end = midway, at_end
+
+    def read1(self, size=-1):
+        if self._midway is not None:
+            self._midway()
+            self._midway = None
+            chunk, self._body = self._body[:1], self._body[1:]
+            return chunk
+        size = len(self._body) if size < 0 else size
+        chunk, self._body = self._body[:size], self._body[size:]
+        if not chunk and self._at_end is not None:
+            self._at_end()
+            self._at_end = None
+        return chunk
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+
+class _GitHub:
+    """Stands in for the opener inside `little_sister.fetch`, so the client the check
+    builds for itself asks through the real request path. Each path answers from
+    `answers` — a callable, since a body is read once and a retry asks again —
+    with an `_Answer`, or an `HTTPError`, which is how a refusal arrives."""
+
+    def __init__(self, answers):
+        self.answers = answers
+        self.paths = []
+
+    def open(self, request, timeout=None):
+        path = urllib.parse.urlsplit(request.full_url).path
+        self.paths.append(path)
+        answer = self.answers[path]()
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+
+class _Clock:
+    """A hand-wound monotonic clock, so a run's budget is spent without waiting."""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+def _budget_headers(remaining, reset, *, limit=5000):
+    return {"x-ratelimit-limit": str(limit),
+            "x-ratelimit-remaining": str(remaining),
+            "x-ratelimit-used": str(limit - remaining),
+            "x-ratelimit-reset": str(reset),
+            "x-ratelimit-resource": "core"}
+
+
+def _account(headers=None, **spend):
+    """`GET /user`, answered for a personal access token."""
+    return _Answer(json.dumps({"login": "example-user"}).encode(), headers, **spend)
+
+
+def _budget(payload, headers=None):
+    """`GET /rate_limit`, answered with ``payload``."""
+    return _Answer(json.dumps(payload).encode(), headers)
+
+
+def _throttled(reset):
+    """`GET /user` refused on an exhausted window: a 403 with
+    `x-ratelimit-remaining: 0` and the window's reset, which is how GitHub asks to be
+    left alone until then (ADR-0002 §2)."""
+    headers = Message()
+    for name, value in _budget_headers(0, reset).items():
+        headers[name] = value
+    return urllib.error.HTTPError(
+        "https://api.github.com/user", 403, "rate limit exceeded", headers,
+        io.BytesIO(b'{"message": "API rate limit exceeded"}'))
+
+
+def _sleeps(check):
+    """What the client the check builds for itself sleeps — recorded, never taken, so
+    a run that waits GitHub's hour out fails the test rather than stalling it."""
+    slept = []
+    made = check._make_client
+
+    def recording(*args, **kwargs):
+        client = made(*args, **kwargs)
+        client._sleep = slept.append
+        return client
+    check._make_client = recording                  # type: ignore[method-assign]
+    return slept
+
+
+def _package_lines(caplog):
+    """Every message this package logged, the client's and the check's."""
+    return [record.getMessage() for record in caplog.records
+            if record.name.startswith("little_sister_github")]
+
+
+@pytest.mark.parametrize("reset", _UNWRITABLE_RESETS)
+def test_a_reset_no_clock_can_write_costs_a_budget_run_its_clock_time_and_nothing_else(
+        reset, monkeypatch, caplog):
+    """ADR-0007 decision 5, for this type: the account lookup and the
+    `/rate_limit` read, through the check's own client, both say the window ends at
+    `reset` with spend on it — the headers and the body's row alike — so the first
+    sight of it writes its line, and the run's own line carries what the headers
+    said (`budget_said`). The run finishes with a reading per watched resource, and
+    every line naming the window says how long it has left and no clock time."""
+    monkeypatch.setenv("GITHUB_TOKEN", "x")
+    caplog.set_level(logging.INFO)
+    headers = _budget_headers(4000, reset)
+    rows = _resources(core=(5000, 4000, reset), graphql=(5000, 5000, reset))
+    github = _GitHub({"/user": lambda: _account(headers),
+                      "/rate_limit": lambda: _budget(rows, headers)})
+    with mock.patch.object(ls_fetch, "_FOLLOWING", github):
+        readings = measured(_check())
+    assert [(reading.record["resource"], reading.record["remaining"])
+            for reading in readings] == [("core", 4000), ("graphql", 5000)]
+    named = [line for line in _package_lines(caplog)
+             if "resets in" in line or "resetting now" in line]
+    assert any(": first reading of the core window, " in line for line in named)
+    assert any("| that response's own headers: core: 4000 of 5000 left, 1000 used, "
+               in line for line in named)
+    clause = "resetting now" if reset < 0 else "resets in "
+    assert [line for line in named
+            if clause not in line or _CLOCK_TIME.search(line)] == []
+
+
+def test_a_throttled_account_lookup_is_not_waited_out(monkeypatch):
+    """ADR-0002 §1: this type's `timeout:` is the whole run's budget, as the
+    `github` type's is. `GET /user` refused on an exhausted window whose reset is an
+    hour away asks for an hour's wait, which a run of 30 seconds cannot afford — so
+    the run sleeps not at all, reads `/rate_limit`, and reports the budget."""
+    import time
+    monkeypatch.setenv("GITHUB_TOKEN", "x")
+    reset = int(time.time()) + _ONE_HOUR
+    github = _GitHub({"/user": lambda: _throttled(reset),
+                      "/rate_limit": lambda: _budget(_resources(
+                          core=(5000, 0, reset), graphql=(5000, 5000)))})
+    check = _check()
+    slept = _sleeps(check)
+    with mock.patch.object(ls_fetch, "_FOLLOWING", github):
+        readings = measured(check)
+    assert slept == []
+    assert github.paths == ["/user", "/rate_limit"]
+    assert [(reading.record["resource"], reading.record["remaining"])
+            for reading in readings] == [("core", 0), ("graphql", 5000)]
+
+
+@pytest.mark.parametrize("reset", _UNWRITABLE_RESETS)
+def test_a_throttled_lookup_whose_reset_no_clock_holds_costs_the_run_nothing(
+        reset, monkeypatch):
+    """The same lookup with a reset no clock can hold: its headers name a window no
+    clock time can be written for, and it asks for a wait `time.sleep` refuses by
+    raising, or for none at all. None of it ends the run, which reads `/rate_limit`
+    and reports each watched budget — the window the refusal named among them while
+    it lasts, which is the tightest."""
+    monkeypatch.setenv("GITHUB_TOKEN", "x")
+    github = _GitHub({"/user": lambda: _throttled(reset),
+                      "/rate_limit": lambda: _budget(_resources(
+                          core=(5000, 4000), graphql=(5000, 5000)))})
+    with mock.patch.object(ls_fetch, "_FOLLOWING", github):
+        readings = measured(_check())
+    assert github.paths[-1] == "/rate_limit"
+    assert [(reading.record["resource"], reading.record["remaining"])
+            for reading in readings] == [
+        ("core", 4000 if reset < 0 else 0), ("graphql", 5000)]
+
+
+def test_a_run_whose_budget_runs_out_before_the_budget_read_is_unanswered(monkeypatch):
+    """ADR-0002 §1: the account lookup answers as the run's `timeout:` runs
+    out, so the `/rate_limit` read after it finds nothing left of the run and is never
+    asked — the run is the one `unanswered` reading a question GitHub did not answer
+    is, and nothing leaves `measure()`."""
+    monkeypatch.setenv("GITHUB_TOKEN", "x")
+    clock = _Clock()
+    check = _check()
+    check._new_deadline = lambda: Deadline(30.0, clock=clock)  # type: ignore[method-assign]
+    github = _GitHub({"/user": lambda: _account(at_end=lambda: clock.advance(31.0)),
+                      "/rate_limit": lambda: _budget(_resources(
+                          core=(5000, 4000), graphql=(5000, 5000)))})
+    with mock.patch.object(ls_fetch, "_FOLLOWING", github):
+        (reading,) = measured(check)
+    assert reading.record["source"] == "unanswered"
+    assert "budget of 30s ran out" in reading.record["error"]
+    assert github.paths == ["/user"]
+
+
+def test_a_lookup_the_budget_runs_out_in_is_asked_again_next_run(monkeypatch):
+    """ADR-0002 §1: a lookup the run's budget runs out in — here while its
+    answer is still arriving — leaves the question open, as one GitHub did not
+    answer does: the run is the `unanswered` reading, and the next run asks
+    `GET /user` again, and its readings name the account."""
+    monkeypatch.setenv("GITHUB_TOKEN", "x")
+    clock = _Clock()
+    check = _check()
+    check._new_deadline = lambda: Deadline(30.0, clock=clock)  # type: ignore[method-assign]
+    rows = _resources(core=(5000, 4000), graphql=(5000, 5000))
+    github = _GitHub({"/user": lambda: _account(midway=lambda: clock.advance(31.0)),
+                      "/rate_limit": lambda: _budget(rows)})
+    with mock.patch.object(ls_fetch, "_FOLLOWING", github):
+        (spent,) = measured(check)
+        github.answers["/user"] = _account
+        again = measured(check)
+    assert spent.record["source"] == "unanswered"
+    assert github.paths == ["/user", "/user", "/rate_limit"]
+    assert [reading.subject for reading in again] == [
+        "example-user;resource=core", "example-user;resource=graphql"]

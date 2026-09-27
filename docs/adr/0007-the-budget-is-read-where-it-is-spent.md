@@ -1,7 +1,7 @@
 # ADR-0007 — The budget is read where it is spent, and there is more than one of it
 
 - **Status:** Accepted
-- **Date:** 2026-09-20 (accepted 2026-09-13)
+- **Date:** 2026-09-27 (accepted 2026-09-13)
 - **Related:** [ADR-0001](0001-a-second-check-type-in-this-package.md) (the budget is
   the token's and a type of its own — this record keeps that and corrects what it says
   about `core` and about the guard), [ADR-0002](0002-a-read-failure-is-not-a-finding.md)
@@ -10,7 +10,9 @@
   is charged to a different counter than the read it replaced), little-sister ADR-0042
   (an entry carries its own code), little-sister ADR-0050 (a slug is an identifier,
   never a position), little-sister ADR-0058 (one transport policy; the sleep this record
-  names is the library's)
+  names is the library's), [ADR-0014](0014-a-run-is-its-readings-and-the-estate-is-its-object.md)
+  (a reset the record keeps as `null`), [ADR-0015](0015-a-workflow-line-holds-the-newest-run-it-has-read.md)
+  (the held runs read by id, which the guard does not price)
 
 A bare ADR number here is this repository's; a reference to one of little-sister's
 is always written out, because the two numbering spaces overlap.
@@ -230,6 +232,11 @@ without a response reports the previous aspect's headers as its own, because
    repositories sits under the window's hundred, and if it ever bites, a window's period
    is the difference between two successive resets on one path, which the ledger sees.
 
+   One kind of read the `actions` aspect makes is not priced at all: a held run read by
+   id when an answer goes back on it
+   ([ADR-0015](0015-a-workflow-line-holds-the-newest-run-it-has-read.md) §3). Those are
+   bounded by the lines held, and a repeat is a `304`, which GitHub does not charge.
+
 4. **A pause is named by its cause.** The client keeps two totals instead of one: the
    seconds it slept because GitHub **asked** — a `retry-after`, or `x-ratelimit-remaining:
    0` with a reset, the throttle path of [ADR-0002](0002-a-read-failure-is-not-a-finding.md)
@@ -249,6 +256,14 @@ without a response reports the previous aspect's headers as its own, because
    minutes — `resets in 34min (21:50:07)` — so two lines about two windows read as two
    windows, which `resets in Nmin` alone cannot show; the node keeps the minutes, since
    a reader there wants the wait.
+
+   The clock time is written where the machine's clock can write it, and nowhere else. A
+   window's end past what the platform's `time_t` holds — an epoch `time.localtime`
+   refuses with `OverflowError` or `OSError` — would raise out of the line naming it, and
+   every such line is written while measuring, so one `x-ratelimit-reset` like it would
+   end a run of either type. Where the time cannot be written, the line keeps the
+   minutes alone, `resets in …min` or `resetting now`, and the record keeps such a reset
+   as `null` ([ADR-0014](0014-a-run-is-its-readings-and-the-estate-is-its-object.md) §8).
 
 ## Consequences
 

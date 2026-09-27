@@ -4,7 +4,7 @@
   `code_scanning_alerts` having become `code_scanning_security` and
   `code_scanning_quality` ([ADR-0006](0006-code-scanning-has-two-scales.md)), and
   every count below reads accordingly
-- **Date:** 2026-09-20 (accepted 2026-08-15)
+- **Date:** 2026-09-27 (accepted 2026-08-15)
 - **Related:** [ADR-0001](0001-a-second-check-type-in-this-package.md) (which
   applied the *wording* half of this — "could not ask" — to `github-rate-limit`,
   and named this type's grading half as the question this record answers),
@@ -63,6 +63,15 @@ A request's socket timeout is **clamped to what is left of the run**. Without th
 clamp a 15-second request could start with two seconds of budget left and overrun
 `timeout:` by thirteen, which would make the deadline a suggestion rather than a
 bound.
+
+**`github-rate-limit` spends `timeout:` the same way**: as the whole run's deadline,
+checked before every request and held against every wait — and, having no
+`request_timeout:`, still as each request's limit, clamped to what is left of the run.
+Nothing more is configurable for it. A wait the run cannot afford — a throttle on
+either of its reads, up to an hour on an exhausted window, or a reset no clock holds,
+which `time.sleep` refuses by raising — is refused rather than slept, and a run whose
+budget runs out reads as a question GitHub did not answer: the account lookup is asked
+again next run, and the `/rate_limit` read is the `unanswered` reading.
 
 This is the shape the library already arrived at in its link prober — and its module
 docstring puts the reason more sharply than this record can: a pass carries a

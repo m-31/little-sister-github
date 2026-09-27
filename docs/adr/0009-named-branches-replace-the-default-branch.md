@@ -1,12 +1,14 @@
 # ADR-0009 — Named branches replace the default branch
 
 - **Status:** Accepted
-- **Date:** 2026-09-19
+- **Date:** 2026-09-27 (accepted 2026-09-19)
 - **Related:** [ADR-0005](0005-the-actions-aspect-asks-per-workflow.md) (the read this
   extends, and the construction it rests on — this record adds a third mode and changes
   nothing ADR-0005 decided), [ADR-0007](0007-the-budget-is-read-where-it-is-spent.md)
   (the guard, which this multiplies), [ADR-0002](0002-a-read-failure-is-not-a-finding.md)
-  (why the line this adds is not a coverage line)
+  (why the line this adds is not a coverage line),
+  [ADR-0015](0015-a-workflow-line-holds-the-newest-run-it-has-read.md) (the held run
+  that keeps that line silent)
 
 A bare ADR number here is this repository's; a reference to one of little-sister's
 is always written out, because the two numbering spaces overlap.
@@ -65,7 +67,11 @@ a read cannot support. The default branch is on the line because it costs nothin
 discovery already carries it — and because `main` against `master` is what this nearly
 always is. The line fires only when **no** named branch produced anything in that
 repository, so an estate where half the repositories have an idle `release` branch says
-nothing as long as another name answered.
+nothing as long as another name answered. *Nothing back* means no run on a named branch
+only where the check holds none there: an answer that goes back on a held run is checked
+by reading that run by id, and one GitHub still has is a run on that branch, so the line
+stays silent while it holds
+([ADR-0015](0015-a-workflow-line-holds-the-newest-run-it-has-read.md) §6).
 
 **Only an exact read may raise that line.** Where the budget degrades a repository to
 the wide page, no row on a named branch is as likely to be the page's cut as the

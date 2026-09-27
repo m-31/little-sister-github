@@ -24,7 +24,7 @@ is [`docs/decisions.md`](docs/decisions.md) and the records in
 
 ## The contract
 
-- **Requires** `little-sister >= 0.3.13` — a floor, never a pin.
+- **Requires** `little-sister >= 0.3.18` — a floor, never a pin.
 - **Runs on** Python **3.11 or newer** — the library's floor, not a higher
   one of its own.
 - **Registers** two check types: **`github`** and **`github-rate-limit`**. One
@@ -38,14 +38,14 @@ is [`docs/decisions.md`](docs/decisions.md) and the records in
 # Pin them. A deployment names exact versions so an upgrade is a deliberate edit
 # rather than drift; a plugin is the one that declares a floor, because two plugins
 # that each pinned could not be installed together.
-dependencies = ["little-sister==0.3.17", "little-sister-github==0.1.8"]
+dependencies = ["little-sister==0.3.18", "little-sister-github==0.1.9"]
 ```
 
 ```python
-# wsgi.py — registrations first, the app last. The order is load-bearing:
-# importing little_sister.app builds the engine and loads the check configs, so
-# every check type must already be registered. `isort: off` keeps an import
-# sorter from quietly reversing that.
+# wsgi.py — registrations first, the app last. The order is load-bearing: the
+# server's start, right after little_sister.app is imported, builds the engine from
+# the check configs, so every check type must already be registered. `isort: off`
+# keeps an import sorter from quietly reversing that.
 # isort: off
 import little_sister_github          # noqa: F401  registers both check types
 from little_sister.app import app
@@ -163,7 +163,7 @@ so it works the same way for every branch check type you install.
 | `code_scanning_quality` | *(the same read)* | everything else, by the rule's own **analysis** severity: `error` / `warning` / `note`, graded by `code_scanning_quality.severity_map` (**WARN** / **WARN** / **OK** by default) |
 | `secret_scanning_alerts` | `GET /repos/{r}/secret-scanning/alerts?state=open` | any open alert → **ERROR**; scanning disabled → **ERROR** (`secret_scanning.require_enabled`) |
 | `sbom_check` | `POST /graphql` — `repository(owner:, name:) { dependencyGraphManifests(first: 10) { totalCount nodes { filename parseable exceedsMaxSize } } }`, one query per repository, one point each | no dependency graph → **ERROR** (`platform-api: no dependency graph (0 manifests)`); manifests none of which could be parsed → **ERROR**, with the cause on the line (`platform-api: 2 manifests, none parseable (package-lock.json exceeds the size limit)`); more than ten manifests is a graph whatever the first ten say (`sbom_check.ignore`; [ADR-0008](docs/adr/0008-the-dependency-graph-is-asked-not-exported.md)) |
-| `actions` | `GET /repos/{r}/actions/workflows` + `…/actions/workflows/{id}/runs` per workflow and branch | one coded line per workflow and branch **that has something to say**: the newest useful verdict, plus a newer in-flight run (the default branch, or the branches `actions.branches` names, or every branch with `actions.all_branches`; a passing idle workflow only with `actions.show_healthy`). Asking per workflow is exact — nothing back means that workflow does not run on that branch. `actions.all_branches` and a budget too thin to pay per workflow fall back to one page of `…/actions/runs`, and one WARN line then names the repositories the answer was short about; where the named branches matched no workflow in a repository, another names it and its default branch ([ADR-0005](docs/adr/0005-the-actions-aspect-asks-per-workflow.md), [ADR-0009](docs/adr/0009-named-branches-replace-the-default-branch.md)) |
+| `actions` | `GET /repos/{r}/actions/workflows` + `…/actions/workflows/{id}/runs` per workflow and branch, and `…/actions/runs/{id}` for a held run an answer went back on | one coded line per workflow and branch **that has something to say**: the newest useful verdict, plus a newer in-flight run (the default branch, or the branches `actions.branches` names, or every branch with `actions.all_branches`; a passing idle workflow only with `actions.show_healthy`). Asking per workflow is exact as a question, and GitHub's answer is checked: each is sorted by run id, and the newest completed run a line has read is held, so an answer that goes back on it is checked by reading that run by id — one `INFO` line in the log each time — and nothing back means that workflow does not run on that branch only where nothing is held. A line is named after its workflow, as the workflow list names it ([ADR-0015](docs/adr/0015-a-workflow-line-holds-the-newest-run-it-has-read.md)). `actions.all_branches` and a budget too thin to pay per workflow fall back to one page of `…/actions/runs`, and one WARN line then names the repositories the answer was short about; where the named branches matched no workflow in a repository, another names it and its default branch ([ADR-0005](docs/adr/0005-the-actions-aspect-asks-per-workflow.md), [ADR-0009](docs/adr/0009-named-branches-replace-the-default-branch.md)) |
 | `issues` | `GET /repos/{r}/issues?state=open` | any open issue → **WARN** (`issues.ignore`); issues disabled → **WARN** |
 
 Discovery is one call verifying the declared kind — plus, for a personal account,
@@ -210,7 +210,7 @@ check writes nothing.
 | `sbom_check` — the dependency graph | `repo` | *Contents* (read) |
 | `actions` | `repo` | *Actions* (read) |
 | `issues` | `repo` | *Issues* (read) |
-| `github-rate-limit` — `GET /rate_limit` | none | none |
+| `github-rate-limit` — `GET /rate_limit`, and `GET /user` once per process | none | none |
 
 A token that may not read something answers `401` or `403`, and the check reports that
 as a fact about the repository rather than as a failure of the run; a token that may
@@ -263,7 +263,12 @@ credential and not to an account — the argument is
 [ADR-0001](docs/adr/0001-a-second-check-type-in-this-package.md). Reading
 `GET /rate_limit` does not count against the budget it reports, so this check can
 run every minute beside a `github` check that runs every fifteen, and it keeps
-reporting through the runs the `github` check skips for want of budget.
+reporting through the runs the `github` check skips for want of budget. Its first run
+also asks `GET /user` whose token it is — one `core` request per process — so that
+each budget's reading names the account it belongs to; an installation token is not
+a user, GitHub refuses it there, and its readings name none. `timeout:` is the **whole
+run's** budget here too, as in `github`, and each request's limit as well; a rate-limit
+wait the run cannot afford is not waited out, and the node says it could not ask.
 
 ```yaml
 type: github-rate-limit
@@ -329,22 +334,24 @@ per token, not per team.
 ## Develop
 
 little-sister is declared as a **floor** — the release that promised the surface
-this package imports — and it resolves **from the index**, like any other
-dependency. There is no `[tool.uv.sources]` table here, and the committed
-`uv.lock` is what a release runs against. To work against a local library
-checkout, add the redirect and **do not commit it**: uv reads the sources table of
-a dependency it resolves from a path or a checkout, so a committed line would
-follow this package into every deployment that installs it.
+this package imports — and a release resolves it **from the index**, like any
+other dependency: a released tree carries no `[tool.uv.sources]` table, and its
+`uv.lock` names the index. Working against a library that is not on the index yet
+takes a redirect to the checkout beside this one:
 
 ```toml
-# pyproject.toml — locally, never committed
+# pyproject.toml — while the library is unreleased, and never in a release
 [tool.uv.sources]
-little-sister = { git = "file:///path/to/little-sister" }
+little-sister = { path = "../little-sister", editable = true }
 ```
 
-Restore `uv.lock` with it. The next `uv run` — the pre-commit gate is one — rewrites
-the lock to `source = { directory = … }`, so a redirect kept out of `pyproject.toml`
-can still reach a commit through the lock beside it.
+The redirect leaves a second trace by itself — the next `uv run`, and the pre-commit
+gate is one, rewrites `uv.lock` to name the directory — and the two go together:
+while the library is unreleased both may be committed, and neither may reach a
+release. uv reads the sources table of a dependency it resolves from a path or a
+checkout, so a released one would be imposed on every deployment that installs this
+package that way; an install from the index is unaffected. The comment on the sources
+table in `pyproject.toml` says what the window costs.
 
 ```bash
 uv sync

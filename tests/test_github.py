@@ -2,17 +2,29 @@
 from __future__ import annotations
 
 import contextlib
+import inspect
+import json
 import logging
 import re
+import urllib.parse
 from email.message import Message
 from unittest import mock
 
 import pytest
 from little_sister import fetch as ls_fetch
-from little_sister.checks import CheckError
+from little_sister.checks import CheckError, Measurement
 from little_sister.fetch import Response
+from little_sister.reasons import MAX_SUBJECT_LENGTH, RECORD_TIMESTAMP_KEYS, slug
 from little_sister.status import StatusCode
 from little_sister.transport import Deadline, DeadlineExceeded, Fault
+from running import (
+    aspect_readings,
+    measured,
+    record_times,
+    run_aspect,
+    run_check,
+    unreachable,
+)
 
 from little_sister_github import github as mod_github
 from little_sister_github.budget import Ledger, ledger
@@ -109,6 +121,10 @@ class FakeClient:
         # requests, so it is zero unless a test about the cache sets it — the
         # report line subtracts it from `reads_made` to say what a run spent.
         self.free_reads = 0
+        # What the real client says of the answer it last handed back: GitHub's
+        # `200`, or the cache's answer to a `304`. The double has no cache, so every
+        # answer it gives is fresh.
+        self.last_status = 200
         # The rest of what the real client counts for the run's trace. The timings
         # have no meaning in a double — nothing here takes time — and a test that
         # wants the summary sentence sets them the way it sets `paused_seconds`.
@@ -226,6 +242,18 @@ class FakeClient:
                     and (branch is None or row.get("head_branch") == branch)]
             return {"total_count": len(rows),
                     "workflow_runs": rows[:(params or {}).get("per_page", 100)]}
+        if "/actions/runs/" in path:
+            # `/repos/<full>/actions/runs/<id>` — one run read by id, answered from
+            # the same fixture: the row with that id, or GitHub's `404` for a run it
+            # does not have.
+            head, _, run_id = path.partition("/actions/runs/")
+            value = self._runs.get(head[len("/repos/"):], {"workflow_runs": []})
+            if isinstance(value, GitHubError):
+                raise value
+            for row in value.get("workflow_runs") or []:
+                if str(row.get("id")) == run_id:
+                    return row
+            raise _answered(f"no run {run_id}", 404)
         if path.endswith("/actions/runs"):
             full = path[len("/repos/"):-len("/actions/runs")]
             value = self._runs.get(full, {"workflow_runs": []})
@@ -321,10 +349,12 @@ def _repos(*names, **kw):
 
 def _wf_run(name="ci", branch="main", status="completed", conclusion="success",
             wf_id=1, url="https://gh/run/1", run_number=1,
-            started=None, updated=None):
+            started=None, updated=None, run_id=None, attempt=None):
     """One `/actions/runs` row. `started` / `updated` are left out unless a test
     asks for them, which is also the shape GitHub answers with for a run that has
-    not begun — the record has to carry that absence as an absence."""
+    not begun — the record has to carry that absence as an absence. `run_id` and
+    `attempt` are left out the same way: GitHub always sends both, and a test that
+    is not about which run a reading is of does not have to invent them."""
     row = {"name": name, "head_branch": branch, "status": status,
            "conclusion": conclusion, "workflow_id": wf_id, "html_url": url,
            "run_number": run_number}
@@ -332,6 +362,10 @@ def _wf_run(name="ci", branch="main", status="completed", conclusion="success",
         row["run_started_at"] = started
     if updated is not None:
         row["updated_at"] = updated
+    if run_id is not None:
+        row["id"] = run_id
+    if attempt is not None:
+        row["run_attempt"] = attempt
     return row
 
 
@@ -451,20 +485,21 @@ def test_a_narrower_scope_is_said_on_the_node_not_only_in_the_log():
     check = _check(owner="m-31", kind="user", team="", name_prefix="")
     repos = check._discover(FakeClient([_repo("little-sister")], owner_type="User",
                                        auth_login="somebody-else"))
-    code, reason = check._scope_reading(repos)
+    code, reason = check._scope_reading(len(repos), check._sees_private)
     assert code is StatusCode.OK
     assert reason == "1 repository in scope (public only)"
 
     own = _check(owner="m-31", kind="user", team="", name_prefix="")
     own_repos = own._discover(FakeClient([_repo("little-sister")],
                                          owner_type="User", auth_login="m-31"))
-    assert own._scope_reading(own_repos)[1] == "1 repository in scope"
+    assert own._scope_reading(len(own_repos),
+                              own._sees_private)[1] == "1 repository in scope"
 
 
 def test_an_empty_user_scope_names_the_account_kind():
     check = _check(owner="m-31", kind="user", team="", name_prefix="")
     repos = check._discover(FakeClient([], owner_type="User", auth_login="m-31"))
-    assert check._scope_reading(repos) == (
+    assert check._scope_reading(len(repos), check._sees_private) == (
         StatusCode.WARN, "no repositories in scope (user m-31)")
 
 
@@ -523,7 +558,7 @@ def test_a_failed_discovery_is_one_error_on_the_check(monkeypatch):
     fake = FakeClient([], owner_type=_answered(
         "HTTP 404 for https://api.github.com/users/m-31", 404))
     monkeypatch.setattr(check, "_make_client", lambda token, deadline=None: fake)
-    result = check.run()
+    result = run_check(check)
     assert result.stored_code is StatusCode.ERROR
     assert result.reason_texts[0].startswith("discovery failed: HTTP 404")
 
@@ -539,7 +574,7 @@ def test_a_transient_discovery_failure_keeps_every_aspect(monkeypatch):
                    token_ref="env://GITHUB_TOKEN")
     fake = FakeClient([], owner_type=_transient("HTTP 503 for /users/m-31"))
     monkeypatch.setattr(check, "_make_client", lambda token, deadline=None: fake)
-    result = check.run()
+    result = run_check(check)
     assert result.stored_code is StatusCode.WARN
     assert result.children == ()
     assert result.reason_texts[0].startswith(
@@ -556,7 +591,7 @@ def test_a_discovery_failure_github_answered_is_still_a_defect(monkeypatch):
                    token_ref="env://GITHUB_TOKEN")
     fake = FakeClient([], owner_type=_answered("HTTP 401 for /users/m-31", 401))
     monkeypatch.setattr(check, "_make_client", lambda token, deadline=None: fake)
-    result = check.run()
+    result = run_check(check)
     assert result.stored_code is StatusCode.ERROR
     assert result.reason_texts[0].startswith("discovery failed: HTTP 401")
 
@@ -569,7 +604,7 @@ def test_a_refused_repository_alone_adds_no_coverage_line():
     repos = _repos("platform-a", "platform-b")
     fake = FakeClient([_repo("platform-a"), _repo("platform-b")],
                       graphs={"example-org/platform-a": "FORBIDDEN"})
-    result = check._sbom_check(fake, repos)
+    result = run_aspect(check, "sbom_check", fake, repos)
     assert not [e for e in result.reason_entries if e.slug == "read"]
     note = next(e for e in result.reason_entries if e.slug.endswith("unreadable"))
     assert note.code is StatusCode.WARN
@@ -583,7 +618,7 @@ def test_a_user_account_runs_every_aspect(monkeypatch):
     fake = FakeClient([_repo("little-sister")], owner_type="User",
                       auth_login="m-31")
     monkeypatch.setattr(check, "_make_client", lambda token, deadline=None: fake)
-    result = check.run()
+    result = run_check(check)
     assert {child.name for child in result.children} == set(check.ASPECTS)
 
 
@@ -646,13 +681,13 @@ def test_an_aspect_can_be_switched_off(monkeypatch):
     on = _check(team="", name_prefix="", token_ref="env://GITHUB_TOKEN")
     fake_on = FakeClient([_repo("platform-a")])
     monkeypatch.setattr(on, "_make_client", lambda token, deadline=None: fake_on)
-    before = {child.name for child in on.run().children}
+    before = {child.name for child in run_check(on).children}
 
     off = _check(team="", name_prefix="", token_ref="env://GITHUB_TOKEN",
                  disabled_aspects=("secret_scanning_alerts", "sbom_check"))
     fake_off = FakeClient([_repo("platform-a")])
     monkeypatch.setattr(off, "_make_client", lambda token, deadline=None: fake_off)
-    after = {child.name for child in off.run().children}
+    after = {child.name for child in run_check(off).children}
 
     assert before - after == {"secret_scanning_alerts", "sbom_check"}
     assert "secret_scanning_alerts" not in after
@@ -676,14 +711,14 @@ def test_a_switched_off_aspect_shrinks_the_rate_estimate(monkeypatch):
     monkeypatch.setattr(
         on, "_make_client",
         lambda token, deadline=None: FakeClient(repos, rate=(5000, 120, 0)))
-    assert on.run().stored_code is StatusCode.WARN          # skipped: 120 < 140
+    assert run_check(on).stored_code is StatusCode.WARN          # skipped: 120 < 140
 
     off = _check(team="", name_prefix="", token_ref="env://GITHUB_TOKEN",
                  disabled_aspects=("issues", "actions"))
     monkeypatch.setattr(
         off, "_make_client",
         lambda token, deadline=None: FakeClient(repos, rate=(5000, 120, 0)))
-    result = off.run()
+    result = run_check(off)
     assert result.stored_code is StatusCode.OK             # ran: 120 > 100
     assert len(result.children) == 6
 
@@ -784,11 +819,12 @@ def test_a_private_repository_is_dropped_from_the_two_scanning_aspects():
 
     watched = _check(team="", name_prefix="", advanced_security_on_private=True)
     fake_on = FakeClient(repos)
-    watched._secret_scanning_alerts(fake_on, watched._discover(fake_on))
+    run_aspect(watched, "secret_scanning_alerts", fake_on, watched._discover(fake_on))
 
     paid_off = _check(team="", name_prefix="", advanced_security_on_private=False)
     fake_off = FakeClient(repos)
-    result = paid_off._secret_scanning_alerts(fake_off, paid_off._discover(fake_off))
+    result = run_aspect(paid_off, "secret_scanning_alerts",
+                        fake_off, paid_off._discover(fake_off))
 
     read_on = [c for c in fake_on.calls if "/secret-scanning/" in c]
     read_off = [c for c in fake_off.calls if "/secret-scanning/" in c]
@@ -806,13 +842,13 @@ def test_the_dropped_private_repositories_are_named_on_the_node():
     check = _check(team="", name_prefix="", advanced_security_on_private=False)
     fake = FakeClient(repos)
     discovered = check._discover(fake)
-    for result in (check._secret_scanning_alerts(fake, discovered),
-                   check._code_scanning_security(fake, discovered)):
+    for result in (run_aspect(check, "secret_scanning_alerts", fake, discovered),
+                   run_aspect(check, "code_scanning_security", fake, discovered)):
         assert "2 private repositories not read" in result.report
         assert "private-thing" in result.report and "private-other" in result.report
     # nothing to say when nothing was dropped
     on = _check(team="", name_prefix="", advanced_security_on_private=True)
-    assert on._secret_scanning_alerts(fake, discovered).report == ""
+    assert run_aspect(on, "secret_scanning_alerts", fake, discovered).report == ""
 
 
 def test_the_other_aspects_still_read_every_private_repository():
@@ -822,9 +858,9 @@ def test_the_other_aspects_still_read_every_private_repository():
     check = _check(team="", name_prefix="", advanced_security_on_private=False)
     fake = FakeClient(repos)
     discovered = check._discover(fake)
-    check._security_advisories(fake, discovered)
-    check._issues(fake, discovered)
-    check._pull_requests(fake, discovered)
+    run_aspect(check, "security_advisories", fake, discovered)
+    run_aspect(check, "issues", fake, discovered)
+    run_aspect(check, "pull_requests", fake, discovered)
     for suffix in ("/dependabot/alerts", "/issues", "/pulls"):
         assert f"/repos/example-org/private-thing{suffix}" in fake.calls
 
@@ -849,7 +885,7 @@ def test_pull_requests_warn_and_ignore_prefix():
             ("example-org/platform-b", "pulls"): [],
         },
     )
-    result = check._pull_requests(fake, check._discover(fake))
+    result = run_aspect(check, "pull_requests", fake, check._discover(fake))
     assert result.name == "pull_requests"
     assert result.stored_code is StatusCode.WARN
     assert len(result.reason_texts) == 1
@@ -861,7 +897,7 @@ def test_pull_requests_ok_when_none():
     check = _check()
     fake = FakeClient([_repo("platform-a")],
                       data={("example-org/platform-a", "pulls"): []})
-    result = check._pull_requests(fake, check._discover(fake))
+    result = run_aspect(check, "pull_requests", fake, check._discover(fake))
     assert result.stored_code is StatusCode.OK
     assert result.reason_texts == []
 
@@ -878,7 +914,7 @@ def test_dependabot_high_is_error_and_filters_severity():
             {"security_advisory": {"severity": "low", "summary": "minor"}},
         ]},
     )
-    result = check._security_advisories(fake, check._discover(fake))
+    result = run_aspect(check, "security_advisories", fake, check._discover(fake))
     assert result.name == "security_advisories"
     bands = {child.name: child for child in result.children}
     assert result.stored_code is StatusCode.OK
@@ -899,7 +935,7 @@ def test_dependabot_medium_only_is_warn():
             {"security_advisory": {"severity": "medium", "summary": "m"}},
         ]},
     )
-    result = check._security_advisories(fake, check._discover(fake))
+    result = run_aspect(check, "security_advisories", fake, check._discover(fake))
     medium = next(child for child in result.children if child.name == "medium")
     assert medium.stored_code is StatusCode.WARN
 
@@ -911,7 +947,7 @@ def test_dependabot_404_skipped_but_403_surfaced():
         ("example-org/platform-a", "dependabot"): _answered("not found", 404),
         ("example-org/platform-b", "dependabot"): _answered("forbidden", 403),
     })
-    result = check._security_advisories(fake, repos)
+    result = run_aspect(check, "security_advisories", fake, repos)
     assert result.stored_code is StatusCode.WARN
     assert any("platform-b" in m for m in result.reason_texts)
     assert not any("platform-a" in m for m in result.reason_texts)
@@ -929,7 +965,7 @@ def test_code_scanning_any_alert_is_error():
              "html_url": "https://gh/codescan/1"},
         ]},
     )
-    result = check._code_scanning_security(fake, check._discover(fake))
+    result = run_aspect(check, "code_scanning_security", fake, check._discover(fake))
     high = next(child for child in result.children if child.name == "high")
     assert result.stored_code is StatusCode.OK
     assert high.stored_code is StatusCode.ERROR
@@ -943,7 +979,7 @@ def test_code_scanning_not_enabled_is_ok():
     fake = FakeClient(repos, errors={
         ("example-org/platform-a", "code_scanning"):
             _answered("no analysis", 404)})
-    result = check._code_scanning_security(fake, repos)
+    result = run_aspect(check, "code_scanning_security", fake, repos)
     assert result.stored_code is StatusCode.OK
     assert result.reason_texts == []
     assert result.children
@@ -966,8 +1002,8 @@ def test_each_security_aspect_has_its_own_configurable_severity_map():
                           "description": "minor"}}],
         },
     )
-    advisory = check._security_advisories(fake, _repos("platform-a"))
-    scanning = check._code_scanning_security(fake, _repos("platform-a"))
+    advisory = run_aspect(check, "security_advisories", fake, _repos("platform-a"))
+    scanning = run_aspect(check, "code_scanning_security", fake, _repos("platform-a"))
     assert advisory.children[0].stored_code is StatusCode.OK
     assert next(child for child in scanning.children
                 if child.name == "low").stored_code is StatusCode.WARN
@@ -982,7 +1018,7 @@ def test_secret_scanning_any_alert_is_error():
              "html_url": "https://gh/secret/1"},
         ]},
     )
-    result = check._secret_scanning_alerts(fake, check._discover(fake))
+    result = run_aspect(check, "secret_scanning_alerts", fake, check._discover(fake))
     assert result.stored_code is StatusCode.ERROR
     assert "github_pat" in result.reason_texts[0]
     assert "(https://gh/secret/1)" in result.reason_texts[0]
@@ -994,7 +1030,7 @@ def test_secret_scanning_not_enabled_is_flagged():
     fake = FakeClient(repos, errors={
         ("example-org/platform-a", "secret_scanning"):
             _answered("secret scanning disabled", 404)})
-    result = check._secret_scanning_alerts(fake, repos)
+    result = run_aspect(check, "secret_scanning_alerts", fake, repos)
     assert result.stored_code is StatusCode.ERROR
     assert len(result.reason_texts) == 1
     assert "platform-a" in result.reason_texts[0]
@@ -1014,7 +1050,7 @@ def test_secret_scanning_alert_and_not_enabled_both_listed():
         errors={("example-org/platform-b", "secret_scanning"):
                 _answered("disabled", 404)},
     )
-    result = check._secret_scanning_alerts(fake, repos)
+    result = run_aspect(check, "secret_scanning_alerts", fake, repos)
     assert result.stored_code is StatusCode.ERROR
     assert len(result.reason_texts) == 2
     assert any("github_pat" in m for m in result.reason_texts)
@@ -1027,7 +1063,7 @@ def test_secret_scanning_403_is_surfaced_not_flagged():
     fake = FakeClient(repos, errors={
         ("example-org/platform-a", "secret_scanning"):
             _answered("forbidden", 403)})
-    result = check._secret_scanning_alerts(fake, repos)
+    result = run_aspect(check, "secret_scanning_alerts", fake, repos)
     # a permission problem is an error note (WARN), never read as 'not enabled'
     assert result.stored_code is StatusCode.WARN
     assert any("could not read" in m for m in result.reason_texts)
@@ -1040,7 +1076,7 @@ def test_secret_scanning_require_enabled_false_suppresses_flag():
     fake = FakeClient(repos, errors={
         ("example-org/platform-a", "secret_scanning"):
             _answered("secret scanning disabled", 404)})
-    result = check._secret_scanning_alerts(fake, repos)
+    result = run_aspect(check, "secret_scanning_alerts", fake, repos)
     assert result.stored_code is StatusCode.OK
     assert result.reason_texts == []
 
@@ -1052,7 +1088,7 @@ _UNPARSEABLE = {"filename": "package-lock.json", "parseable": False,
 
 
 def _sbom(check, fake):
-    return check._sbom_check(fake, check._discover(fake))
+    return run_aspect(check, "sbom_check", fake, check._discover(fake))
 
 
 def test_sbom_a_graph_with_manifests_is_ok():
@@ -1150,7 +1186,7 @@ def test_sbom_a_forbidden_alias_grades_as_a_permission_answer():
     assert note.slug == _slug("platform-a", "unreadable")
     assert note.code is StatusCode.WARN
     assert note.text.startswith("platform-a: could not read (FORBIDDEN")
-    assert check._unreachable == 0
+    assert unreachable() == 0
 
 
 def test_sbom_a_not_found_alias_grades_nothing():
@@ -1168,7 +1204,7 @@ def test_sbom_a_not_found_alias_grades_nothing():
     # the leaf's own code is derived, and nothing here graded: not WARN, and
     # not counted as an outage on the node
     assert result.stored_code is not StatusCode.WARN
-    assert check._unreachable == 0
+    assert unreachable() == 0
 
 
 def test_sbom_an_errors_only_answer_is_could_not_ask():
@@ -1187,7 +1223,7 @@ def test_sbom_an_errors_only_answer_is_could_not_ask():
     gap = next(e for e in result.reason_entries if e.slug == "read")
     assert gap.text == "GitHub did not answer for 2 of 2 repositories"
     assert result.stored_code is StatusCode.WARN
-    assert check._unreachable == 2
+    assert unreachable() == 2
 
 
 def test_sbom_an_answer_with_neither_data_nor_errors_cannot_be_read():
@@ -1196,7 +1232,7 @@ def test_sbom_an_answer_with_neither_data_nor_errors_cannot_be_read():
     result = _sbom(check, fake)
     (note,) = result.reason_entries
     assert note.code is StatusCode.WARN and "could not read" in note.text
-    assert check._unreachable == 0
+    assert unreachable() == 0
 
 
 def test_sbom_a_repository_object_of_the_wrong_shape_is_could_not_read():
@@ -1215,7 +1251,7 @@ def test_sbom_an_errors_field_that_is_not_a_list_cannot_be_read():
                       graph_answer={"data": {}, "errors": "nope"})
     (note,) = _sbom(check, fake).reason_entries
     assert note.code is StatusCode.WARN and "cannot read" in note.text
-    assert check._unreachable == 0
+    assert unreachable() == 0
 
 
 def test_sbom_an_alias_error_of_a_kind_the_record_does_not_name_is_could_not_read():
@@ -1230,7 +1266,7 @@ def test_sbom_an_alias_error_of_a_kind_the_record_does_not_name_is_could_not_rea
     (note,) = _sbom(check, fake).reason_entries
     assert note.code is StatusCode.WARN
     assert "could not read (SERVICE_UNAVAILABLE: Something went wrong)" in note.text
-    assert check._unreachable == 0
+    assert unreachable() == 0
 
 
 def test_sbom_an_alias_with_neither_object_nor_error_cannot_be_read():
@@ -1281,7 +1317,7 @@ def test_actions_failure_is_error():
     check = _check()
     fake = FakeClient([_repo("platform-a")], runs={
         "example-org/platform-a": {"workflow_runs": [_wf_run(conclusion="failure")]}})
-    result = check._actions(fake, check._discover(fake))
+    result = run_aspect(check, "actions", fake, check._discover(fake))
     assert result.name == "actions"
     assert result.code is None
     assert result.stored_code is StatusCode.ERROR
@@ -1299,11 +1335,15 @@ def test_actions_entry_carries_its_subject_and_its_record():
                     url="https://gh/run/41",
                     started="2026-09-19T09:12:00Z",
                     updated="2026-09-19T09:20:14Z")]}})
-    result = check._actions(fake, check._discover(fake))
+    result = run_aspect(check, "actions", fake, check._discover(fake))
     entry, = [e for e in result.reason_entries if e.data]
-    # the subject is the id a rename cannot change — the slug's own first part
-    assert entry.subject == str(_repo_id("platform-a"))
+    # the object is the workflow on its branch (ADR-0013): the repository's id,
+    # the workflow's id, and the branch verbatim
+    assert entry.subject == f"{_repo_id('platform-a')}:1:main"
     assert entry.data["repository"] == "example-org/platform-a"
+    # and the ids beside the names, so a projection can group by repository
+    assert entry.data["repository_id"] == _repo_id("platform-a")
+    assert entry.data["workflow_id"] == 1
     assert entry.data["workflow"] == "ci"
     assert entry.data["branch"] == "main"
     # two words for the outcome, and they are not the same field: `conclusion` is
@@ -1312,9 +1352,12 @@ def test_actions_entry_carries_its_subject_and_its_record():
     assert entry.data["completed"]["conclusion"] == "failure"
     assert entry.data["completed"]["run_number"] == 41
     assert entry.data["completed"]["url"] == "https://gh/run/41"
-    # `started` is one of the three names the library reads as an instant
+    # `started` is one of the three names the library reads as an instant, and
+    # `updated` is kept under another, `at`, where it reads one at any depth —
+    # never as `ended`, which a run has no time for (ADR-0012 decision 3)
     assert entry.data["completed"]["started"] == "2026-09-19T09:12:00Z"
-    assert entry.data["completed"]["updated"] == "2026-09-19T09:20:14Z"
+    assert entry.data["completed"]["updated"] == {"at": "2026-09-19T09:20:14Z"}
+    assert "ended" not in entry.data["completed"]
     assert "running" not in entry.data
 
 
@@ -1326,22 +1369,23 @@ def test_actions_the_sentence_does_not_move_when_the_record_arrives():
         "example-org/platform-a": {"workflow_runs": [
             _wf_run(conclusion="failure", run_number=41,
                     url="https://gh/run/41")]}})
-    result = check._actions(fake, check._discover(fake))
+    result = run_aspect(check, "actions", fake, check._discover(fake))
     assert result.reason_texts[0] == (
         "[platform-a (main) / ci](https://gh/run/41): failed (#41)")
 
 
 def test_actions_an_absent_time_is_null_and_not_an_empty_string():
     """The library refuses a timed name whose value is not a time, so a run GitHub
-    gave no `run_started_at` for has to read as *no time*, not as `""`."""
+    gave no `run_started_at` or `updated_at` for has to read as *no time*, not as
+    `""` — and `updated` keeps its shape, one object with a null in it."""
     check = _check()
     fake = FakeClient([_repo("platform-a")], runs={
         "example-org/platform-a": {"workflow_runs": [
             _wf_run(conclusion="failure")]}})
-    result = check._actions(fake, check._discover(fake))
+    result = run_aspect(check, "actions", fake, check._discover(fake))
     entry, = [e for e in result.reason_entries if e.data]
     assert entry.data["completed"]["started"] is None
-    assert entry.data["completed"]["updated"] is None
+    assert entry.data["completed"]["updated"] == {"at": None}
 
 
 def test_actions_an_in_flight_run_rides_its_own_block():
@@ -1352,7 +1396,7 @@ def test_actions_an_in_flight_run_rides_its_own_block():
                     url="https://gh/run/42", started="2026-09-19T10:00:00Z"),
             _wf_run(conclusion="success", run_number=41,
                     url="https://gh/run/41")]}})
-    result = check._actions(fake, check._discover(fake))
+    result = run_aspect(check, "actions", fake, check._discover(fake))
     entry, = [e for e in result.reason_entries if e.data]
     assert entry.data["verdict"] == "passed"
     assert entry.data["completed"]["run_number"] == 41
@@ -1366,7 +1410,7 @@ def test_actions_waiting_is_warn():
     fake = FakeClient([_repo("platform-a")], runs={
         "example-org/platform-a": {"workflow_runs": [
             _wf_run(status="waiting", conclusion="")]}})
-    result = check._actions(fake, check._discover(fake))
+    result = run_aspect(check, "actions", fake, check._discover(fake))
     assert result.code is None
     assert result.stored_code is StatusCode.WARN
     assert "waiting" in result.reason_texts[0]
@@ -1380,7 +1424,7 @@ def test_actions_running_keeps_the_last_success_visible():
                     url="https://gh/run/12"),
             _wf_run(conclusion="success", run_number=11,
                     url="https://gh/run/11")]}})
-    result = check._actions(fake, check._discover(fake))
+    result = run_aspect(check, "actions", fake, check._discover(fake))
     assert result.stored_code is StatusCode.OK
     assert len(result.reason_entries) == 1
     assert result.reason_entries[0].code is StatusCode.OK
@@ -1393,8 +1437,9 @@ def test_actions_healthy_idle_is_hidden_by_default_and_can_be_enabled():
     fake = FakeClient([_repo("platform-a")], runs={
         "example-org/platform-a": {"workflow_runs": [
             _wf_run(conclusion="success")]}})
-    hidden = _check()._actions(fake, _repos("platform-a"))
-    shown = _check(actions_show_healthy=True)._actions(fake, _repos("platform-a"))
+    hidden = run_aspect(_check(), "actions", fake, _repos("platform-a"))
+    shown = run_aspect(_check(actions_show_healthy=True), "actions", fake,
+                       _repos("platform-a"))
     assert hidden.stored_code is StatusCode.OK
     assert hidden.reason_texts == []
     assert shown.reason_entries[0].code is StatusCode.OK
@@ -1407,7 +1452,7 @@ def test_actions_latest_run_per_workflow_branch_wins():
         "example-org/platform-a": {"workflow_runs": [
             _wf_run(conclusion="failure", wf_id=1),     # newest
             _wf_run(conclusion="success", wf_id=1)]}})   # older, same (wf, branch)
-    result = check._actions(fake, check._discover(fake))
+    result = run_aspect(check, "actions", fake, check._discover(fake))
     assert result.stored_code is StatusCode.ERROR
     assert len(result.reason_texts) == 1
 
@@ -1418,7 +1463,7 @@ def test_actions_retry_does_not_hide_the_last_failure():
         "example-org/platform-a": {"workflow_runs": [
             _wf_run(status="in_progress", conclusion="", run_number=22),
             _wf_run(conclusion="failure", run_number=21)]}})
-    result = check._actions(fake, check._discover(fake))
+    result = run_aspect(check, "actions", fake, check._discover(fake))
     entry = result.reason_entries[0]
     assert result.stored_code is StatusCode.ERROR
     assert entry.code is StatusCode.ERROR
@@ -1433,7 +1478,7 @@ def test_actions_cancelled_retry_does_not_hide_the_last_failure():
         "example-org/platform-a": {"workflow_runs": [
             _wf_run(conclusion="cancelled", run_number=22),
             _wf_run(conclusion="failure", run_number=21)]}})
-    result = check._actions(fake, check._discover(fake))
+    result = run_aspect(check, "actions", fake, check._discover(fake))
     assert result.stored_code is StatusCode.ERROR
     assert "failed (#21)" in result.reason_texts[0]
 
@@ -1443,7 +1488,7 @@ def test_actions_a_first_run_in_flight_is_undefined_but_visible():
     fake = FakeClient([_repo("platform-a")], runs={
         "example-org/platform-a": {"workflow_runs": [
             _wf_run(status="queued", conclusion="", run_number=1)]}})
-    result = check._actions(fake, check._discover(fake))
+    result = run_aspect(check, "actions", fake, check._discover(fake))
     assert result.stored_code is StatusCode.UNDEFINED
     assert result.reason_entries[0].code is StatusCode.UNDEFINED
     assert result.reason_entries[0].running is True
@@ -1461,7 +1506,7 @@ def test_actions_order_problems_then_running_then_healthy():
                     run_number=1),
             _wf_run(name="broken", wf_id=1, conclusion="failure"),
         ]}})
-    result = check._actions(fake, check._discover(fake))
+    result = run_aspect(check, "actions", fake, check._discover(fake))
     assert [entry.code for entry in result.reason_entries] == [
         StatusCode.ERROR, StatusCode.OK, StatusCode.OK]
     assert [entry.running for entry in result.reason_entries] == [False, True, False]
@@ -1472,7 +1517,7 @@ def test_actions_ignore_pattern_skips_workflow():
     fake = FakeClient([_repo("platform-a")], runs={
         "example-org/platform-a": {"workflow_runs": [
             _wf_run(name="Nightly Load", conclusion="failure")]}})
-    result = check._actions(fake, check._discover(fake))
+    result = run_aspect(check, "actions", fake, check._discover(fake))
     assert result.stored_code is StatusCode.OK
 
 
@@ -1485,7 +1530,7 @@ def test_actions_default_branch_asks_each_workflow_about_that_branch():
         runs={"example-org/platform-a": {"workflow_runs": [
             _wf_run(name="ci", branch="develop", wf_id=1),
             _wf_run(name="deploy", branch="develop", wf_id=2)]}})
-    check._actions(fake, check._discover(fake))
+    run_aspect(check, "actions", fake, check._discover(fake))
     asked = [(p, params) for (p, params) in fake.get_calls
              if p.endswith("/runs") and "/actions/workflows/" in p]
     assert [p for p, _ in asked] == [
@@ -1499,10 +1544,17 @@ def test_actions_default_branch_asks_each_workflow_about_that_branch():
 # --- disabled workflows (ADR-0010) -------------------------------------------
 
 def _listed(*rows):
-    """The workflow list with a state per row, as GitHub's schema spells them."""
-    return {"example-org/platform-a": {"workflows": [
-        {"id": i, "name": n, "state": st,
-         "html_url": f"https://gh/wf/{i}"} for i, n, st in rows]}}
+    """The workflow list with a state per row, as GitHub's schema spells them. A
+    row's fourth value, where it has one, is the workflow's `updated_at`; it is left
+    out otherwise, as `_wf_run` leaves out what a test is not about."""
+    workflows = []
+    for workflow_id, name, state, *updated in rows:
+        row = {"id": workflow_id, "name": name, "state": state,
+               "html_url": f"https://gh/wf/{workflow_id}"}
+        if updated:
+            (row["updated_at"],) = updated
+        workflows.append(row)
+    return {"example-org/platform-a": {"workflows": workflows}}
 
 
 def test_a_manually_disabled_workflow_is_a_line_and_costs_no_read():
@@ -1515,7 +1567,7 @@ def test_a_manually_disabled_workflow_is_a_line_and_costs_no_read():
         runs=_runs([_wf_run(name="ci", wf_id=1)], 1),
         workflows=_listed((1, "ci", "active"),
                           (2, "nightly", "disabled_manually")))
-    result = check._actions(fake, check._discover(fake))
+    result = run_aspect(check, "actions", fake, check._discover(fake))
     assert result.stored_code is StatusCode.WARN
     line, = result.reason_entries
     assert line.text == ("[platform-a / nightly](https://gh/wf/2): disabled "
@@ -1527,19 +1579,26 @@ def test_a_manually_disabled_workflow_is_a_line_and_costs_no_read():
 
 def test_a_disabled_line_carries_its_subject_and_its_record():
     """The disabled line is an `actions` line about a repository too, so it groups
-    with the rest of them. `state` is GitHub's own word and is free-form — the
-    library types three names and this is not one of them."""
+    with the rest of them. `state` is GitHub's own word and free-form — the
+    library types three names and this is not one of them — and `updated.at` is
+    GitHub's `updated_at`, under one that is."""
     check = _check()
     fake = FakeClient(
         [_repo("platform-a")],
-        workflows=_listed((2, "nightly", "disabled_manually")))
-    result = check._actions(fake, check._discover(fake))
+        workflows=_listed((2, "nightly", "disabled_manually",
+                           "2026-09-01T08:15:00Z")))
+    result = run_aspect(check, "actions", fake, check._discover(fake))
     line, = result.reason_entries
-    assert line.subject == str(_repo_id("platform-a"))
-    assert line.data == {"repository": "example-org/platform-a",
+    # its object is the workflow everywhere, so its subject has no branch part
+    assert line.subject == f"{_repo_id('platform-a')}:2"
+    assert line.data == {"aspect": "actions", "kind": "disabled",
+                         "repository": "example-org/platform-a",
+                         "repository_id": _repo_id("platform-a"),
                          "workflow": "nightly",
+                         "workflow_id": 2,
                          "url": "https://gh/wf/2",
-                         "state": "disabled_manually"}
+                         "state": "disabled_manually",
+                         "updated": {"at": "2026-09-01T08:15:00Z"}}
 
 
 def test_a_disabled_line_is_keyed_without_a_branch():
@@ -1550,7 +1609,7 @@ def test_a_disabled_line_is_keyed_without_a_branch():
     fake = FakeClient(
         [_repo("platform-a")],
         workflows=_listed((2, "nightly", "disabled_manually")))
-    line, = check._actions(fake, check._discover(fake)).reason_entries
+    line, = run_aspect(check, "actions", fake, check._discover(fake)).reason_entries
     assert line.slug == _slug("platform-a", "workflow", 2)
     assert line.slug != _slug("platform-a", "workflow", 2, "main")
 
@@ -1563,7 +1622,7 @@ def test_inactivity_is_amber_and_says_what_github_did():
     fake = FakeClient(
         [_repo("platform-a")],
         workflows=_listed((3, "soak", "disabled_inactivity")))
-    line, = check._actions(fake, check._discover(fake)).reason_entries
+    line, = run_aspect(check, "actions", fake, check._discover(fake)).reason_entries
     assert line.code is StatusCode.WARN
     assert line.text == ("[platform-a / soak](https://gh/wf/3): disabled by "
                          "GitHub after 60 days without repository activity, "
@@ -1579,13 +1638,13 @@ def test_a_fork_disabled_workflow_is_ok_and_hidden_like_a_passing_one():
     fake = FakeClient(
         [_repo("platform-a")],
         workflows=_listed((4, "release", "disabled_fork")))
-    result = check._actions(fake, check._discover(fake))
+    result = run_aspect(check, "actions", fake, check._discover(fake))
     assert result.reason_texts == []
     shown = _check(actions_show_healthy=True)
     fake2 = FakeClient(
         [_repo("platform-a")],
         workflows=_listed((4, "release", "disabled_fork")))
-    line, = shown._actions(fake2, shown._discover(fake2)).reason_entries
+    line, = run_aspect(shown, "actions", fake2, shown._discover(fake2)).reason_entries
     assert line.code is StatusCode.OK
     assert line.text == ("[platform-a / release](https://gh/wf/4): disabled by "
                          "GitHub on this fork, no runs read")
@@ -1602,7 +1661,7 @@ def test_the_deployment_grades_a_disabled_state_for_itself():
         [_repo("platform-a")],
         workflows=_listed((2, "nightly", "disabled_manually"),
                           (4, "release", "disabled_fork")))
-    result = check._actions(fake, check._discover(fake))
+    result = run_aspect(check, "actions", fake, check._discover(fake))
     codes = {entry.code for entry in result.reason_entries}
     assert codes == {StatusCode.OK, StatusCode.ERROR}
     assert result.stored_code is StatusCode.ERROR
@@ -1616,7 +1675,7 @@ def test_a_disabled_state_this_package_has_not_met_is_amber_and_said_as_given():
     fake = FakeClient(
         [_repo("platform-a")],
         workflows=_listed((5, "odd", "disabled_by_some_new_rule")))
-    line, = check._actions(fake, check._discover(fake)).reason_entries
+    line, = run_aspect(check, "actions", fake, check._discover(fake)).reason_entries
     assert line.code is StatusCode.WARN
     assert line.text == ("[platform-a / odd](https://gh/wf/5): disabled "
                          "(disabled_by_some_new_rule), no runs read")
@@ -1633,7 +1692,7 @@ def test_a_disabled_workflow_is_not_priced_by_the_guard():
         workflows=_listed((1, "ci", "active"),
                           (2, "nightly", "disabled_manually"),
                           (3, "soak", "disabled_inactivity")))
-    check._actions(fake, check._discover(fake))
+    run_aspect(check, "actions", fake, check._discover(fake))
     assert check._workflow_counts == {"example-org/platform-a": 1}
     assert check._priced_reads(_repos("platform-a"))["actions/workflows"] == 1 + 1
 
@@ -1646,7 +1705,7 @@ def test_an_ignored_disabled_workflow_is_neither_read_nor_reported():
     fake = FakeClient(
         [_repo("platform-a")],
         workflows=_listed((2, "nightly", "disabled_manually")))
-    result = check._actions(fake, check._discover(fake))
+    result = run_aspect(check, "actions", fake, check._discover(fake))
     assert result.reason_texts == []
     assert check._workflow_counts == {"example-org/platform-a": 0}
 
@@ -1659,7 +1718,7 @@ def test_a_deleted_workflow_is_still_dropped_rather_than_called_disabled():
     fake = FakeClient(
         [_repo("platform-a")],
         workflows=_listed((6, "gone", "deleted")))
-    result = check._actions(fake, check._discover(fake))
+    result = run_aspect(check, "actions", fake, check._discover(fake))
     assert result.reason_texts == []
     assert check._workflow_counts == {"example-org/platform-a": 0}
 
@@ -1687,7 +1746,7 @@ def test_actions_named_branches_replace_the_default_branch():
         [_repo("platform-a", default_branch="main")],
         runs=_runs([_wf_run(name="ci", branch="release", wf_id=1)], 1),
         workflows=_named((1, "ci")))
-    check._actions(fake, check._discover(fake))
+    run_aspect(check, "actions", fake, check._discover(fake))
     asked = [params.get("branch") for (p, params) in fake.get_calls
              if "/actions/workflows/" in p and p.endswith("/runs")]
     assert asked == ["release", "staging"]
@@ -1702,7 +1761,7 @@ def test_actions_each_watched_workflow_is_asked_about_each_named_branch():
         [_repo("platform-a")],
         runs=_runs([_wf_run(name="ci", branch="release", wf_id=1)], 2),
         workflows=_named((1, "ci"), (2, "deploy")))
-    check._actions(fake, check._discover(fake))
+    run_aspect(check, "actions", fake, check._discover(fake))
     asked = [(p, params.get("branch")) for (p, params) in fake.get_calls
              if "/actions/workflows/" in p and p.endswith("/runs")]
     assert asked == [
@@ -1722,7 +1781,7 @@ def test_actions_a_named_branch_that_matched_nothing_is_one_line_naming_the_defa
         [_repo("platform-a", default_branch="master")],
         runs=_runs([_wf_run(name="ci", branch="master", wf_id=1)], 1),
         workflows=_named((1, "ci")))
-    result = check._actions(fake, check._discover(fake))
+    result = run_aspect(check, "actions", fake, check._discover(fake))
     assert result.stored_code is StatusCode.WARN
     line, = result.reason_entries
     assert line.slug == "branches-unmatched"
@@ -1743,7 +1802,7 @@ def test_actions_the_unmatched_line_stays_silent_after_a_degraded_read():
         workflows=_named((1, "ci"), (2, "deploy")),
         rate=(5000, 3, 0),              # 3 left, 4 × 2 workflows × 2 branches
     )
-    result = check._actions(fake, check._discover(fake))
+    result = run_aspect(check, "actions", fake, check._discover(fake))
     assert not [p for p, _ in fake.get_calls if "/actions/workflows/" in p]
     assert [entry.slug for entry in result.reason_entries] == [
         "runs-window-partial"]
@@ -1759,7 +1818,7 @@ def test_actions_a_repository_with_no_watched_workflow_is_not_called_unmatched()
         [_repo("platform-a")],
         runs=_runs([], 0),
         workflows=_named((1, "ci")))
-    result = check._actions(fake, check._discover(fake))
+    result = run_aspect(check, "actions", fake, check._discover(fake))
     assert result.reason_texts == []
 
 
@@ -1777,7 +1836,7 @@ def test_actions_more_than_one_named_branch_degrades_to_an_unfiltered_page():
         workflows=_named((1, "ci")),
         rate=(5000, 3, 0),
     )
-    result = check._actions(fake, check._discover(fake))
+    result = run_aspect(check, "actions", fake, check._discover(fake))
     wide = [params for (p, params) in fake.get_calls
             if p.endswith("/actions/runs")]
     assert wide and all("branch" not in params for params in wide)
@@ -1799,7 +1858,7 @@ def test_actions_one_named_branch_is_filtered_by_github_on_the_degraded_read():
         workflows=_named((1, "ci"), (2, "deploy")),
         rate=(5000, 3, 0),
     )
-    result = check._actions(fake, check._discover(fake))
+    result = run_aspect(check, "actions", fake, check._discover(fake))
     wide = [params for (p, params) in fake.get_calls
             if p.endswith("/actions/runs")]
     assert wide == [{"per_page": 100, "branch": "release"}]
@@ -1866,7 +1925,7 @@ def test_actions_the_per_repository_guard_prices_the_branches_too():
         workflows=_named((1, "ci"), (2, "deploy")),
         rate=(5000, 15, 0),             # 4 × 2 workflows would pass, 4 × 4 does not
     )
-    check._actions(fake, check._discover(fake))
+    run_aspect(check, "actions", fake, check._discover(fake))
     assert not [p for p, _ in fake.get_calls if "/actions/workflows/" in p]
     covering = _check(actions_branches=("release", "staging"))
     fake_ok = FakeClient(
@@ -1875,7 +1934,7 @@ def test_actions_the_per_repository_guard_prices_the_branches_too():
         workflows=_named((1, "ci"), (2, "deploy")),
         rate=(5000, 16, 0),                                    # exactly 4 × 2 × 2
     )
-    covering._actions(fake_ok, covering._discover(fake_ok))
+    run_aspect(covering, "actions", fake_ok, covering._discover(fake_ok))
     assert [p for p, _ in fake_ok.get_calls if "/actions/workflows/" in p]
 
 
@@ -1891,7 +1950,7 @@ def test_actions_named_branches_are_on_the_config_summary():
 def test_actions_all_branches_omits_branch_param():
     check = _check(actions_all_branches=True)
     fake = FakeClient([_repo("platform-a", default_branch="main")])
-    check._actions(fake, check._discover(fake))
+    run_aspect(check, "actions", fake, check._discover(fake))
     runs_calls = [params for (p, params) in fake.get_calls
                   if p.endswith("/actions/runs")]
     assert runs_calls and all("branch" not in params for params in runs_calls)
@@ -1907,7 +1966,7 @@ def test_actions_ignores_runs_of_deleted_workflows():
         workflows={"example-org/platform-a": {"workflows": [
             {"id": 1, "state": "active"}]}},          # workflow 99 no longer exists
     )
-    result = check._actions(fake, check._discover(fake))
+    result = run_aspect(check, "actions", fake, check._discover(fake))
     assert result.stored_code is StatusCode.ERROR
     assert len(result.reason_texts) == 1                    # only the existing workflow
     assert "old-ci" not in result.reason_texts[0]           # the deleted one is dropped
@@ -1922,7 +1981,7 @@ def test_actions_deleted_only_repo_is_ok():
         workflows={"example-org/platform-a": {"workflows": [
             {"id": 1, "state": "active"}]}},          # 99 absent -> deleted
     )
-    result = check._actions(fake, check._discover(fake))
+    result = run_aspect(check, "actions", fake, check._discover(fake))
     assert result.stored_code is StatusCode.OK
     assert result.reason_texts == []
 
@@ -1936,7 +1995,7 @@ def test_actions_workflow_state_deleted_is_excluded():
         workflows={"example-org/platform-a": {"workflows": [
             {"id": 5, "state": "deleted"}]}},          # present but deleted
     )
-    result = check._actions(fake, check._discover(fake))
+    result = run_aspect(check, "actions", fake, check._discover(fake))
     assert result.stored_code is StatusCode.OK
 
 
@@ -1970,7 +2029,7 @@ def test_actions_a_workflow_that_does_not_run_on_the_branch_is_simply_absent():
         runs=_runs([_wf_run(name="ci", conclusion="success", wf_id=1)], 240),
         workflows=_named((1, "ci"), (2, "deploy")),
     )
-    result = check._actions(fake, check._discover(fake))
+    result = run_aspect(check, "actions", fake, check._discover(fake))
     assert result.stored_code is StatusCode.OK
     assert result.reason_texts == []
     # it was asked about, and answered nothing — that is the difference
@@ -1987,7 +2046,7 @@ def test_actions_an_ignored_workflow_costs_no_request():
         runs=_runs([_wf_run(name="ci", conclusion="success", wf_id=1)], 1),
         workflows=_named((1, "ci"), (2, "nightly-soak")),
     )
-    check._actions(fake, check._discover(fake))
+    run_aspect(check, "actions", fake, check._discover(fake))
     asked = [p for p, _ in fake.get_calls if "/actions/workflows/" in p]
     assert asked == ["/repos/example-org/platform-a/actions/workflows/1/runs"]
 
@@ -2002,7 +2061,7 @@ def test_actions_all_branches_reads_one_page_and_says_when_it_was_cut():
         runs=_runs([_wf_run(name="ci", conclusion="success", wf_id=1)], 240),
         workflows=_named((1, "ci"), (2, "deploy")),
     )
-    result = check._actions(fake, check._discover(fake))
+    result = run_aspect(check, "actions", fake, check._discover(fake))
     assert result.stored_code is StatusCode.WARN
     assert result.reason_texts == [
         "not all runs read in 1 of 1 repository — a workflow whose newest run "
@@ -2023,7 +2082,7 @@ def test_actions_a_thin_budget_degrades_to_the_wide_read():
         workflows=_named((1, "ci"), (2, "deploy")),
         rate=(5000, 3, 0),                       # 3 left, 4 × 2 workflows needed
     )
-    result = check._actions(fake, check._discover(fake))
+    result = run_aspect(check, "actions", fake, check._discover(fake))
     assert not [p for p, _ in fake.get_calls if "/actions/workflows/" in p]
     assert [p for p, _ in fake.get_calls if p.endswith("/actions/runs")]
     assert result.stored_code is StatusCode.ERROR      # the failure is still found
@@ -2041,7 +2100,7 @@ def test_actions_a_budget_that_covers_the_workflows_is_not_degraded():
         workflows=_named((1, "ci"), (2, "deploy")),
         rate=(5000, 8, 0),                       # exactly 4 × 2
     )
-    result = check._actions(fake, check._discover(fake))
+    result = run_aspect(check, "actions", fake, check._discover(fake))
     assert [p for p, _ in fake.get_calls if "/actions/workflows/" in p]
     assert result.reason_texts == []
 
@@ -2056,7 +2115,7 @@ def test_actions_no_budget_headers_does_not_degrade_the_read():
         workflows=_named((1, "ci")),
         last_rate_limit=None,
     )
-    check._actions(fake, check._discover(fake))
+    run_aspect(check, "actions", fake, check._discover(fake))
     assert [p for p, _ in fake.get_calls if "/actions/workflows/" in p]
 
 
@@ -2071,7 +2130,7 @@ def test_actions_a_cut_workflow_list_makes_the_answer_partial():
             "total_count": 137,
             "workflows": [{"id": 1, "name": "ci", "state": "active"}]}},
     )
-    result = check._actions(fake, check._discover(fake))
+    result = run_aspect(check, "actions", fake, check._discover(fake))
     assert result.stored_code is StatusCode.WARN
     assert result.reason_texts[0].startswith("not all runs read in 1 of 1 ")
 
@@ -2087,7 +2146,7 @@ def test_actions_a_repository_short_both_ways_is_counted_once():
             "total_count": 137,
             "workflows": [{"id": 1, "name": "ci", "state": "active"}]}},
     )
-    result = check._actions(fake, check._discover(fake))
+    result = run_aspect(check, "actions", fake, check._discover(fake))
     assert len(result.reason_texts) == 1
     assert "in 1 of 1 repository" in result.reason_texts[0]
     assert result.reason_texts[0].count("platform-a") == 1
@@ -2102,7 +2161,7 @@ def test_actions_the_window_line_is_last_and_does_not_displace_a_failure():
         runs=_runs([_wf_run(name="ci", conclusion="failure", wf_id=1)], 500),
         workflows=_named((1, "ci")),
     )
-    result = check._actions(fake, check._discover(fake))
+    result = run_aspect(check, "actions", fake, check._discover(fake))
     assert result.stored_code is StatusCode.ERROR
     assert len(result.reason_texts) == 2
     assert "failed" in result.reason_texts[0]
@@ -2114,10 +2173,10 @@ def test_actions_the_window_line_is_last_and_does_not_displace_a_failure():
 def _row(children):
     """The children in the order little-sister will draw them.
 
-    The real sort is the library's, once, in the snapshot — `(order, name)`, ADR-0055
-    decision 1. This mirrors that key rather than calling it, because the check hands
-    back a `CheckResult` and the library sorts a tree node; what is asserted here is
-    the row those ranks produce, not the sorting."""
+    The real sort is the library's, once, in the snapshot — `(order, name)`,
+    little-sister ADR-0055 decision 1. This mirrors that key rather than calling it,
+    because the check hands back a `CheckResult` and the library sorts a tree node;
+    what is asserted here is the row those ranks produce, not the sorting."""
     return [child.name for child in sorted(children, key=lambda c: (c.order, c.name))]
 
 
@@ -2146,7 +2205,7 @@ def test_one_field_decides_an_alert_so_the_two_aspects_partition(monkeypatch):
             _scan_alert(2, "https://x/2", analysis="warning"),
         ]})
     monkeypatch.setattr(check, "_make_client", lambda token, deadline=None: fake)
-    result = check.run()
+    result = run_check(check)
     security = next(c for c in result.children if c.name == "code_scanning_security")
     quality = next(c for c in result.children if c.name == "code_scanning_quality")
 
@@ -2168,7 +2227,7 @@ def test_the_three_unreachable_bands_are_gone(monkeypatch):
     check = _check()
     monkeypatch.setattr(check, "_make_client",
                         lambda token, deadline=None: FakeClient([_repo("a")]))
-    result = check.run()
+    result = run_check(check)
     security = next(c for c in result.children if c.name == "code_scanning_security")
     quality = next(c for c in result.children if c.name == "code_scanning_quality")
     assert _row(security.children) == ["critical", "high", "medium", "low"]
@@ -2187,7 +2246,7 @@ def test_a_security_finding_and_a_lint_note_are_graded_differently(monkeypatch):
             _scan_alert(2, "https://x/2", analysis="note"),
         ]})
     monkeypatch.setattr(check, "_make_client", lambda token, deadline=None: fake)
-    result = check.run()
+    result = run_check(check)
     security = next(c for c in result.children if c.name == "code_scanning_security")
     quality = next(c for c in result.children if c.name == "code_scanning_quality")
     # the aspect container defers to its bands, so the codes are on the bands
@@ -2209,7 +2268,7 @@ def test_an_alert_with_neither_severity_is_a_band_nobody_declared(monkeypatch):
     fake = FakeClient([_repo("platform-a")], data={
         ("example-org/platform-a", "code_scanning"): [_scan_alert(1, "https://x/1")]})
     monkeypatch.setattr(check, "_make_client", lambda token, deadline=None: fake)
-    result = check.run()
+    result = run_check(check)
     quality = next(c for c in result.children if c.name == "code_scanning_quality")
     assert _row(quality.children) == ["error", "warning", "note", "none"]
     band = next(c for c in quality.children if c.name == "none")
@@ -2225,7 +2284,7 @@ def test_the_split_costs_no_extra_request(monkeypatch):
     check = _check()
     fake = FakeClient([_repo("platform-a"), _repo("platform-b")])
     monkeypatch.setattr(check, "_make_client", lambda token, deadline=None: fake)
-    check.run()
+    run_check(check)
     scans = [path for path in fake.calls if "code-scanning" in path]
     assert len(scans) == 2                     # one per repository, not two
     assert len(check.ASPECTS) == 8
@@ -2233,8 +2292,8 @@ def test_the_split_costs_no_extra_request(monkeypatch):
 
 
 def test_one_unreadable_repository_is_counted_once_not_once_per_aspect(monkeypatch):
-    """The shared payload's other hazard. Both code-scanning aspects read one
-    `_Coverage`, and the check's node reports how many repositories could not be
+    """The shared payload's other hazard. Both code-scanning aspects are built
+    from one read, and the check's node reports how many repositories could not be
     read this run — so counting per aspect would report two failures where one read
     was attempted, which is the double-count ADR-0002 kept off the aspects."""
     monkeypatch.setenv("GITHUB_TOKEN", "x")
@@ -2244,7 +2303,7 @@ def test_one_unreadable_repository_is_counted_once_not_once_per_aspect(monkeypat
     fake = FakeClient([_repo("platform-a")], errors={
         ("example-org/platform-a", "code_scanning"): _transient("boom")})
     monkeypatch.setattr(check, "_make_client", lambda token, deadline=None: fake)
-    result = check.run()
+    result = run_check(check)
     node = " | ".join(result.reason_texts)
     assert "1 repository read could not be completed this run" in node
     assert "2 repository reads" not in node
@@ -2259,7 +2318,7 @@ def _aspects(check, monkeypatch, **fake):
     monkeypatch.setenv("GITHUB_TOKEN", "x")
     client = FakeClient([_repo("platform-a")], **fake)
     monkeypatch.setattr(check, "_make_client", lambda token, deadline=None: client)
-    return {c.name: c for c in check.run().children}
+    return {c.name: c for c in run_check(check).children}
 
 
 def _with_subnodes(**block):
@@ -2406,7 +2465,7 @@ def test_each_scale_ranks_from_one_with_no_leftover(monkeypatch):
     check = _check()
     monkeypatch.setattr(check, "_make_client",
                         lambda token, deadline=None: FakeClient([_repo("a")]))
-    result = check.run()
+    result = run_check(check)
     security = next(c for c in result.children if c.name == "code_scanning_security")
     quality = next(c for c in result.children if c.name == "code_scanning_quality")
     assert [c.order for c in security.children] == [1, 2, 3, 4]
@@ -2425,7 +2484,8 @@ def test_the_rate_guard_reserves_for_reads_and_not_for_aspects(monkeypatch):
     monkeypatch.setattr(
         check, "_make_client",
         lambda token, deadline=None: FakeClient(repos, rate=(5000, 150, 0)))
-    assert check.run().stored_code is StatusCode.OK          # 150 ≥ 140, so it runs
+    # 150 ≥ 140, so it runs
+    assert run_check(check).stored_code is StatusCode.OK
 
 
 def test_the_old_code_scanning_block_is_refused_at_load():
@@ -2453,7 +2513,7 @@ def test_the_aspect_row_is_in_an_order_somebody_chose(monkeypatch):
     check = _check()
     monkeypatch.setattr(check, "_make_client",
                         lambda token, deadline=None: FakeClient([_repo("platform-a")]))
-    result = check.run()
+    result = run_check(check)
     assert _row(result.children) == [
         "secret_scanning_alerts", "security_advisories", "code_scanning_security",
         "actions", "sbom_check", "code_scanning_quality", "pull_requests", "issues"]
@@ -2477,7 +2537,7 @@ def test_switching_an_aspect_off_leaves_a_gap_and_the_row_still_reads(monkeypatc
     check = _check(disabled_aspects=("security_advisories", "actions"))
     monkeypatch.setattr(check, "_make_client",
                         lambda token, deadline=None: FakeClient([_repo("platform-a")]))
-    result = check.run()
+    result = run_check(check)
     assert _row(result.children) == [
         "secret_scanning_alerts", "code_scanning_security", "sbom_check",
         "code_scanning_quality", "pull_requests", "issues"]
@@ -2494,7 +2554,7 @@ def test_a_bands_rank_is_the_aspects_own_tuple_not_the_module_constant(monkeypat
     check = _check(dependabot_severities=("high", "critical"))   # deliberately not ours
     monkeypatch.setattr(check, "_make_client",
                         lambda token, deadline=None: FakeClient([_repo("platform-a")]))
-    result = check.run()
+    result = run_check(check)
     advisories = next(c for c in result.children if c.name == "security_advisories")
     assert _row(advisories.children) == ["high", "critical"]
 
@@ -2507,7 +2567,7 @@ def test_a_band_only_a_severity_map_names_ranks_after_the_declared_ones(monkeypa
     check = _check(code_scanning_security_map={"zeta": StatusCode.WARN})
     monkeypatch.setattr(check, "_make_client",
                         lambda token, deadline=None: FakeClient([_repo("platform-a")]))
-    result = check.run()
+    result = run_check(check)
     scanning = next(c for c in result.children if c.name == "code_scanning_security")
     assert _row(scanning.children)[-1] == "zeta"
     ranks = {c.name: c.order for c in scanning.children}
@@ -2530,7 +2590,7 @@ def test_bands_nobody_stated_share_one_rank_and_sort_by_name(monkeypatch):
                 "security_severity_level": "alpha"}},
         ]})
     monkeypatch.setattr(check, "_make_client", lambda token, deadline=None: fake)
-    result = check.run()
+    result = run_check(check)
     scanning = next(c for c in result.children if c.name == "code_scanning_security")
     ranks = {c.name: c.order for c in scanning.children}
     assert ranks["alpha"] == ranks["zeta"] == len(SECURITY_SEVERITY_ORDER) + 1
@@ -2545,7 +2605,7 @@ def test_run_returns_all_aspect_leaves(monkeypatch):
         ("example-org/platform-a", "pulls"): [{"title": "Fix", "user": {"login": "a"}}],
     })
     monkeypatch.setattr(check, "_make_client", lambda token, deadline=None: fake)
-    result = check.run()
+    result = run_check(check)
     assert [c.name for c in result.children] == [
         "secret_scanning_alerts", "security_advisories", "code_scanning_security",
         "actions", "sbom_check", "code_scanning_quality", "pull_requests", "issues"]
@@ -2555,11 +2615,13 @@ def test_run_returns_all_aspect_leaves(monkeypatch):
     assert result.reason_texts == ["1 repository in scope"]
     assert result.report.startswith(
         "- [platform-a](https://github.com/example-org/platform-a)\n\n")
-    # and the cache's own line, which is scope and never a status claim
+    # and the cache's own line, which is scope and never a status claim, with
+    # the held runs beside it (ADR-0015)
     assert result.report.endswith(
         "conditional cache: 0 payload(s) held across 7 aspect(s) and discovery, "
         "0 dropped; this run made 10 request(s) of which 0 were free, so it "
-        "spent 10 against the 7 the guard priced it at")
+        "spent 10 against the 7 the guard priced it at; held runs: 0 kept; this "
+        "run's answers contradicted them 0 time(s), 0 let go")
 
 
 def test_run_warns_on_empty_scope_but_keeps_every_aspect(monkeypatch):
@@ -2567,7 +2629,7 @@ def test_run_warns_on_empty_scope_but_keeps_every_aspect(monkeypatch):
     check = _check()
     fake = FakeClient([])
     monkeypatch.setattr(check, "_make_client", lambda token, deadline=None: fake)
-    result = check.run()
+    result = run_check(check)
     assert result.stored_code is StatusCode.WARN
     assert result.reason_texts == [
         'no repositories in scope (organization example-org, team platform,'
@@ -2576,7 +2638,8 @@ def test_run_warns_on_empty_scope_but_keeps_every_aspect(monkeypatch):
     assert result.report == (
         "conditional cache: 0 payload(s) held across 7 aspect(s) and discovery, "
         "0 dropped; this run made 3 request(s) of which 0 were free, so it "
-        "spent 3 against the 7 the guard priced it at")
+        "spent 3 against the 7 the guard priced it at; held runs: 0 kept; this "
+        "run's answers contradicted them 0 time(s), 0 let go")
     assert [child.name for child in result.children] == list(check.ASPECTS)
 
 
@@ -2585,7 +2648,7 @@ def test_run_warns_below_the_configured_repository_minimum(monkeypatch):
     check = _check(expect_min_repos=3)
     fake = FakeClient([_repo("platform-a"), _repo("platform-b")])
     monkeypatch.setattr(check, "_make_client", lambda token, deadline=None: fake)
-    result = check.run()
+    result = run_check(check)
     assert result.stored_code is StatusCode.WARN
     assert result.reason_texts == [
         "2 repositories in scope, expected at least 3"]
@@ -2643,7 +2706,7 @@ def test_rate_limit_guard_skips(monkeypatch):
     check = _check(rate_limit_safety_factor=4)
     fake = FakeClient([_repo("platform-a")], rate=(5000, 3, 0))   # 3 left, need 4×6
     monkeypatch.setattr(check, "_make_client", lambda token, deadline=None: fake)
-    result = check.run()
+    result = run_check(check)
     assert result.stored_code is StatusCode.WARN
     assert "skipped" in result.reason_texts[0]
     assert result.reason_texts[1] == "1 repository in scope"
@@ -2692,7 +2755,7 @@ def test_the_guard_prices_the_run_per_window_and_names_the_one_that_cannot_affor
     check = _check(team="", name_prefix="platform")
     fake = FakeClient(_twenty(), rate=(5000, 5000, 0))
     monkeypatch.setattr(check, "_make_client", lambda token, deadline=None: fake)
-    result = check.run()
+    result = run_check(check)
     assert result.stored_code is StatusCode.WARN
     assert result.reason_texts[0] == (
         "skipped this run: 200 API calls left on the window GitHub charges the "
@@ -2705,7 +2768,7 @@ def test_the_guard_prices_the_run_per_window_and_names_the_one_that_cannot_affor
     _window("x", _WINDOW_A, left=3000, minutes=12)     # the same window, refilled
     runs = _check(team="", name_prefix="platform")
     monkeypatch.setattr(runs, "_make_client", lambda token, deadline=None: fake)
-    cleared = runs.run()
+    cleared = run_check(runs)
     assert cleared.stored_code is StatusCode.OK and cleared.children
     assert fake.rate_limit_calls == 0
 
@@ -2767,7 +2830,7 @@ def test_after_a_rollover_a_rest_path_is_not_priced_against_the_graphql_window(
     rich = _check(team="", name_prefix="platform")           # the endpoint affords it
     affordable = FakeClient(_twenty(), rate=(5000, 4000, 0))
     monkeypatch.setattr(rich, "_make_client", lambda token, deadline=None: affordable)
-    assert rich.run().stored_code is StatusCode.OK
+    assert run_check(rich).stored_code is StatusCode.OK
     assert affordable.rate_limit_calls == 1
 
 
@@ -2782,7 +2845,7 @@ def test_a_path_the_ledger_has_not_seen_is_priced_against_the_tightest_window_kn
     check = _check(team="", name_prefix="platform")
     fake = FakeClient(_twenty(), rate=(5000, 5000, 0))
     monkeypatch.setattr(check, "_make_client", lambda token, deadline=None: fake)
-    result = check.run()
+    result = run_check(check)
     assert result.reason_texts[0] == (
         "skipped this run: 100 API calls left on the window GitHub charges the "
         "secret-scanning, pulls and issues reads to (resets in 9min), need > "
@@ -2800,7 +2863,7 @@ def test_where_nothing_is_known_the_guard_reads_the_endpoint_as_it_always_did(
     check = _check(team="", name_prefix="platform")
     fake = FakeClient(_twenty(), rate=(5000, 300, 0))
     monkeypatch.setattr(check, "_make_client", lambda token, deadline=None: fake)
-    result = check.run()
+    result = run_check(check)
     assert result.reason_texts[0] == (
         "skipped this run: 300 API calls left, need > 4×140 for 20 repo(s)")
     assert fake.rate_limit_calls == 1
@@ -2821,9 +2884,9 @@ def test_actions_is_priced_one_plus_the_workflows_the_last_run_saw(monkeypatch):
     _window("x", _WINDOW_A, left=39, minutes=12)
     _window("x", (*_WINDOW_B, "orgs"), left=4000, minutes=17)
     _window("x", ("graphql",), left=4900, minutes=40, resource="graphql")
-    assert check.run().stored_code is StatusCode.OK        # the floor: 4×3 ≤ 39
+    assert run_check(check).stored_code is StatusCode.OK        # the floor: 4×3 ≤ 39
     assert check._workflow_counts == {"example-org/platform-a": 9}
-    skipped = check.run()
+    skipped = run_check(check)
     assert skipped.reason_texts[0] == (
         "skipped this run: 39 API calls left on the window GitHub charges the "
         "dependabot, code-scanning and actions reads to (resets in 12min), need > "
@@ -2854,7 +2917,7 @@ def test_the_foreign_rate_over_the_last_runs_length_comes_off_the_window_first(
     check = _check(team="", name_prefix="platform")
     monkeypatch.setattr(check, "_make_client", lambda token, deadline=None: fake)
     check._last_run_seconds = 600.0
-    result = check.run()
+    result = run_check(check)
     assert result.reason_texts[0] == (
         "skipped this run: 250 API calls left on the window GitHub charges the "
         "dependabot, code-scanning and actions reads to (resets in 12min), need > "
@@ -2862,7 +2925,7 @@ def test_the_foreign_rate_over_the_last_runs_length_comes_off_the_window_first(
         "this token")
     fresh = _check(team="", name_prefix="platform")     # no last run to price by
     monkeypatch.setattr(fresh, "_make_client", lambda token, deadline=None: fake)
-    assert fresh.run().stored_code is StatusCode.OK
+    assert run_check(fresh).stored_code is StatusCode.OK
 
 
 def test_a_run_remembers_its_length_for_the_next_guard_and_a_skipped_one_does_not(
@@ -2872,11 +2935,11 @@ def test_a_run_remembers_its_length_for_the_next_guard_and_a_skipped_one_does_no
     fake = FakeClient([_repo("platform-a")], rate=(5000, 5000, 0))
     monkeypatch.setattr(check, "_make_client", lambda token, deadline=None: fake)
     assert check._last_run_seconds is None
-    check.run()
+    run_check(check)
     assert check._last_run_seconds is not None
     _window("x", _WINDOW_A, left=1, minutes=12)
     remembered = check._last_run_seconds
-    assert check.run().stored_code is StatusCode.WARN      # skipped
+    assert run_check(check).stored_code is StatusCode.WARN      # skipped
     assert check._last_run_seconds == remembered
 
 
@@ -2929,14 +2992,14 @@ def test_an_unseen_path_is_priced_against_the_tightest_window_the_guard_prices(
     check._last_run_seconds = 300.0
     fake = FakeClient(_twenty(), rate=(5000, 5000, 0))
     monkeypatch.setattr(check, "_make_client", lambda token, deadline=None: fake)
-    assert check.run().stored_code is StatusCode.OK          # 4×120 ≤ 4000 on B
+    assert run_check(check).stored_code is StatusCode.OK          # 4×120 ≤ 4000 on B
     assert fake.rate_limit_calls == 0
 
     _window("x", _WINDOW_B, left=300, minutes=17)
     short = _check(team="", name_prefix="platform")
     short._last_run_seconds = 300.0
     monkeypatch.setattr(short, "_make_client", lambda token, deadline=None: fake)
-    assert short.run().reason_texts[0] == (
+    assert run_check(short).reason_texts[0] == (
         "skipped this run: 300 API calls left on the window GitHub charges the "
         "secret-scanning, pulls and issues reads to (resets in 17min), need > "
         "4×120 for 20 repo(s)")
@@ -2959,14 +3022,14 @@ def test_before_a_run_has_been_measured_timeout_bounds_what_the_run_would_take(
     assert check._last_run_seconds is None
     fake = FakeClient([_repo("platform-a")], rate=(5000, 5000, 0))
     monkeypatch.setattr(check, "_make_client", lambda token, deadline=None: fake)
-    assert check.run().stored_code is StatusCode.OK
+    assert run_check(check).stored_code is StatusCode.OK
     for path in (*_WINDOW_A, *_WINDOW_B):
         ledger().record("x", f"/repos/example-org/platform-00/{path}",
                         resource="core", limit=5000, remaining=1, used=4999,
                         reset=now + 100, now=float(now))
     later = _check(timeout_seconds=60.0)
     monkeypatch.setattr(later, "_make_client", lambda token, deadline=None: fake)
-    assert later.run().reason_texts[0].startswith("skipped this run: 1 API call")
+    assert run_check(later).reason_texts[0].startswith("skipped this run: 1 API call")
 
 
 def test_when_every_known_window_ends_before_the_run_the_endpoint_is_read(
@@ -2980,7 +3043,7 @@ def test_when_every_known_window_ends_before_the_run_the_endpoint_is_read(
     check._last_run_seconds = 300.0
     fake = FakeClient(_twenty_six(), rate=(5000, 300, 0))
     monkeypatch.setattr(check, "_make_client", lambda token, deadline=None: fake)
-    assert check.run().reason_texts[0] == (
+    assert run_check(check).reason_texts[0] == (
         "skipped this run: 300 API calls left, need > 4×182 for 26 repo(s)")
     assert fake.rate_limit_calls == 1
 
@@ -3086,7 +3149,7 @@ def test_issues_lists_each_open_issue():
     fake = FakeClient([_repo("platform-a")], data={
         ("example-org/platform-a", "issues"): [_issue(7, "disk full"), _issue(9)],
     })
-    result = check._issues(fake, check._discover(fake))
+    result = run_aspect(check, "issues", fake, check._discover(fake))
     assert result.stored_code is StatusCode.WARN
     assert len(result.reason_texts) == 2
     assert "has issue 7" in result.reason_texts[0]
@@ -3104,7 +3167,7 @@ def test_issues_excludes_pull_requests():
         ("example-org/platform-a", "issues"): [
             _issue(7, "disk full"), _issue(8, "Bump lib", pull_request=True)],
     })
-    result = check._issues(fake, check._discover(fake))
+    result = run_aspect(check, "issues", fake, check._discover(fake))
     assert len(result.reason_texts) == 1
     assert "has issue 7" in result.reason_texts[0]
     assert "has issue 8" not in " ".join(result.reason_texts)
@@ -3117,14 +3180,14 @@ def test_issues_are_paginated():
     fake = FakeClient([_repo("platform-a")], data={
         ("example-org/platform-a", "issues"): [_issue(1)],
     })
-    check._issues(fake, check._discover(fake))
+    run_aspect(check, "issues", fake, check._discover(fake))
     assert "/repos/example-org/platform-a/issues" in fake.paginated_calls
 
 
 def test_issues_no_open_issues_is_ok():
     check = _check()
     fake = FakeClient([_repo("platform-a")])
-    result = check._issues(fake, check._discover(fake))
+    result = run_aspect(check, "issues", fake, check._discover(fake))
     assert result.stored_code is StatusCode.OK
     assert result.reason_texts == []
 
@@ -3134,7 +3197,7 @@ def test_issues_ignore_list_skips_repo():
     fake = FakeClient([_repo("platform-a")], data={
         ("example-org/platform-a", "issues"): [_issue(7)],
     })
-    result = check._issues(fake, check._discover(fake))
+    result = run_aspect(check, "issues", fake, check._discover(fake))
     assert result.stored_code is StatusCode.OK
     assert result.reason_texts == []
 
@@ -3143,7 +3206,7 @@ def test_issues_disabled_repo_is_flagged_not_read_as_none():
     check = _check()
     fake = FakeClient([_repo("platform-a")], errors={
         ("example-org/platform-a", "issues"): _answered("not found", 404)})
-    result = check._issues(fake, check._discover(fake))
+    result = run_aspect(check, "issues", fake, check._discover(fake))
     assert result.stored_code is StatusCode.WARN
     assert "issues are disabled" in result.reason_texts[0]
 
@@ -3152,7 +3215,7 @@ def test_issues_other_error_is_surfaced_as_a_note():
     check = _check()
     fake = FakeClient([_repo("platform-a")], errors={
         ("example-org/platform-a", "issues"): _answered("forbidden", 403)})
-    result = check._issues(fake, check._discover(fake))
+    result = run_aspect(check, "issues", fake, check._discover(fake))
     assert result.stored_code is StatusCode.WARN
     assert "could not read" in result.reason_texts[0]
 
@@ -3160,7 +3223,7 @@ def test_issues_other_error_is_surfaced_as_a_note():
 def test_issues_leaf_declares_its_built_in_text():
     check = _check()
     fake = FakeClient([_repo("platform-a")])
-    result = check._issues(fake, check._discover(fake))
+    result = run_aspect(check, "issues", fake, check._discover(fake))
     assert result.name == "issues"
     # Declared, not stamped: the label is resolved once at construction and the
     # engine writes it per aspect name (little-sister ADR-0025), so the result
@@ -3286,7 +3349,7 @@ def test_pull_request_lines_are_members_keyed_by_repo_and_number():
                  "html_url": "https://gh/pr/7"}],
         },
     )
-    result = check._pull_requests(fake, check._discover(fake))
+    result = run_aspect(check, "pull_requests", fake, check._discover(fake))
     assert result.members
     assert [e.slug for e in result.reason_entries] == [
         _slug("platform-a", "pr", 42), _slug("platform-b", "pr", 7)]
@@ -3301,10 +3364,12 @@ def test_a_pull_request_slug_does_not_move_when_one_above_it_is_merged():
         {"title": "Second", "number": 2, "html_url": "https://gh/pr/2"}]}
     left = {("example-org/platform-a", "pulls"): [
         {"title": "Second", "number": 2, "html_url": "https://gh/pr/2"}]}
-    before = check._pull_requests(FakeClient([_repo("platform-a")], data=both),
-                                  _repos("platform-a"))
-    after = check._pull_requests(FakeClient([_repo("platform-a")], data=left),
-                                 _repos("platform-a"))
+    before = run_aspect(check, "pull_requests",
+                        FakeClient([_repo("platform-a")], data=both),
+                        _repos("platform-a"))
+    after = run_aspect(check, "pull_requests",
+                       FakeClient([_repo("platform-a")], data=left),
+                       _repos("platform-a"))
     assert before.reason_entries[1].slug == after.reason_entries[0].slug
 
 
@@ -3318,9 +3383,9 @@ def test_a_repository_rename_does_not_move_a_pin():
 
     def leaf(name):
         row = _repo(name, repo_id=4242)
-        return check._pull_requests(
+        return run_aspect(check, "pull_requests",
             FakeClient([row], data={(f"example-org/{name}", "pulls"): [pr]}),
-            [Repo.from_api(row)])
+                          [Repo.from_api(row)])
 
     before, after = leaf("platform-a"), leaf("platform-renamed")
     assert before.reason_entries[0].slug == "4242-pr-42"
@@ -3339,14 +3404,15 @@ def test_a_repository_name_is_never_in_a_slug():
     runs = {"example-org/platform-a": {"workflow_runs": [
         _wf_run(name="ci", branch="main", conclusion="failure", wf_id=5)]}}
     leaves = [
-        check._pull_requests(FakeClient([row], data={
+        run_aspect(check, "pull_requests", FakeClient([row], data={
             ("example-org/platform-a", "pulls"): [
                 {"title": "x", "number": 1, "html_url": "https://gh/pr/1"}]}),
-            [Repo.from_api(row)]),
-        check._sbom_check(
-            FakeClient([row], graphs={"example-org/platform-a": _graph(0)}),
-            [Repo.from_api(row)]),
-        check._actions(FakeClient([row], runs=runs), [Repo.from_api(row)]),
+                   [Repo.from_api(row)]),
+        run_aspect(check, "sbom_check",
+                   FakeClient([row], graphs={"example-org/platform-a": _graph(0)}),
+                   [Repo.from_api(row)]),
+        run_aspect(check, "actions",
+                   FakeClient([row], runs=runs), [Repo.from_api(row)]),
     ]
     slugs = [entry.slug for leaf in leaves for entry in leaf.reason_entries]
     assert slugs, "no lines to check"
@@ -3362,7 +3428,8 @@ def test_a_workflow_line_is_keyed_on_the_id_too():
         row = _repo(name, repo_id=4242)
         runs = {f"example-org/{name}": {"workflow_runs": [
             _wf_run(name="ci", branch="main", conclusion="failure", wf_id=5)]}}
-        return check._actions(FakeClient([row], runs=runs), [Repo.from_api(row)])
+        return run_aspect(check, "actions",
+                          FakeClient([row], runs=runs), [Repo.from_api(row)])
 
     assert leaf("platform-a").reason_entries[0].slug == "4242-workflow-5-main"
     assert (leaf("platform-renamed").reason_entries[0].slug
@@ -3417,7 +3484,7 @@ def test_a_band_leaf_says_what_it_is_graded_as():
             {"number": 1, "html_url": "https://gh/a/1",
              "security_advisory": {"summary": "boom"},
              "security_vulnerability": {"severity": "critical"}}]})
-    result = check._security_advisories(fake, repos)
+    result = run_aspect(check, "security_advisories", fake, repos)
     critical = next(c for c in result.children if c.name == "critical")
     assert "ERROR" in critical.config
     assert "when empty" in critical.config
@@ -3515,7 +3582,7 @@ def test_both_kinds_of_wait_are_said_apart_on_the_node(monkeypatch):
     fake = FakeClient([_repo("platform-a")], throttled_seconds=61.0,
                       retried_seconds=3.0)
     monkeypatch.setattr(check, "_make_client", lambda token, deadline=None: fake)
-    reason = check.run().reason_texts
+    reason = run_check(check).reason_texts
     assert "paused 61s for a GitHub rate limit" in reason
     assert "paused 3s retrying after GitHub did not answer" in reason
     assert reason.index("paused 61s for a GitHub rate limit") < reason.index(
@@ -3532,7 +3599,7 @@ def test_the_pull_request_leaf_keeps_its_own_title():
         [_repo("platform-a")],
         data={("example-org/platform-a", "pulls"): [
             {"title": "Fix bug", "number": 1, "html_url": "https://gh/pr/1"}]})
-    result = check._pull_requests(fake, check._discover(fake))
+    result = run_aspect(check, "pull_requests", fake, check._discover(fake))
     assert result.name == "pull_requests"
     assert result.title == ""
     assert check.subnode_labels["pull_requests"]["title"] == "Pull requests"
@@ -3545,7 +3612,7 @@ def test_issue_lines_are_keyed_by_repo_and_issue_number():
         data={("example-org/platform-a", "issues"): [
             {"number": 7, "title": "disk full"},
             {"number": 9, "title": "flaky test"}]})
-    result = check._issues(fake, check._discover(fake))
+    result = run_aspect(check, "issues", fake, check._discover(fake))
     assert [e.slug for e in result.reason_entries] == [
         _slug("platform-a", "issue", 7), _slug("platform-a", "issue", 9)]
 
@@ -3559,8 +3626,9 @@ def test_a_workflow_line_is_keyed_by_workflow_and_branch_not_by_the_run():
         runs = {"example-org/platform-a": {"workflow_runs": [
             _wf_run(name="ci", branch="release/1.2", conclusion="failure",
                     wf_id=5, url=run_url)]}}
-        return check._actions(FakeClient([_repo("platform-a")], runs=runs),
-                              _repos("platform-a"))
+        return run_aspect(check, "actions",
+                          FakeClient([_repo("platform-a")], runs=runs),
+                          _repos("platform-a"))
 
     first, second = leaf("https://gh/run/100"), leaf("https://gh/run/200")
     assert first.reason_entries[0].slug == _slug(
@@ -3574,7 +3642,7 @@ def test_scanning_switched_off_is_its_own_kind_of_entry():
     check = _check()
     fake = FakeClient([_repo("platform-a")], errors={
         ("example-org/platform-a", "secret_scanning"): _answered("off", 404)})
-    result = check._secret_scanning_alerts(fake, check._discover(fake))
+    result = run_aspect(check, "secret_scanning_alerts", fake, check._discover(fake))
     assert [e.slug for e in result.reason_entries] == \
         [_slug("platform-a", "secret-scanning-off")]
 
@@ -3586,7 +3654,7 @@ def test_a_read_failure_is_keyed_too():
     fake = FakeClient([_repo("platform-a")], errors={
         ("example-org/platform-a", "secret_scanning"): GitHubError("boom", status=500,
                           fault=Fault.TRANSIENT)})
-    result = check._secret_scanning_alerts(fake, check._discover(fake))
+    result = run_aspect(check, "secret_scanning_alerts", fake, check._discover(fake))
     assert [e.slug for e in result.reason_entries] == [
         _slug("platform-a", "unreadable"), "read"]
 
@@ -3608,7 +3676,7 @@ def test_pull_requests_isolates_per_repository_like_every_other_aspect():
         errors={("example-org/platform-a", "pulls"):
                 GitHubError("boom", status=500,
                           fault=Fault.TRANSIENT)})
-    result = check._pull_requests(fake, check._discover(fake))
+    result = run_aspect(check, "pull_requests", fake, check._discover(fake))
     slugs = [entry.slug for entry in result.reason_entries]
     # b's finding survived a's failure — which is the whole point
     assert _slug("platform-b", "pr", 7) in slugs
@@ -3631,7 +3699,7 @@ def test_a_5xx_no_longer_paints_the_repository_amber():
     repos = [_repo("platform-a"), _repo("platform-b")]
     fake = FakeClient(repos, errors={("example-org/platform-a", "pulls"):
                                      _transient()})
-    result = check._pull_requests(fake, check._discover(fake))
+    result = run_aspect(check, "pull_requests", fake, check._discover(fake))
     lines = {e.slug: e for e in result.reason_entries}
     assert lines[_slug("platform-a", "unreadable")].code is StatusCode.UNDEFINED
     assert "could not ask GitHub" in lines[_slug("platform-a", "unreadable")].text
@@ -3649,7 +3717,7 @@ def test_the_split_is_by_status_and_a_permission_error_still_grades():
     check = _check()
     fake = FakeClient([_repo("platform-a")],
                       errors={("example-org/platform-a", "pulls"): _denied()})
-    result = check._pull_requests(fake, check._discover(fake))
+    result = run_aspect(check, "pull_requests", fake, check._discover(fake))
     line = result.reason_entries[0]
     assert line.code is StatusCode.WARN
     assert "could not read" in line.text and "could not ask" not in line.text
@@ -3663,7 +3731,7 @@ def test_an_absent_graph_still_means_missing():
     check = _check()
     fake = FakeClient([_repo("platform-a")],
                       graphs={"example-org/platform-a": _graph(0)})
-    result = check._sbom_check(fake, check._discover(fake))
+    result = run_aspect(check, "sbom_check", fake, check._discover(fake))
     assert result.reason_entries[0].slug == _slug("platform-a", "sbom")
     assert result.stored_code is StatusCode.ERROR
 
@@ -3677,7 +3745,7 @@ def test_the_repositories_that_were_read_are_not_erased_by_the_one_that_was_not(
     repos = [_repo(f"platform-{c}") for c in "abc"]
     fake = FakeClient(repos, errors={("example-org/platform-a", "pulls"):
                                      _transient()})
-    result = check._pull_requests(fake, check._discover(fake))
+    result = run_aspect(check, "pull_requests", fake, check._discover(fake))
     assert result.stored_code is StatusCode.WARN         # not UNDEFINED
     read = [e for e in result.reason_entries if e.slug == "read"]
     assert len(read) == 1
@@ -3694,7 +3762,7 @@ def test_an_aspect_that_read_nothing_at_all_is_amber_not_grey():
     check = _check()
     repos = [_repo("platform-a"), _repo("platform-b")]
     fake = FakeClient(repos, graph_error=_transient())   # the one query, unanswered
-    result = check._sbom_check(fake, check._discover(fake))
+    result = run_aspect(check, "sbom_check", fake, check._discover(fake))
     assert result.stored_code is StatusCode.WARN
     assert all(e.code is StatusCode.UNDEFINED
                for e in result.reason_entries if e.slug != "read")
@@ -3707,7 +3775,7 @@ def test_a_clean_aspect_stays_silent():
     renders exactly as it did before this slice — no line, no noise."""
     check = _check()
     fake = FakeClient([_repo("platform-a")])
-    result = check._sbom_check(fake, check._discover(fake))
+    result = run_aspect(check, "sbom_check", fake, check._discover(fake))
     assert result.reason_entries == ()
     assert result.stored_code is StatusCode.OK
 
@@ -3727,7 +3795,7 @@ def test_the_rule_is_the_same_in_every_aspect_that_reads_per_repository():
         "sbom_check": FakeClient(repos, graph_error=_transient()),
     }
     for aspect, fake in cases.items():
-        result = getattr(check, f"_{aspect}")(fake, check._discover(fake))
+        result = run_aspect(check, aspect, fake, check._discover(fake))
         note = next(e for e in result.reason_entries
                     if e.slug.endswith("unreadable"))
         assert note.code is StatusCode.UNDEFINED, aspect
@@ -3749,12 +3817,13 @@ def test_a_banded_aspect_that_could_not_look_is_amber_and_its_bands_are_not():
     repos = [_repo("platform-a"), _repo("platform-b")]
     fake = FakeClient(repos, errors={
         ("example-org/platform-a", "dependabot"): _transient()})
-    result = check._security_advisories(fake, check._discover(fake))
+    result = run_aspect(check, "security_advisories", fake, check._discover(fake))
     assert result.stored_code is StatusCode.WARN
     fake_all = FakeClient(repos, errors={
         ("example-org/platform-a", "dependabot"): _transient(),
         ("example-org/platform-b", "dependabot"): _transient()})
-    nothing_read = check._security_advisories(fake_all, check._discover(fake_all))
+    nothing_read = run_aspect(check, "security_advisories",
+                              fake_all, check._discover(fake_all))
     assert nothing_read.stored_code is StatusCode.WARN          # was UNDEFINED
     assert {c.name for c in nothing_read.children} == {"critical", "high"}
     # and the bands themselves say exactly what they said before
@@ -3770,7 +3839,7 @@ def test_the_check_node_is_where_an_outage_becomes_visible():
                       errors={("example-org/platform-a", "pulls"): _transient(),
                               ("example-org/platform-b", "issues"): _transient()})
     check._make_client = lambda token, deadline=None: fake  # type: ignore[method-assign]
-    result = check.run()
+    result = run_check(check)
     assert result.stored_code is StatusCode.WARN
     node = " | ".join(result.reason_texts)
     assert "2 repository reads could not be completed this run" in node
@@ -3785,7 +3854,7 @@ def test_a_permission_error_is_not_counted_on_the_node():
     fake = FakeClient([_repo("platform-a")],
                       graphs={"example-org/platform-a": "FORBIDDEN"})
     check._make_client = lambda token, deadline=None: fake  # type: ignore[method-assign]
-    result = check.run()
+    result = run_check(check)
     assert "could not be completed" not in " ".join(result.reason_texts)
 
 
@@ -4081,7 +4150,7 @@ def test_the_report_says_what_is_held_and_what_the_run_spent(monkeypatch):
     check._conditional.reading("pull_requests")
     check._conditional.store("https://api/x", 'W/"a"', [1], "")
     check._conditional.sweep()
-    report = check.run().report
+    report = run_check(check).report
     assert "conditional cache: 1 payload(s) held across 7 aspect(s) and discovery" \
         in report
     assert "of which 4 were free" in report
@@ -4240,17 +4309,17 @@ def test_the_deadline_stops_the_run_and_what_finished_is_kept():
     # than written out, so re-ordering the row does not silently turn this into a
     # test that the second aspect ate the budget.
     first = check.active_aspects()[0]
-    real_first = getattr(check, f"_{first}")
+    real_first = getattr(check, f"_read_{first}")
 
     def spend_the_run(client, repos):
         result = real_first(client, repos)
         clock.advance(31)                     # the first aspect ate the budget
         return result
 
-    setattr(check, f"_{first}", spend_the_run)
+    setattr(check, f"_read_{first}", spend_the_run)
     check._make_client = lambda token, deadline=None: fake  # type: ignore[method-assign]
     check._new_deadline = lambda: Deadline(30.0, clock=clock)  # type: ignore[method-assign]
-    result = check.run()
+    result = run_check(check)
     names = [child.name for child in result.children]
     assert names == [first]                           # what finished is kept
     assert result.stored_code is StatusCode.WARN
@@ -4274,7 +4343,7 @@ def test_a_wait_the_pause_budget_cannot_afford_stops_the_run():
     # out — the claim is about the *first* aspect finishing and the *second* hitting
     # the cap, not about which two those happen to be today.
     first, second = check.active_aspects()[:2]
-    real_first = getattr(check, f'_{first}')
+    real_first = getattr(check, f'_read_{first}')
 
     def throttled(client, repos):
         result = real_first(client, repos)
@@ -4282,17 +4351,17 @@ def test_a_wait_the_pause_budget_cannot_afford_stops_the_run():
         return result
 
     raise_next = [False]
-    real_second = getattr(check, f'_{second}')
+    real_second = getattr(check, f'_read_{second}')
 
     def refused(client, repos):
         if raise_next[0]:
             raise mod_github._PauseBudgetSpent(45.0)
         return real_second(client, repos)
 
-    setattr(check, f'_{first}', throttled)
-    setattr(check, f'_{second}', refused)
+    setattr(check, f'_read_{first}', throttled)
+    setattr(check, f'_read_{second}', refused)
     check._make_client = lambda token, deadline=None: fake  # type: ignore[method-assign]
-    result = check.run()
+    result = run_check(check)
     assert [child.name for child in result.children] == [first]
     assert result.stored_code is StatusCode.WARN
     node = ' | '.join(result.reason_texts)
@@ -4325,7 +4394,7 @@ def _traced_run(caplog, check, fake):
     """One run with its trace captured at INFO."""
     caplog.set_level(logging.INFO, logger=_LOGGER)
     check._make_client = lambda token, deadline=None: fake
-    return check.run(), _lines(caplog)
+    return run_check(check), _lines(caplog)
 
 
 def test_the_run_states_the_budgets_it_is_about_to_spend(caplog):
@@ -4366,8 +4435,8 @@ def test_an_aspect_line_times_the_aspect_and_not_the_run(caplog):
     clock = _Clock()
     check = _check(timeout_seconds=60.0)
     first, second = check.active_aspects()[:2]
-    real_first = getattr(check, f"_{first}")
-    real_second = getattr(check, f"_{second}")
+    real_first = getattr(check, f"_read_{first}")
+    real_second = getattr(check, f"_read_{second}")
 
     def five_seconds(client, repos):
         result = real_first(client, repos)
@@ -4379,8 +4448,8 @@ def test_an_aspect_line_times_the_aspect_and_not_the_run(caplog):
         clock.advance(7)
         return result
 
-    setattr(check, f"_{first}", five_seconds)
-    setattr(check, f"_{second}", seven_seconds)
+    setattr(check, f"_read_{first}", five_seconds)
+    setattr(check, f"_read_{second}", seven_seconds)
     check._new_deadline = lambda: Deadline(60.0, clock=clock)
     _result, lines = _traced_run(caplog, check, FakeClient(_two_repos()))
     assert (f"/github: aspect 1/8 {first} took 5.0s in 2 read(s) — 55s of the "
@@ -4403,14 +4472,14 @@ def test_the_cut_short_log_names_the_aspect_and_the_starving_tail(caplog):
     clock = _Clock()
     check = _check(timeout_seconds=60.0, disabled_aspects=("issues",))
     first, second = check.active_aspects()[:2]
-    real_first = getattr(check, f"_{first}")
+    real_first = getattr(check, f"_read_{first}")
 
     def spend_the_run(client, repos):
         result = real_first(client, repos)
         clock.advance(61)
         return result
 
-    setattr(check, f"_{first}", spend_the_run)
+    setattr(check, f"_read_{first}", spend_the_run)
     check._new_deadline = lambda: Deadline(60.0, clock=clock)
     _result, lines = _traced_run(caplog, check, FakeClient(_two_repos()))
     assert (f"/github: run cut short after 61s of its 60s timeout — 1 of 7 "
@@ -4419,21 +4488,21 @@ def test_the_cut_short_log_names_the_aspect_and_the_starving_tail(caplog):
 
 
 def test_a_short_run_resumes_where_it_stopped_rather_than_starving_a_tail(caplog):
-    """ADR-0002 §7, 2026-09-06 update. A run that never fits refreshed the same
+    """ADR-0002 §7. A run that never fits refreshed the same
     head and starved the same tail forever, while those nodes kept their last
     reading and looked answered. The next run starts at the aspect this one never
     got to."""
     clock = _Clock()
     check = _check(timeout_seconds=60.0)
     first, second = check.active_aspects()[:2]
-    real_first = getattr(check, f"_{first}")
+    real_first = getattr(check, f"_read_{first}")
 
     def spend_the_run(client, repos):
         result = real_first(client, repos)
         clock.advance(61)
         return result
 
-    setattr(check, f"_{first}", spend_the_run)
+    setattr(check, f"_read_{first}", spend_the_run)
     check._new_deadline = lambda: Deadline(60.0, clock=clock)
     _traced_run(caplog, check, FakeClient(_two_repos()))
 
@@ -4442,7 +4511,7 @@ def test_a_short_run_resumes_where_it_stopped_rather_than_starving_a_tail(caplog
     # And the next run actually walks it: the roster is what `run` reads, not a
     # number somebody could keep up to date beside it.
     caplog.clear()
-    setattr(check, f"_{first}", real_first)
+    setattr(check, f"_read_{first}", real_first)
     check._new_deadline = lambda: Deadline(60.0, clock=_Clock())
     _result, lines = _traced_run(caplog, check, FakeClient(_two_repos()))
 
@@ -4505,7 +4574,7 @@ def test_an_aspect_the_budget_died_inside_is_told_apart_from_one_never_started(
     clock = _Clock()
     check = _check(timeout_seconds=60.0)
     first, second = check.active_aspects()[:2]
-    real_first = getattr(check, f"_{first}")
+    real_first = getattr(check, f"_read_{first}")
 
     def slow_but_finishes(client, repos):
         result = real_first(client, repos)
@@ -4517,8 +4586,8 @@ def test_an_aspect_the_budget_died_inside_is_told_apart_from_one_never_started(
         clock.advance(41)
         raise DeadlineExceeded("the body read found the budget gone")
 
-    setattr(check, f"_{first}", slow_but_finishes)
-    setattr(check, f"_{second}", cut_off_partway)
+    setattr(check, f"_read_{first}", slow_but_finishes)
+    setattr(check, f"_read_{second}", cut_off_partway)
     check._new_deadline = lambda: Deadline(60.0, clock=clock)
     _result, lines = _traced_run(caplog, check, FakeClient(_two_repos()))
     assert (f"/github: run cut short after 61s of its 60s timeout — 1 of 8 "
@@ -4539,7 +4608,7 @@ def test_the_pause_budget_stop_names_where_it_stopped_too(caplog):
         # of the second aspect, so the first one's result is what survives.
         raise mod_github._PauseBudgetSpent(45.0)
 
-    setattr(check, f"_{second}", refused)
+    setattr(check, f"_read_{second}", refused)
     _result, lines = _traced_run(caplog, check, FakeClient(_two_repos()))
     assert (f"/github: run cut short after 1 of 8 aspects reported — a further "
             f"45s wait would pass its 10s pause budget — {second} (2 of 8) was "
@@ -4748,7 +4817,7 @@ def test_a_run_that_times_out_during_discovery_says_so_and_nothing_else():
             raise DeadlineExceeded("the run's timeout of 5s ran out")
 
     check._make_client = lambda token, deadline=None: _Slow([])  # type: ignore[method-assign]
-    result = check.run()
+    result = run_check(check)
     assert result.stored_code is StatusCode.WARN
     assert result.children == ()
     assert "ran out" in " ".join(result.reason_texts)
@@ -4836,8 +4905,8 @@ def test_a_real_5xx_reaches_the_aspect_as_a_line_that_grades_nothing():
 
 def _the_500_reaches_the_aspect(build):
     check = _check()
-    result = check._sbom_check(build(retries=1),
-                               _repos("platform-a", "platform-b"))
+    result = run_aspect(check, "sbom_check", build(retries=1),
+                        _repos("platform-a", "platform-b"))
     notes = [e for e in result.reason_entries if e.slug.endswith("unreadable")]
     assert len(notes) == 2
     assert all(e.code is StatusCode.UNDEFINED for e in notes)
@@ -4849,7 +4918,7 @@ def _the_500_reaches_the_aspect(build):
     assert gap.text == "GitHub did not answer for 2 of 2 repositories"
     assert result.stored_code is StatusCode.WARN
     # both repositories were counted toward the node's coverage line
-    assert check._unreachable == 2
+    assert unreachable() == 2
 
 
 # --- *Not now* is not *no*: GitHub's throttle, in GitHub's own headers ---------
@@ -5425,11 +5494,11 @@ def test_an_unreadable_answer_still_grades_the_line():
     check = _check()
     fake = FakeClient([_repo("platform-a")], graph_error=GitHubError(
         "not JSON", status=200, fault=Fault.MALFORMED))
-    result = check._sbom_check(fake, _repos("platform-a"))
+    result = run_aspect(check, "sbom_check", fake, _repos("platform-a"))
     line = result.reason_entries[0]
     assert line.code is StatusCode.WARN
     assert "could not read" in line.text
-    assert check._unreachable == 0
+    assert unreachable() == 0
 
 
 def test_the_backoff_is_actually_slept_before_the_retry():
@@ -5456,21 +5525,18 @@ def test_the_shipped_per_request_default_is_fifteen_seconds():
 
 
 def test_every_aspect_reports_its_unreachable_repositories_to_the_node():
-    """The node's count is assembled from all seven aspects, and the two that
-    build severity bands take a different route to it (`_severity_bands` rather
-    than `_finalize`). A count that silently dropped those two would leave a
-    Dependabot outage invisible on the only node that grades it."""
-    repos = [_repo("platform-a")]
-    banded = _check()
-    banded._security_advisories(
-        FakeClient(repos, errors={("example-org/platform-a", "dependabot"):
-                                  _transient()}), _repos("platform-a"))
-    assert banded._unreachable == 1
-
-    flat = _check()
-    flat._issues(FakeClient(repos, errors={("example-org/platform-a", "issues"):
-                                           _transient()}), _repos("platform-a"))
-    assert flat._unreachable == 1
+    """The node's count is assembled from every aspect, and the two that build
+    severity bands grade by a different route (`_severity_bands` rather than
+    `_finalize`). A count that silently dropped those would leave a Dependabot
+    outage invisible on the only node that grades it — so this runs the whole
+    check, both halves, and reads the node."""
+    for endpoint in ("dependabot", "issues"):
+        check = _check()
+        fake = FakeClient([_repo("platform-a")], errors={
+            ("example-org/platform-a", endpoint): _transient()})
+        check._make_client = lambda token, deadline=None, fake=fake: fake  # type: ignore[method-assign]
+        node = " | ".join(run_check(check).reason_texts)
+        assert "1 repository read could not be completed this run" in node, endpoint
 
 
 def test_actions_counts_each_repository_once_though_it_reads_two_endpoints():
@@ -5483,7 +5549,7 @@ def test_actions_counts_each_repository_once_though_it_reads_two_endpoints():
         [_repo("platform-a"), _repo("platform-b")],
         workflows={"example-org/platform-a": active},
         runs={"example-org/platform-a": _transient()})
-    result = check._actions(fake, repos)
+    result = run_aspect(check, "actions", fake, repos)
     read = next(e for e in result.reason_entries if e.slug == "read")
     assert read.text == "GitHub did not answer for 1 of 2 repositories"
 
@@ -5493,12 +5559,12 @@ def test_actions_says_which_of_its_two_reads_failed():
     on the rendered line."""
     check = _check()
     repos = _repos("platform-a")
-    workflows = check._actions(
-        FakeClient([_repo("platform-a")],
+    workflows = run_aspect(check, "actions",
+                           FakeClient([_repo("platform-a")],
                    workflows={"example-org/platform-a": _transient()}), repos)
     assert "could not ask GitHub workflows" in workflows.reason_entries[0].text
-    runs = check._actions(
-        FakeClient([_repo("platform-a")],
+    runs = run_aspect(check, "actions",
+                      FakeClient([_repo("platform-a")],
                    workflows={"example-org/platform-a":
                               {"workflows": [{"id": 1, "state": "active"}]}},
                    runs={"example-org/platform-a": _transient()}), repos)
@@ -5511,7 +5577,7 @@ def test_a_permission_error_alone_does_not_add_the_read_line():
     check = _check()
     fake = FakeClient([_repo("platform-a"), _repo("platform-b")],
                       graphs={"example-org/platform-a": "FORBIDDEN"})
-    result = check._sbom_check(fake, check._discover(fake))
+    result = run_aspect(check, "sbom_check", fake, check._discover(fake))
     assert not [e for e in result.reason_entries if e.slug == "read"]
     assert result.stored_code is StatusCode.WARN
 
@@ -5529,7 +5595,7 @@ def test_the_deadline_at_the_rate_limit_probe_is_a_reading_not_a_traceback():
 
     check._make_client = (                                # type: ignore[method-assign]
         lambda token, deadline=None: _Wedged([_repo("platform-a")]))
-    result = check.run()
+    result = run_check(check)
     assert result.stored_code is StatusCode.WARN
     texts = " | ".join(result.reason_texts)
     assert "ran out" in texts
@@ -5547,7 +5613,7 @@ def test_the_read_count_counts_every_repository_it_got_an_answer_about():
         errors={("example-org/platform-a", "secret_scanning"): _transient(),
                 ("example-org/platform-b", "secret_scanning"):
                     _answered("not enabled", 404)})
-    result = check._secret_scanning_alerts(fake, repos)
+    result = run_aspect(check, "secret_scanning_alerts", fake, repos)
     read = next(e for e in result.reason_entries if e.slug == "read")
     assert read.text == "GitHub did not answer for 1 of 3 repositories"
 
@@ -5562,7 +5628,7 @@ def test_the_read_count_includes_every_kind_of_miss_not_only_the_quiet_ones():
         [_repo(n) for n in ("platform-a", "platform-b", "platform-c")],
         errors={("example-org/platform-a", "pulls"): _transient(),
                 ("example-org/platform-b", "pulls"): _denied()})
-    result = check._pull_requests(fake, repos)
+    result = run_aspect(check, "pull_requests", fake, repos)
     read = next(e for e in result.reason_entries if e.slug == "read")
     assert read.text == "GitHub did not answer for 1 of 3 repositories"
 
@@ -5574,11 +5640,1478 @@ def test_the_nodes_count_reads_as_english_for_exactly_one():
     one = FakeClient([_repo("platform-a")], graph_error=_transient())
     check._make_client = lambda token, deadline=None: one  # type: ignore[method-assign]
     assert "1 repository read could not be completed" in \
-        " ".join(check.run().reason_texts)
+        " ".join(run_check(check).reason_texts)
 
     other = _check()
     two = FakeClient([_repo("platform-a"), _repo("platform-b")],
                      graph_error=_transient())
     other._make_client = lambda token, deadline=None: two  # type: ignore[method-assign]
     assert "2 repository reads could not be completed" in \
-        " ".join(other.run().reason_texts)
+        " ".join(run_check(other).reason_texts)
+
+
+# --- the two halves: what is measured, and what the grading may read -----------
+# (little-sister ADR-0086; this package's ADR-0013 and ADR-0014)
+
+def _full_run_check(fake, **over):
+    check = _check(**over)
+    check._make_client = lambda token, deadline=None: fake  # type: ignore[method-assign]
+    return check
+
+
+def _busy_estate():
+    """Two repositories with something to say: a pull request, an issue, a
+    Dependabot alert, a failing workflow — and a repository that cannot be read,
+    so the coverage readings are in it too."""
+    repos = [_repo("platform-a"), _repo("platform-b")]
+    return FakeClient(repos, runs={
+        "example-org/platform-a": {"workflow_runs": [
+            _wf_run(conclusion="failure", run_number=7)]}}, data={
+        ("example-org/platform-a", "pulls"): [
+            {"number": 3, "title": "Bump", "user": {"login": "bot"},
+             "html_url": "https://gh/pr/3"}],
+        ("example-org/platform-a", "issues"): [
+            {"number": 4, "title": "Broken"}],
+        ("example-org/platform-a", "dependabot"): [
+            {"number": 9, "html_url": "https://gh/d/9", "security_advisory": {
+                "severity": "high", "summary": "a hole"}}]},
+        errors={("example-org/platform-b", "issues"): _transient()})
+
+
+def test_the_grading_reads_nothing_but_the_readings():
+    """"`grade` must be pure over (record, configuration, now): no attribute
+    `measure()` left behind, no clock of its own, no second look at the world."
+    The readings of one run, graded again after every trace of that run is gone
+    from the check — no client to ask, the run's memo cleared, the state the next
+    run's guard reads scrambled — say exactly what they said the first time."""
+    check = _full_run_check(_busy_estate())
+    readings = measured(check)
+    first = run_check(check, measurements=readings)
+
+    def no_world(*_args, **_kw):
+        raise AssertionError("the grading asked the world")
+
+    check._make_client = no_world  # type: ignore[method-assign]
+    check._collected = {}
+    check._sees_private = not check._sees_private
+    check._workflow_counts = {"example-org/platform-a": 99}
+    check._priced_total = -1
+    check._conditional = mod_github._ConditionalCache()
+    check._conditional.store("https://api.github.com/x", '"e"', {}, "")
+    assert run_check(check, measurements=readings) == first
+
+
+def test_the_estate_is_read_first_and_is_the_one_reading_with_a_history():
+    """The estate reading leads, and it carries the check's own subject; the
+    roster's and every finding's readings carry none (little-sister ADR-0085
+    decision 2) — except an `actions` line, whose object is the
+    workflow on its branch."""
+    check = _full_run_check(_busy_estate())
+    readings = measured(check)
+    estate = readings[0]
+    assert estate.record["kind"] == "estate"
+    assert estate.subject == check.subject
+    assert check.subject == "example-org;team=platform;prefix=platform"
+    named = {r.record["kind"] for r in readings[1:] if r.subject}
+    assert named == {"run"}
+    assert {r.record["kind"] for r in readings if not r.subject} >= {"repository"}
+
+
+def test_a_run_line_carries_its_reading_as_one_value():
+    """The fork closed the simple way: each measurement maps one-to-one onto a
+    line, and the grading carries it through — the line's `data` **is** the
+    measurement's record, and its `subject` the measurement's."""
+    check = _full_run_check(_busy_estate())
+    readings = measured(check)
+    result = run_check(check, measurements=readings)
+    actions = next(c for c in result.children if c.name == "actions")
+    line = next(e for e in actions.reason_entries if e.data)
+    reading = next(r for r in readings if r.record["kind"] == "run")
+    assert line.data == dict(reading.record)
+    assert line.subject == reading.subject
+
+
+def test_a_healthy_idle_workflow_is_measured_though_it_writes_no_line():
+    """`show_healthy: false` is the grading's choice not to show it, and it does
+    not unmake what was read."""
+    fake = FakeClient([_repo("platform-a")], runs={
+        "example-org/platform-a": {"workflow_runs": [
+            _wf_run(conclusion="success")]}})
+    check = _full_run_check(fake)
+    readings = measured(check)
+    assert [r.record["verdict"] for r in readings
+            if r.record["kind"] == "run"] == ["passed"]
+    actions = next(c for c in run_check(check, measurements=readings).children
+                   if c.name == "actions")
+    assert actions.reason_entries == ()
+
+
+def test_a_subject_keeps_the_branch_verbatim_where_a_slug_narrows_it():
+    """"Not the narrowed slug — `slug()` collapses `/` in a branch name, so
+    `feature/a-b` and `feature-a/b` can meet." Two branches, two objects."""
+    one = mod_github._workflow_subject(1001, 42, "feature/a-b")
+    other = mod_github._workflow_subject(1001, 42, "feature-a/b")
+    assert (one, other) == ("1001:42:feature/a-b", "1001:42:feature-a/b")
+    assert one != other
+
+
+def test_a_workflow_and_one_of_its_branches_never_share_a_subject():
+    """The two shapes differ by their number of parts: the colon is refused in a
+    git ref name, so no branch can supply the missing one."""
+    assert mod_github._workflow_subject(1001, 42) == "1001:42"
+    assert mod_github._workflow_subject(1001, 42, "main").count(":") == 2
+
+
+def test_a_branch_too_long_for_a_subject_is_written_as_its_digest():
+    """"Within `MAX_SUBJECT_LENGTH` (200)": past it the branch is `sha256:` and 32
+    hex digits of its name — a part with a colon in it, which no branch can have,
+    so it can never be mistaken for one — and the same branch always gives the
+    same subject."""
+    branch = "release/" + "x" * 250
+    subject = mod_github._workflow_subject(1001, 42, branch)
+    assert len(subject) <= 200
+    head, digest = subject.split(":sha256:")
+    assert head == "1001:42"
+    assert re.fullmatch(r"[0-9a-f]{32}", digest)
+    assert subject == mod_github._workflow_subject(1001, 42, branch)
+    assert subject != mod_github._workflow_subject(1001, 42, branch + "y")
+    # and a branch that fits keeps its name, right up to the limit
+    fits = "b" * (200 - len("1001:42:"))
+    assert mod_github._workflow_subject(1001, 42, fits) == f"1001:42:{fits}"
+
+
+def test_two_estates_of_one_login_are_two_objects():
+    """Two checks watching one login through two prefixes watch two estates, so
+    they have two subjects — the login alone would name two different things as
+    one."""
+    web = _check(owner="example-org", team="", name_prefix="web")
+    data = _check(owner="example-org", team="", name_prefix="data")
+    assert web.subject == "example-org;prefix=web"
+    assert data.subject == "example-org;prefix=data"
+
+
+def test_an_estate_names_only_the_filters_set_away_from_their_defaults():
+    """The login first, then team, prefix, archived, forks and host, each only
+    where a configuration moved it, in that fixed order."""
+    assert _check(owner="m-31", kind="user", team="",
+                  name_prefix="").subject == "m-31"
+    assert _check(include_archived=True, include_forks=False,
+                  api_url="https://ghe.example.test/api/v3").subject == (
+        "example-org;team=platform;prefix=platform;archived=yes;forks=no;"
+        "host=ghe.example.test")
+
+
+def test_a_failed_discovery_is_one_reading_against_the_estate(monkeypatch):
+    """Nothing was read, so the run hands back the estate reading alone — which
+    the engine places on the check's own node — and the failure is in it."""
+    monkeypatch.setenv("GITHUB_TOKEN", "t")
+    check = _check(owner="m-31", kind="user", team="", name_prefix="")
+    fake = FakeClient([], owner_type=_transient("HTTP 503 for /users/m-31"))
+    monkeypatch.setattr(check, "_make_client", lambda token, deadline=None: fake)
+    (estate,) = measured(check)
+    assert estate.subject == "m-31"
+    assert estate.record["discovery"]["fault"] == "transient"
+    assert "HTTP 503" in estate.record["discovery"]["error"]
+
+
+def test_the_estate_reading_has_one_shape_on_every_run(monkeypatch):
+    """A field a run did not come to stands as None or zero rather than being
+    left out (little-sister ADR-0085 decision 3), so a series draws a real gap."""
+    monkeypatch.setenv("GITHUB_TOKEN", "t")
+    failed = _check(owner="m-31", kind="user", team="", name_prefix="")
+    fake = FakeClient([], owner_type=_transient())
+    monkeypatch.setattr(failed, "_make_client", lambda token, deadline=None: fake)
+    whole = _full_run_check(_busy_estate())
+    assert (set(measured(failed)[0].record)
+            == set(measured(whole)[0].record))
+
+
+def test_a_title_in_emoji_is_clipped_into_the_record_and_the_line_says_the_same():
+    """A 256-character title in emoji is 3 KB in the bytes the seam weighs a
+    record in, so unclipped it would be refused at the seam and cost the whole run.
+    Clipped once, in the measuring half: the reading fits, and the line is written
+    from exactly the text the reading kept (little-sister ADR-0086 decision 7)."""
+    emoji = "\U0001F600"
+    assert len(emoji) == 1
+    title = emoji * 256
+    fake = FakeClient([_repo("platform-a")], data={
+        ("example-org/platform-a", "pulls"): [
+            {"number": 5, "title": title, "user": {"login": "someone"},
+             "html_url": "https://gh/pr/5"}]})
+    check = _check()
+    readings, _read = aspect_readings(check, "pull_requests", fake,
+                                      _repos("platform-a"))
+    (pull,) = [r for r in readings if r.record["kind"] == "pull_request"]
+    kept = pull.record["title"]
+    assert 0 < len(kept) < len(title)
+    result = run_aspect(check, "pull_requests", fake, _repos("platform-a"))
+    assert f"platform-a: {kept}" in result.reason_entries[0].text
+
+
+def test_a_reading_this_check_did_not_take_grades_as_nothing_read():
+    """The engine writes `{"error": …}` itself when a measurement raises and grades
+    that run itself; handed such a record anyway, the grading says nothing was
+    read rather than failing on a shape it does not know."""
+    result = run_check(_check(), measurements=[
+        Measurement(record={"error": "boom"}, subject="example-org")])
+    assert result.stored_code is StatusCode.ERROR
+    assert result.reason_texts == ["no estate reading to grade — nothing was read"]
+
+
+# --- every line one reading became carries it (ADR-0014 §7) -------------------
+
+def _written_lines(result):
+    """Every line a result wrote, at any depth — a leaf's own and its bands'."""
+    return [*result.reason_entries,
+            *(line for child in result.children for line in _written_lines(child))]
+
+
+def _graded_aspect(check, name, fake):
+    """One aspect's readings, and the child its grading built out of them."""
+    repos = check._discover(fake)
+    readings, read = aspect_readings(check, name, fake, repos)
+    return readings, getattr(check, f"_grade_{name}")(readings, read, list(repos))
+
+
+def _reading_of(readings, kind, name):
+    """The one reading of ``kind`` about repository ``name``."""
+    (reading,) = [r for r in readings if r.record["kind"] == kind
+                  and r.record["repository"] == f"example-org/{name}"]
+    return reading
+
+
+def _line_named(result, slug):
+    """The one line ``slug`` names, at any depth."""
+    (line,) = [line for line in _written_lines(result) if line.slug == slug]
+    return line
+
+
+def _carries(line, reading):
+    """The claim: the reading's record, whole, is the line's ``data``, and the
+    reading's subject — the empty one a finding has (ADR-0014 §2) — the line's."""
+    return line.data == dict(reading.record) and line.subject == reading.subject
+
+
+def test_a_pull_request_line_carries_its_reading_and_so_does_each_note():
+    fake = FakeClient(
+        [_repo("platform-a"), _repo("platform-b"), _repo("platform-c")],
+        data={("example-org/platform-a", "pulls"): [
+            {"title": "Fix bug", "number": 42, "user": {"login": "alice"},
+             "html_url": "https://gh/pr/42"}]},
+        errors={("example-org/platform-b", "pulls"): _denied(),
+                ("example-org/platform-c", "pulls"): _transient()})
+    readings, result = _graded_aspect(_check(), "pull_requests", fake)
+    pull = _line_named(result, _slug("platform-a", "pr", 42))
+    assert _carries(pull, _reading_of(readings, "pull_request", "platform-a"))
+    assert (pull.data["title"], pull.data["user"]) == ("Fix bug", "alice")
+    assert _carries(_line_named(result, _slug("platform-b", "unreadable")),
+                    _reading_of(readings, "unreadable", "platform-b"))
+    assert _carries(_line_named(result, _slug("platform-c", "unreadable")),
+                    _reading_of(readings, "unreadable", "platform-c"))
+    # the count is written out of every could-not-ask reading at once
+    assert _line_named(result, "read").data is None
+
+
+def test_a_band_line_carries_its_reading_and_is_still_a_member_a_pin_holds():
+    check = _check(dependabot_severities=("critical", "high"))
+    fake = FakeClient([_repo("platform-a")], data={
+        ("example-org/platform-a", "dependabot"): [
+            {"number": 7, "html_url": "https://gh/dependabot/7",
+             "security_advisory": {"severity": "high", "summary": "RCE in x"}}]})
+    readings, result = _graded_aspect(check, "security_advisories", fake)
+    high = next(child for child in result.children if child.name == "high")
+    (line,) = high.reason_entries
+    assert _carries(line, _reading_of(readings, "advisory", "platform-a"))
+    assert line.data["summary"] == "RCE in x"
+    # the band carries the code, so it is the flag, not a coded line, that keeps
+    # each finding a line a pin can hold on its own
+    assert high.members
+
+
+@pytest.mark.parametrize("aspect,rule", [
+    ("code_scanning_security",
+     {"security_severity_level": "high", "description": "SQL injection"}),
+    ("code_scanning_quality", {"severity": "warning", "description": "unused"}),
+])
+def test_a_code_scanning_line_carries_its_reading(aspect, rule):
+    fake = FakeClient([_repo("platform-a")], data={
+        ("example-org/platform-a", "code_scanning"): [
+            {"number": 3, "rule": rule, "html_url": "https://gh/codescan/3"}]})
+    readings, result = _graded_aspect(_check(), aspect, fake)
+    line = _line_named(result, _slug("platform-a", "codescan", 3))
+    assert _carries(line, _reading_of(readings, "code_scanning_alert", "platform-a"))
+
+
+def test_a_secret_scanning_line_carries_its_reading_and_so_does_scanning_off():
+    fake = FakeClient(
+        [_repo("platform-a"), _repo("platform-b")],
+        data={("example-org/platform-a", "secret_scanning"): [
+            {"number": 5, "secret_type": "github_pat",
+             "created_at": "2026-07-01T00:00:00Z",
+             "html_url": "https://gh/secret/5"}]},
+        errors={("example-org/platform-b", "secret_scanning"):
+                _answered("secret scanning disabled", 404)})
+    readings, result = _graded_aspect(_check(), "secret_scanning_alerts", fake)
+    assert _carries(_line_named(result, _slug("platform-a", "secret", 5)),
+                    _reading_of(readings, "secret_alert", "platform-a"))
+    assert _carries(_line_named(result, _slug("platform-b", "secret-scanning-off")),
+                    _reading_of(readings, "scanning_off", "platform-b"))
+
+
+def test_a_dependency_graph_line_carries_its_reading_and_so_does_a_gone_note():
+    fake = FakeClient([_repo("platform-a"), _repo("platform-b")],
+                      graphs={"example-org/platform-a": _graph(0),
+                              "example-org/platform-b": "NOT_FOUND"})
+    readings, result = _graded_aspect(_check(), "sbom_check", fake)
+    line = _line_named(result, _slug("platform-a", "sbom"))
+    assert _carries(line, _reading_of(readings, "dependency_graph", "platform-a"))
+    assert line.data["total"] == 0
+    assert _carries(_line_named(result, _slug("platform-b", "unreadable")),
+                    _reading_of(readings, "gone", "platform-b"))
+
+
+def test_an_issue_line_carries_its_reading_and_so_does_issues_off():
+    fake = FakeClient(
+        [_repo("platform-a"), _repo("platform-b")],
+        data={("example-org/platform-a", "issues"): [_issue(7, "disk full")]},
+        errors={("example-org/platform-b", "issues"): _answered("not found", 404)})
+    readings, result = _graded_aspect(_check(), "issues", fake)
+    assert _carries(_line_named(result, _slug("platform-a", "issue", 7)),
+                    _reading_of(readings, "issue", "platform-a"))
+    assert _carries(_line_named(result, _slug("platform-b", "issues-off")),
+                    _reading_of(readings, "issues_off", "platform-b"))
+
+
+# --- an actions reading names the run attempt it is of (ADR-0013 §4) ---------
+
+def _run_readings(runs, **over):
+    """The `run` readings one `actions` read hands back for one repository whose
+    runs page is ``runs`` — newest first, as GitHub answers it."""
+    check = _check(**over)
+    fake = FakeClient([_repo("platform-a")], runs={
+        "example-org/platform-a": {"workflow_runs": runs}})
+    readings, _read = aspect_readings(check, "actions", fake, check._discover(fake))
+    return [reading for reading in readings if reading.record["kind"] == "run"]
+
+
+def _identity(runs):
+    """The identity of the one `run` reading a runs page makes."""
+    (reading,) = _run_readings(runs)
+    return reading.identity
+
+
+def test_a_finished_run_read_on_two_polls_is_one_identity():
+    """The same finished run, read again on the next poll, is the same event, so
+    it replaces its own record rather than adding itself to the series again —
+    however much GitHub has touched it in between."""
+    first = _identity([_wf_run(conclusion="failure", run_number=41, run_id=5541,
+                               attempt=1, updated="2026-09-19T09:20:14Z")])
+    again = _identity([_wf_run(conclusion="failure", run_number=41, run_id=5541,
+                               attempt=1, updated="2026-09-19T09:31:02Z")])
+    assert first == again == "5541/1"
+
+
+def test_a_new_run_completing_is_a_new_identity():
+    before = _identity([
+        _wf_run(conclusion="failure", run_number=41, run_id=5541, attempt=1)])
+    after = _identity([
+        _wf_run(conclusion="success", run_number=42, run_id=5542, attempt=1),
+        _wf_run(conclusion="failure", run_number=41, run_id=5541, attempt=1)])
+    assert (before, after) == ("5541/1", "5542/1")
+
+
+def test_a_first_run_read_in_flight_and_again_finished_is_one_identity():
+    """Where nothing has completed yet the reading is of the run in flight, so the
+    record that carried it running becomes the record of it finished — one point,
+    not two."""
+    running = _identity([_wf_run(status="in_progress", conclusion="", run_number=1,
+                                 run_id=5501, attempt=1)])
+    finished = _identity([_wf_run(conclusion="success", run_number=1, run_id=5501,
+                                  attempt=1)])
+    assert running == finished == "5501/1"
+
+
+def test_a_run_in_flight_rides_on_the_verdict_before_it():
+    """Once a verdict exists, the reading is of the run that verdict is of: a run
+    in flight rides on that record, and the identity changes when the new run
+    completes — not when it starts."""
+    in_flight = _identity([
+        _wf_run(status="in_progress", conclusion="", run_number=42, run_id=5542,
+                attempt=1),
+        _wf_run(conclusion="success", run_number=41, run_id=5541, attempt=1)])
+    completed = _identity([
+        _wf_run(conclusion="failure", run_number=42, run_id=5542, attempt=1),
+        _wf_run(conclusion="success", run_number=41, run_id=5541, attempt=1)])
+    assert (in_flight, completed) == ("5541/1", "5542/1")
+
+
+def test_a_re_run_is_an_attempt_of_its_own_and_keeps_the_failure():
+    """A re-run keeps the run's id and number and counts its attempt (GitHub: *does
+    not change if you re-run the workflow run*). With the attempt in the identity
+    the re-run that passed is a point beside the attempt that failed, rather than
+    the record that replaces it."""
+    failed = _identity([
+        _wf_run(conclusion="failure", run_number=41, run_id=5541, attempt=1),
+        _wf_run(conclusion="success", run_number=40, run_id=5540, attempt=1)])
+    # while attempt 2 runs, the run has no conclusion, so the verdict is #40's
+    re_running = _identity([
+        _wf_run(status="in_progress", conclusion="", run_number=41, run_id=5541,
+                attempt=2),
+        _wf_run(conclusion="success", run_number=40, run_id=5540, attempt=1)])
+    passed = _identity([
+        _wf_run(conclusion="success", run_number=41, run_id=5541, attempt=2),
+        _wf_run(conclusion="success", run_number=40, run_id=5540, attempt=1)])
+    assert (failed, re_running, passed) == ("5541/1", "5540/1", "5541/2")
+
+
+def test_a_cancelled_run_never_becomes_a_point_of_its_own():
+    """A cancelled run leaves no verdict, so the reading stays the verdict's
+    beneath it, and no record ever names the cancelled run."""
+    assert _identity([
+        _wf_run(conclusion="cancelled", run_number=42, run_id=5542, attempt=1),
+        _wf_run(conclusion="failure", run_number=41, run_id=5541, attempt=1),
+    ]) == "5541/1"
+
+
+def test_the_record_carries_what_the_identity_is_made_of():
+    """GitHub's id and the attempt ride in both run blocks (architecture §3.7), so
+    the identity can be read back out of the record it names."""
+    (reading,) = _run_readings([
+        _wf_run(status="in_progress", conclusion="", run_number=42, run_id=5542,
+                attempt=1),
+        _wf_run(conclusion="failure", run_number=41, run_id=5541, attempt=3)])
+    completed, running = reading.record["completed"], reading.record["running"]
+    assert (completed["id"], completed["attempt"]) == (5541, 3)
+    assert (running["id"], running["attempt"]) == (5542, 1)
+    assert reading.identity == f"{completed['id']}/{completed['attempt']}"
+
+
+def test_a_run_without_an_id_appends_and_one_without_an_attempt_is_its_id():
+    """Where GitHub sends no attempt the id stands alone; where it sends no id
+    there is no event to name, and the reading appends as every reading did."""
+    assert _identity([_wf_run(conclusion="failure", run_id=5541)]) == "5541"
+    assert _identity([_wf_run(conclusion="failure")]) == ""
+
+
+def test_only_an_actions_line_names_what_it_is_of():
+    """The estate is read anew on every run, so each of its readings is a new
+    record in its series, and a finding keeps no series at all; a run line names
+    the attempt it is of, and a disabled workflow when it last changed."""
+    fake = FakeClient(
+        [_repo("platform-a"), _repo("platform-b")],
+        runs={"example-org/platform-a": {"workflow_runs": [
+            _wf_run(conclusion="failure", run_number=7, run_id=5507, attempt=1)]}},
+        workflows={**_listed((1, "ci", "active"),
+                             (2, "nightly", "disabled_manually",
+                              "2026-09-01T08:15:00Z"))},
+        data={("example-org/platform-a", "issues"): [
+            {"number": 4, "title": "Broken"}]})
+    readings = measured(_full_run_check(fake))
+    named = {(r.record["kind"], r.identity, r.state) for r in readings
+             if r.identity or r.state}
+    assert named == {("run", "5507/1", ""),
+                     ("disabled", "2026-09-01T08:15:00Z", "")}
+    kinds = {r.record["kind"] for r in readings}
+    assert {"estate", "disabled", "issue"} <= kinds
+
+
+# --- a disabled workflow names when it last changed (ADR-0013 §5) ------------
+
+def _disabled_reading(*rows):
+    """The one `disabled` reading an `actions` read hands back for a repository
+    whose workflow list is ``rows``, as `_listed` spells them."""
+    check = _check()
+    fake = FakeClient([_repo("platform-a")], workflows=_listed(*rows))
+    readings, _read = aspect_readings(check, "actions", fake, check._discover(fake))
+    (reading,) = [r for r in readings if r.record["kind"] == "disabled"]
+    return reading
+
+
+def test_a_disabled_workflow_names_when_it_last_changed():
+    """It names no run, so the event it names is the workflow's own last change: the
+    instant GitHub's `updated_at` for it names, exactly as the record keeps it under
+    `updated.at` — UTC, with a `Z` and no `.000` — and no state beside it. GitHub
+    wrote the time at `+02:00` when it was measured, so that is the shape read here,
+    and a fraction of a second is kept the way the record keeps it."""
+    reading = _disabled_reading(
+        (2, "nightly", "disabled_manually", "2026-09-24T14:13:13.000+02:00"))
+    assert (reading.identity, reading.state) == ("2026-09-24T12:13:13Z", "")
+    assert reading.record["updated"] == {"at": reading.identity}
+    fraction = _disabled_reading(
+        (2, "nightly", "disabled_manually", "2026-09-24T14:13:13.500+02:00"))
+    assert fraction.record["updated"] == {"at": fraction.identity}
+
+
+def test_one_instant_is_one_identity_however_github_writes_it():
+    """The identity is the instant as the record keeps it and not GitHub's text, so
+    one switch-off written in three offsets names one event."""
+    renderings = ("2026-09-24T14:13:13.000+02:00", "2026-09-24T12:13:13Z",
+                  "2026-09-24T05:13:13.000-07:00")
+    identities = {_disabled_reading((2, "nightly", "disabled_manually", stamp)).identity
+                  for stamp in renderings}
+    assert identities == {"2026-09-24T12:13:13Z"}
+
+
+def test_a_workflow_that_stays_off_is_one_record_and_each_switch_off_another():
+    """Read again while nothing about it changed, a disabled workflow names the
+    event it named before, so it replaces its own record rather than adding one per
+    poll; switched off again — by the same cause, after running in between — it
+    names a new one, which is a record of its own. Its state could not tell those
+    two apart: it is the same word both times."""
+    first = _disabled_reading(
+        (2, "nightly", "disabled_manually", "2026-09-01T08:15:00Z"))
+    again = _disabled_reading(
+        (2, "nightly", "disabled_manually", "2026-09-01T08:15:00Z"))
+    later = _disabled_reading(
+        (2, "nightly", "disabled_manually", "2026-09-20T17:40:00Z"))
+    assert again.identity == first.identity
+    assert later.identity != first.identity
+    assert later.record["state"] == first.record["state"]
+
+
+def test_a_disabled_workflow_github_gave_no_time_names_its_state():
+    """Where GitHub sent no `updated_at` the reading names what the library's rule
+    takes next, the state it is in — GitHub's `state`, the one field that
+    constitutes it — so a workflow that stays off is still one record per spell
+    rather than one per poll. The record keeps the absence as an absence."""
+    reading = _disabled_reading((2, "nightly", "disabled_manually"))
+    assert (reading.identity, reading.state) == ("", "disabled_manually")
+    assert reading.state == reading.record["state"]
+    assert reading.record["updated"] == {"at": None}
+
+
+def test_a_time_that_would_not_travel_names_the_state_instead():
+    """The library refuses an identity longer than a subject may be, or one with a
+    control character, and a refusal raised out of the measuring half would be an
+    error on every poll — so such an `updated_at` is passed over for the state,
+    and one exactly as long as an identity may be is still the identity. None of
+    them is an instant, so the record keeps no time for any of them."""
+    stamp = "2026-09-01T08:15:00Z"
+    for updated in (stamp.ljust(MAX_SUBJECT_LENGTH + 1, "0"),
+                    stamp + chr(31), stamp + chr(127)):
+        reading = _disabled_reading(
+            (2, "nightly", "disabled_manually", updated))
+        assert (reading.identity, reading.state) == ("", "disabled_manually")
+        assert reading.record["updated"] == {"at": None}
+    longest = stamp.ljust(MAX_SUBJECT_LENGTH, "0")
+    assert _disabled_reading(
+        (2, "nightly", "disabled_manually", longest)).identity == longest
+
+
+def test_a_state_that_would_not_travel_either_is_its_digest():
+    """The last rung: a state the library would refuse is named by `sha256:` and 32
+    hex digits of it — the same for the same state, so still one record per spell,
+    and never a refusal."""
+    for odd in ("disabled_".ljust(MAX_SUBJECT_LENGTH + 1, "x"),
+                "disabled_" + chr(31), "disabled_" + chr(127)):
+        reading = _disabled_reading((2, "nightly", odd))
+        assert reading.identity == ""
+        assert re.fullmatch(r"sha256:[0-9a-f]{32}", reading.state)
+        assert reading.state == _disabled_reading((2, "nightly", odd)).state
+
+
+# --- a time is typed, in every kind of record (little-sister ADR-0082) --------
+
+#: A time as GitHub's REST answers spell one.
+_STAMP = "2026-09-01T08:15:00Z"
+
+
+def _kinds_written():
+    """Every `kind` this type hands `_reading`, read off its source: a kind added
+    there is one the test below has to meet, and a call whose kind is not a
+    literal fails it rather than being skipped."""
+    source = inspect.getsource(mod_github)
+    calls = re.findall(r"(?<![\w.])_reading\((?!aspect: )", source)
+    kinds = re.findall(
+        r'(?<![\w.])_reading\(\s*(?:None|self\.aspect|aspect|"\w+"),\s*"(\w+)"',
+        source)
+    assert len(kinds) == len(calls)
+    return set(kinds)
+
+
+def _every_kind():
+    """One `github` run that writes every kind of record the type has, with
+    GitHub's times wherever GitHub sends them: a pull request, an issue, an alert
+    of each family and a dependency graph; a failing run with another in flight, a
+    workflow switched off, a workflow list cut short and a named branch nothing
+    ran on; issues and secret scanning off; a repository that cannot be read and
+    one that is gone."""
+    fake = FakeClient(
+        [_repo("platform-a"), _repo("platform-b"), _repo("platform-c")],
+        data={
+            ("example-org/platform-a", "pulls"): [
+                {"number": 3, "title": "Bump", "user": {"login": "bot"},
+                 "html_url": "https://gh/pr/3", "created_at": _STAMP,
+                 "updated_at": _STAMP}],
+            ("example-org/platform-a", "issues"): [
+                {"number": 4, "title": "Broken", "created_at": _STAMP,
+                 "updated_at": _STAMP}],
+            ("example-org/platform-a", "dependabot"): [
+                {"number": 5, "html_url": "https://gh/d/5", "created_at": _STAMP,
+                 "updated_at": _STAMP,
+                 "security_advisory": {"severity": "high", "summary": "s"}}],
+            ("example-org/platform-a", "code_scanning"): [
+                {**_scan_alert(6, "https://gh/cs/6", security="high",
+                               analysis="error"),
+                 "created_at": _STAMP, "updated_at": _STAMP}],
+            ("example-org/platform-a", "secret_scanning"): [
+                {"number": 7, "secret_type": "token", "created_at": _STAMP,
+                 "updated_at": _STAMP, "html_url": "https://gh/ss/7"}],
+        },
+        errors={
+            ("example-org/platform-b", "issues"): _answered("off", 404),
+            ("example-org/platform-b", "secret_scanning"): _answered("off", 404),
+            ("example-org/platform-c", "pulls"): _denied(),
+        },
+        graphs={"example-org/platform-c": "NOT_FOUND"},
+        runs={"example-org/platform-a": {"workflow_runs": [
+            _wf_run(status="in_progress", conclusion="", run_number=8,
+                    run_id=5508, attempt=1, started=_STAMP, updated=_STAMP),
+            _wf_run(conclusion="failure", run_number=7, run_id=5507, attempt=1,
+                    started=_STAMP, updated=_STAMP)]}},
+        workflows={
+            "example-org/platform-a": {"total_count": 3, "workflows": [
+                {"id": 1, "name": "ci", "state": "active",
+                 "html_url": "https://gh/wf/1", "created_at": _STAMP,
+                 "updated_at": _STAMP},
+                {"id": 2, "name": "nightly", "state": "disabled_manually",
+                 "html_url": "https://gh/wf/2", "created_at": _STAMP,
+                 "updated_at": _STAMP}]},
+            "example-org/platform-b": {"total_count": 1, "workflows": [
+                {"id": 9, "name": "lint", "state": "active",
+                 "html_url": "https://gh/wf/9", "created_at": _STAMP,
+                 "updated_at": _STAMP}]}})
+    return measured(_full_run_check(fake, actions_branches=("main",)))
+
+
+def test_every_time_in_every_kind_of_record_is_typed():
+    """little-sister reads `at`, `started` and `ended` as instants at any depth of
+    a record, and a time under any other name is only a string to every surface
+    that shows one — so every time a `github` record carries sits under one of
+    the three, and every kind the type writes is in the run that says so."""
+    readings = _every_kind()
+    assert {reading.record["kind"] for reading in readings} == _kinds_written()
+    untyped = sorted(f"{reading.record['kind']}: {path}"
+                     for reading in readings
+                     for path, name in record_times(reading.record)
+                     if name not in RECORD_TIMESTAMP_KEYS)
+    assert untyped == []
+
+
+def test_a_time_that_is_not_an_instant_costs_its_field_and_not_the_run():
+    """A value under a name the library reads as an instant must be one, with an
+    offset, or the library refuses the whole result — every aspect of the run.
+    So a time GitHub sent that is not one is kept as `null` — no offset, no
+    time at all, or one the calendar cannot hold in UTC — the run stands, and so
+    does a disabled workflow's identity, which is then GitHub's text as sent."""
+    naive = "2026-09-01T08:15:00"
+    fake = FakeClient(
+        [_repo("platform-a")],
+        data={("example-org/platform-a", "secret_scanning"): [
+            {"number": 7, "secret_type": "token",
+             "created_at": "0001-01-01T00:00:00+01:00",
+             "html_url": "https://gh/ss/7"}]},
+        runs={"example-org/platform-a": {"workflow_runs": [
+            _wf_run(conclusion="failure", run_number=7, run_id=5507, attempt=1,
+                    started=naive, updated="yesterday")]}},
+        workflows={"example-org/platform-a": {"workflows": [
+            {"id": 1, "name": "ci", "state": "active",
+             "html_url": "https://gh/wf/1"},
+            {"id": 2, "name": "nightly", "state": "disabled_manually",
+             "html_url": "https://gh/wf/2", "updated_at": naive}]}})
+    readings = measured(_full_run_check(fake))
+    run = _reading_of(readings, "run", "platform-a")
+    assert run.record["completed"]["started"] is None
+    assert run.record["completed"]["updated"] == {"at": None}
+    alert = _reading_of(readings, "secret_alert", "platform-a")
+    assert alert.record["created"] == {"at": None}
+    disabled = _reading_of(readings, "disabled", "platform-a")
+    assert disabled.record["updated"] == {"at": None}
+    assert disabled.identity == naive
+
+
+# --- the heaviest record, under the library's warning line (ADR-0014 §4) -------
+
+def _graph_at_its_heaviest(*paths):
+    """A dependency-graph reading with every field at its longest — the longest
+    owner and repository names GitHub allows, a ten-digit repository id, a manifest
+    count at a GraphQL `Int`'s largest, manifests with neither flag set — and
+    ``paths`` as the manifests' file names, read through the aspect."""
+    owner, name = "o" * 39, "platform-".ljust(100, "r")
+    full = f"{owner}/{name}"
+    graph = {"totalCount": 2_147_483_647, "nodes": [
+        {"filename": path, "parseable": False, "exceedsMaxSize": False}
+        for path in paths]}
+    fake = FakeClient([{**_repo(name), "id": 9_999_999_999, "full_name": full}],
+                      graphs={full: graph})
+    check = _check()
+    readings, _read = aspect_readings(check, "sbom_check", fake,
+                                      check._discover(fake))
+    (reading,) = readings
+    return reading
+
+
+def test_the_heaviest_reading_is_what_the_type_declares():
+    """A dependency graph with every field at its longest and ten manifest paths
+    at their clip — one whole at 68 characters, nine cut from the front — weighs
+    exactly what the type declares for startup to hold against `record_limit`
+    (ADR-0014 §4)."""
+    reading = _graph_at_its_heaviest(
+        "p" * 68, *(f"services/{n}/" + "x" * 90 + "/package-lock.json"
+                    for n in range(9)))
+    kept = [manifest["filename"] for manifest in reading.record["manifests"]]
+    assert len(kept) == 10
+    assert all(len(json.dumps(filename)) == 70 for filename in kept)
+    weight = len(json.dumps(reading.record).encode("utf-8"))
+    assert weight == _check().expected_record()
+
+
+def test_the_declared_record_stands_under_the_librarys_warning_line():
+    """Every start weighs each type's declared record against `record_limit` and
+    says so while one stands at the library's share of it or past (little-sister
+    ADR-0075 decision 5). At the default limit, this type's starts without it.
+
+    This leans, on purpose, on `little_sister.limits`, a module the library does
+    not promise to keep: the share is the library's number and nowhere else, and a
+    copy of it here would stay green the day the library moved the line. Imported
+    in here, so that if the module goes, this test goes red and the rest stand."""
+    from little_sister.limits import AMBER_SHARE, RECORD_LIMIT
+
+    assert _check().expected_record() < AMBER_SHARE * RECORD_LIMIT
+
+
+def test_a_run_reading_at_its_heaviest_stays_under_the_declaration():
+    """The reading the type declared before its branch was clipped — the longest
+    owner and repository names GitHub allows, a 255-byte branch and a workflow name
+    in emoji, ten-digit repository and workflow ids, eleven-digit run ids, a
+    two-digit attempt, a six-digit run number, `startup_failure`, both run blocks
+    filled — keeps 300 bytes of its branch and weighs less than the graph the type
+    declares now."""
+    owner, name = "o" * 39, "r" * 100
+    repo = Repo(id=9_999_999_999, name=name, full_name=f"{owner}/{name}")
+    branch = "\U0001F600" * 63 + "é" + "b"
+    assert len(branch.encode("utf-8")) == 255
+
+    def run(run_id, status, conclusion):
+        return {"id": run_id, "run_attempt": 99, "run_number": 999_999,
+                "html_url": f"https://github.com/{owner}/{name}/actions/runs/"
+                            f"{run_id}",
+                "status": status, "conclusion": conclusion,
+                "run_started_at": _STAMP, "updated_at": _STAMP}
+
+    reading = GitHubCheck._action_reading(
+        repo, 9_999_999_999, "\U0001F600" * 100, branch,
+        run(99_999_999_999, "completed", "startup_failure"),
+        run(99_999_999_998, "in_progress", None),
+        (StatusCode.WARN, "waiting"))
+    assert len(json.dumps(reading.record["branch"])) <= 300
+    weight = len(json.dumps(reading.record).encode("utf-8"))
+    assert weight < _check().expected_record()
+
+
+#: A branch past the clip: 49 Cyrillic letters are 294 bytes of the seam's JSON
+#: with their quotes 296, so the clip keeps four characters of what follows.
+_PAST_THE_CLIP = "ж" * 49 + "-release-7"
+
+
+def test_a_branch_is_clipped_at_its_end_in_the_record_and_kept_whole_in_the_subject():
+    """"Every record's copy of a branch is clipped at 300 bytes of the JSON the
+    seam weighs, cut at the end", and the subject keeps it whole (ADR-0013 §2):
+    the record's copy is what the line says, the subject what its series is of. A
+    255-character ASCII branch fits and is kept whole."""
+    fits = "b" * 255
+    check = _check(actions_all_branches=True)
+    fake = FakeClient([_repo("platform-a")], runs={
+        "example-org/platform-a": {"workflow_runs": [
+            _wf_run(name="ci", branch=branch, conclusion="failure", wf_id=5)
+            for branch in (fits, _PAST_THE_CLIP)]}})
+    readings, _read = aspect_readings(check, "actions", fake, _repos("platform-a"))
+    runs = {reading.subject: reading.record for reading in readings
+            if reading.record["kind"] == "run"}
+    repo_id = _repo_id("platform-a")
+    subject_of = {branch: mod_github._workflow_subject(repo_id, 5, branch)
+                  for branch in (fits, _PAST_THE_CLIP)}
+    assert runs[subject_of[fits]]["branch"] == fits
+    assert subject_of[_PAST_THE_CLIP].endswith(f":{_PAST_THE_CLIP}")
+    kept = runs[subject_of[_PAST_THE_CLIP]]["branch"]
+    assert kept == "ж" * 49 + "-rel"
+    assert len(json.dumps(kept)) == 300
+    texts = run_aspect(check, "actions", fake, _repos("platform-a")).reason_texts
+    assert any(f"platform-a ({kept}) / ci" in text for text in texts)
+    assert not any(_PAST_THE_CLIP in text for text in texts)
+
+
+def test_a_line_on_a_clipped_branch_keeps_the_slug_its_whole_branch_gives():
+    """A slug is a stored key — a pin is held against it — and it was built from
+    the whole branch before the record's copy was clipped, so the clip must not
+    move it: the slug is built from the branch the line's subject was built from.
+
+    A branch too long for a subject as well is spelled there as its digest, and
+    its line's slug is built from that: it moves that line's slug once, and it
+    keeps two such branches, alike up to the clip, on two lines."""
+    alike = "a" * 170 + "ж" * 30
+    one, other = alike + "-1", alike + "-2"
+    check = _check(actions_all_branches=True)
+    fake = FakeClient([_repo("platform-a")], runs={
+        "example-org/platform-a": {"workflow_runs": [
+            _wf_run(name="ci", branch=branch, conclusion="failure", wf_id=5)
+            for branch in (_PAST_THE_CLIP, one, other)]}})
+    readings, _read = aspect_readings(check, "actions", fake, _repos("platform-a"))
+    kept = [reading.record["branch"] for reading in readings
+            if reading.record["kind"] == "run"]
+    assert len(kept) == 3 and kept.count("a" * 170 + "ж" * 21) == 2
+    repo_id = _repo_id("platform-a")
+    digests = [mod_github._workflow_subject(repo_id, 5, branch).split(":", 2)[2]
+               for branch in (one, other)]
+    assert all(digest.startswith("sha256:") for digest in digests)
+    lines = run_aspect(check, "actions", fake, _repos("platform-a")).reason_entries
+    assert sorted(line.slug for line in lines) == sorted(
+        slug(repo_id, "workflow", 5, branch)
+        for branch in (_PAST_THE_CLIP, *digests))
+
+
+def test_a_default_branch_on_the_unmatched_line_is_clipped_like_any_branch():
+    """The other record that carries a copy of a branch: the repository's default,
+    on the line that says the branches this check names matched nothing. Clipped
+    the same way, and the line names what the record kept."""
+    default = "ж" * 49 + "-mainline"
+    check = _check(actions_branches=("release",))
+    fake = FakeClient(
+        [_repo("platform-a", default_branch=default)],
+        runs=_runs([_wf_run(name="ci", branch=default, wf_id=1)], 1),
+        workflows=_named((1, "ci")))
+    readings, _read = aspect_readings(check, "actions", fake, check._discover(fake))
+    (unmatched,) = [reading for reading in readings
+                    if reading.record["kind"] == "branches_unmatched"]
+    kept = unmatched.record["default_branch"]
+    assert kept == "ж" * 49 + "-mai"
+    (line,) = run_aspect(check, "actions", fake,
+                         check._discover(fake)).reason_entries
+    assert line.text.endswith(f"platform-a (default branch {kept})")
+
+
+def test_a_manifest_path_keeps_its_end_behind_a_mark_weighed_with_it():
+    """"Manifest filename limit 100 → 70 bytes, cut from the front so the path
+    keeps its end": manifests in one repository differ near their end, and the
+    whole path is one click away, on the graph's page the line links to. The cut
+    and its mark are weighed in the bytes the seam weighs, as `clip` weighs what it
+    keeps from the other end; the cut falls between two characters, never inside
+    one; a path that fits is kept whole, with no mark."""
+    ascii_path = "services/billing/" + "x" * 60 + "/requirements/production.txt"
+    emoji_path = "docs/" + "\U0001F600" * 10 + "/package.json"
+    fits = "p" * 68
+    reading = _graph_at_its_heaviest(ascii_path, emoji_path, fits)
+    kept = [manifest["filename"] for manifest in reading.record["manifests"]]
+    assert kept == ["…" + ascii_path[-62:],
+                    "…" + "\U0001F600" * 4 + "/package.json",
+                    fits]
+    for path, cut in zip((ascii_path, emoji_path), kept, strict=False):
+        assert len(json.dumps(cut)) <= 70
+        # the longest end that fits: one more character would not
+        assert len(json.dumps("…" + path[len(path) - len(cut):])) > 70
+        assert json.loads(json.dumps(cut)) == cut
+    assert len(json.dumps(fits)) == 70
+
+
+def test_the_red_line_names_the_end_of_a_manifest_path():
+    """The line that names each unparseable manifest names what the record kept:
+    the end of a long path, behind its mark."""
+    path = "services/billing/" + "x" * 60 + "/requirements/production.txt"
+    check = _check()
+    fake = FakeClient([_repo("platform-a")], graphs={
+        "example-org/platform-a": _graph(
+            1, {"filename": path, "parseable": False, "exceedsMaxSize": False})})
+    (line,) = _sbom(check, fake).reason_entries
+    assert f"(…{path[-62:]} could not be parsed)" in line.text
+
+
+# --- a workflow line holds the newest run it has read (ADR-0015) ---------------
+
+#: The workflow these tests watch, in the repository `_repos("platform-a")` gives.
+_HELD_WF = 5
+_HELD_REPO = "example-org/platform-a"
+#: Every aspect but `actions`, for the tests that run the whole check.
+_NOT_ACTIONS = tuple(a for a in GitHubCheck.ASPECTS if a != "actions")
+
+
+def _run(run_id, attempt=1, *, status="completed", conclusion="success",
+         branch="main", wf_id=_HELD_WF, name="ci",
+         started="2026-09-20T10:00:00Z"):
+    """One workflow run as GitHub writes it: which run, which attempt, its outcome."""
+    return {"id": run_id, "run_attempt": attempt, "run_number": run_id % 1000,
+            "name": name, "head_branch": branch, "workflow_id": wf_id,
+            "status": status,
+            "conclusion": conclusion if status == "completed" else None,
+            "html_url": f"https://github.com/{_HELD_REPO}/actions/runs/{run_id}",
+            "run_started_at": started, "updated_at": started}
+
+
+def _page(*runs, total=None, etag=""):
+    """A runs answer: these rows, GitHub's own `total_count` for them, and an
+    `ETag` where the test wants the cache to hold the answer."""
+    return ("page", {"total_count": len(runs) if total is None else total,
+                     "workflow_runs": list(runs)}, etag)
+
+
+def _by_id(run, etag=""):
+    """A run read by id, as GitHub answers `GET …/actions/runs/{run_id}`."""
+    return ("run", run, etag)
+
+
+#: GitHub's `304` to the `ETag` the cache sent — the cache's answer, not GitHub's.
+_UNCHANGED = ("unchanged", None, "")
+
+
+def _not_found():
+    return _http_error(404, b'{"message": "Not Found"}')
+
+
+class _RecordedGitHub:
+    """GitHub's side of the `actions` aspect as recorded answers, served to the
+    **real** client through the real `fetch`: the workflow list, the per-workflow
+    runs read, the repository's wide page, a run read by id, and discovery for the
+    tests that run the whole check. A test sets what each answers before each poll;
+    every request is kept, in order, with the `If-None-Match` it carried."""
+
+    def __init__(self, *, workflows=((_HELD_WF, "ci"),), budget=None):
+        self.workflows = list(workflows)
+        #: The rate headers the workflow list answers with — what the aspect prices
+        #: the per-workflow read against.
+        self.budget = budget
+        self.runs = {}                # (workflow id, branch), or "wide" -> reply
+        self.by_id = {}               # run id -> reply
+        self.asked = []               # (path?query, If-None-Match)
+        #: Called before each answer, with its path — how a test moves a clock.
+        self.before = None
+
+    def answer(self, request, _timeout):
+        url = urllib.parse.urlsplit(request.full_url)
+        path = url.path
+        self.asked.append((path + (f"?{url.query}" if url.query else ""),
+                           request.get_header("If-none-match")))
+        if self.before is not None:
+            self.before(path)
+        branch = urllib.parse.parse_qs(url.query).get("branch", [""])[0]
+        actions = f"/repos/{_HELD_REPO}/actions"
+        if path == f"{actions}/workflows":
+            listed = {"total_count": len(self.workflows),
+                      "workflows": [{"id": i, "name": n, "state": "active"}
+                                    for i, n in self.workflows]}
+            return _Answer(200, json.dumps(listed).encode(), self.budget or {})
+        if path.startswith(f"{actions}/workflows/") and path.endswith("/runs"):
+            workflow_id = int(path[len(f"{actions}/workflows/"):-len("/runs")])
+            return self._reply(self.runs.get((workflow_id, branch), _page()))
+        if path == f"{actions}/runs":
+            return self._reply(self.runs.get("wide", _page()))
+        if path.startswith(f"{actions}/runs/"):
+            return self._reply(self.by_id.get(int(path.rsplit("/", 1)[1]),
+                                              _not_found()))
+        if path == "/users/example-org":
+            return _Answer(200, b'{"login": "example-org", "type": "Organization"}')
+        if path == "/orgs/example-org/teams":
+            return _Answer(200, b'[{"slug": "platform", "name": "platform"}]')
+        if path == "/orgs/example-org/teams/platform/repos":
+            return _Answer(200, json.dumps([_repo("platform-a")]).encode())
+        raise _not_found()
+
+    @staticmethod
+    def _reply(reply):
+        if callable(reply):
+            reply = reply()            # an answer made afresh for every request
+        if isinstance(reply, BaseException):
+            raise reply
+        kind, payload, etag = reply
+        if kind == "unchanged":
+            return _Answer(304, b"", {})
+        return _Answer(200, json.dumps(payload).encode(),
+                       {"ETag": etag} if etag else {})
+
+    def read_by_id(self):
+        """The runs this poll read by id, with the `If-None-Match` each carried."""
+        return [(path.rsplit("/", 1)[1], held) for path, held in self.asked
+                if f"/repos/{_HELD_REPO}/actions/runs/" in path]
+
+
+def _poll(check, github, *, deadline=None, max_pause=None):
+    """One pass of `actions` the way `measure()` makes one: a fresh client for the
+    run, the check's own cache, and the cache swept once the pass has finished."""
+    github.asked = []
+    with _through(github.answer) as (build, _opener):
+        client = build(cache=check._conditional, deadline=deadline,
+                       max_pause=max_pause, ledger=Ledger())
+        check._conditional.reading("actions")
+        repos = _repos("platform-a")
+        readings, read = check._read_actions(client, repos)
+        check._conditional.sweep()
+    return check._grade_actions(readings, read, repos), client
+
+
+def _held_line(result, branch="main", workflow_id=_HELD_WF):
+    """The line about the watched workflow on ``branch``, or ``None``."""
+    subject = mod_github._workflow_subject(_repo_id("platform-a"), workflow_id,
+                                           branch)
+    lines = [line for line in result.reason_entries if line.subject == subject]
+    return lines[0] if lines else None
+
+
+def _completed(result, **where):
+    """``(run id, attempt, verdict)`` of that line's completed run."""
+    line = _held_line(result, **where)
+    block = line.data["completed"]
+    return block["id"], block["attempt"], line.data["verdict"]
+
+
+def _contradictions(caplog):
+    return [line for line in _lines(caplog) if "contradicts the held run" in line]
+
+
+def _holding(**over):
+    """A check that shows passing lines too, so a held pass is a line to read."""
+    return _check(actions_show_healthy=True, **over)
+
+
+def test_an_answer_out_of_order_is_sorted_by_run_id_and_is_no_contradiction(caplog):
+    """"Each answer's runs are sorted by run id, newest first, before the scan": the
+    first row with a verdict in GitHub's order was an older run whenever GitHub
+    answered out of order. And what the sort repairs is not a contradiction — the
+    log line counts only what it could not."""
+    caplog.set_level(logging.INFO, logger=_LOGGER)
+    check, github = _holding(), _RecordedGitHub()
+    github.runs[(_HELD_WF, "main")] = _page(
+        _run(101, conclusion="success"), _run(103, conclusion="failure"),
+        _run(102, conclusion="success"))
+    first, _client = _poll(check, github)
+    assert _completed(first) == (103, 1, "failed")
+    github.runs[(_HELD_WF, "main")] = _page(
+        _run(102), _run(101), _run(103, conclusion="failure"))
+    second, _client = _poll(check, github)
+    assert _completed(second) == (103, 1, "failed")
+    assert github.read_by_id() == []
+    assert _contradictions(caplog) == []
+
+
+def test_an_answer_that_leaves_the_newest_run_out_is_held_back(caplog):
+    """"The hold overrides an answer that lacks the newer runs": GitHub answers the
+    ten newest without the newest, the line keeps the run it had read, and the run
+    is read once by id — still there, so the hold stands. A repeat of that read is a
+    `304`, and costs nothing."""
+    caplog.set_level(logging.INFO, logger=_LOGGER)
+    check, github = _holding(), _RecordedGitHub()
+    github.runs[(_HELD_WF, "main")] = _page(_run(103, conclusion="failure"),
+                                            _run(101))
+    _poll(check, github)
+    github.runs[(_HELD_WF, "main")] = _page(_run(101), _run(99))
+    github.by_id[103] = _by_id(_run(103, conclusion="failure"), etag='W/"r103"')
+    second, client = _poll(check, github)
+    assert _completed(second) == (103, 1, "failed")
+    assert github.read_by_id() == [("103", None)]          # once, and only once
+    assert client.reads_made == 3                           # list, runs, the run
+    (said,) = _contradictions(caplog)
+    assert said.endswith("held: the run is still there")
+    github.by_id[103] = _UNCHANGED
+    third, client = _poll(check, github)
+    assert _completed(third) == (103, 1, "failed")
+    assert github.read_by_id() == [("103", 'W/"r103"')]
+    assert client.free_reads == 1
+
+
+def test_an_empty_answer_for_a_held_line_is_a_contradiction_too(caplog):
+    """"An answer with no completed run at all for a held (workflow, branch) is a
+    contradiction too" — what an exact read's empty answer used to mean *does not
+    run on this branch* is asked of the held run first."""
+    caplog.set_level(logging.INFO, logger=_LOGGER)
+    check, github = _holding(), _RecordedGitHub()
+    github.runs[(_HELD_WF, "main")] = _page(_run(103))
+    _poll(check, github)
+    github.runs[(_HELD_WF, "main")] = _page()
+    github.by_id[103] = _by_id(_run(103))
+    second, _client = _poll(check, github)
+    assert _completed(second) == (103, 1, "passed")
+    assert github.read_by_id() == [("103", None)]
+    (said,) = _contradictions(caplog)
+    assert "its newest completed run is none" in said
+
+
+def test_a_held_run_that_answers_404_is_let_go_and_the_answer_believed(caplog):
+    """"A `404` means GitHub no longer has it: the hold lets go, and the answer is
+    believed" — the line shows the newest run GitHub still has, and that is what
+    is held from then on."""
+    caplog.set_level(logging.INFO, logger=_LOGGER)
+    check, github = _holding(), _RecordedGitHub()
+    github.runs[(_HELD_WF, "main")] = _page(_run(103, conclusion="failure"),
+                                            _run(101))
+    _poll(check, github)
+    github.runs[(_HELD_WF, "main")] = _page(_run(101))    # 103 is gone
+    second, _client = _poll(check, github)
+    assert _completed(second) == (101, 1, "passed")
+    (said,) = _contradictions(caplog)
+    assert said.endswith("let go: GitHub no longer has the run")
+    caplog.clear()
+    third, _client = _poll(check, github)                 # 101 is held now
+    assert _completed(third) == (101, 1, "passed")
+    assert github.read_by_id() == [] and _contradictions(caplog) == []
+
+
+def test_a_line_whose_every_run_retention_took_goes_as_it_goes_today():
+    """How GitHub's retention will show up: every run of a quiet workflow gone, an
+    empty answer, and a held run that answers `404`. The line goes, as a workflow
+    with no run on its branch has none."""
+    check, github = _holding(), _RecordedGitHub()
+    github.runs[(_HELD_WF, "main")] = _page(_run(103, conclusion="failure"))
+    _poll(check, github)
+    github.runs[(_HELD_WF, "main")] = _page()
+    second, _client = _poll(check, github)
+    assert _held_line(second) is None
+
+
+def test_a_200_with_a_newer_attempt_replaces_the_held_run(caplog):
+    """"A `200` whose attempt is newer than the held one replaces it, as question 1
+    settled" — a re-run of the held run, completed, is the run the line is of now,
+    and names its attempt. A newer attempt still in flight is not a verdict, and
+    the hold, which holds verdicts only, stands."""
+    caplog.set_level(logging.INFO, logger=_LOGGER)
+    check, github = _holding(), _RecordedGitHub()
+    github.runs[(_HELD_WF, "main")] = _page(_run(103, conclusion="failure"))
+    _poll(check, github)
+    github.runs[(_HELD_WF, "main")] = _page(_run(101))
+    github.by_id[103] = _by_id(_run(103, 2, status="in_progress"))
+    second, _client = _poll(check, github)
+    assert _completed(second) == (103, 1, "failed")
+    assert _contradictions(caplog)[-1].endswith(
+        "held: a newer attempt is in flight, 103/2")
+    github.by_id[103] = _by_id(_run(103, 2, conclusion="success"))
+    third, _client = _poll(check, github)
+    assert _completed(third) == (103, 2, "passed")
+    assert _contradictions(caplog)[-1].endswith("replaced: a newer attempt, 103/2")
+
+
+def test_a_throttle_on_the_read_by_id_leaves_the_hold_standing(caplog):
+    """"A throttle … leaves the hold standing for that poll": a wait the run cannot
+    afford is refused, and the line keeps the run it had read."""
+    caplog.set_level(logging.INFO, logger=_LOGGER)
+    check, github = _holding(), _RecordedGitHub()
+    github.runs[(_HELD_WF, "main")] = _page(_run(103, conclusion="failure"))
+    _poll(check, github)
+    github.runs[(_HELD_WF, "main")] = _page(_run(101))
+    github.by_id[103] = _http_error(
+        403, b'{"message": "You have exceeded a secondary rate limit"}',
+        {"Retry-After": "3600"})
+    second, _client = _poll(check, github, deadline=Deadline(300))
+    assert _completed(second) == (103, 1, "failed")
+    assert _contradictions(caplog)[-1].endswith("held: not answered, throttled")
+
+
+def test_a_5xx_on_the_read_by_id_leaves_the_hold_standing(caplog):
+    """"… an error …": GitHub failing to answer is not GitHub saying the run is
+    gone, so the hold stands, and the line says which error it was."""
+    caplog.set_level(logging.INFO, logger=_LOGGER)
+    check, github = _holding(), _RecordedGitHub()
+    github.runs[(_HELD_WF, "main")] = _page(_run(103, conclusion="failure"))
+    _poll(check, github)
+    github.runs[(_HELD_WF, "main")] = _page(_run(101))
+    github.by_id[103] = lambda: _http_error(502, b"<html>bad gateway</html>")
+    second, _client = _poll(check, github)
+    assert _completed(second) == (103, 1, "failed")
+    assert _contradictions(caplog)[-1].endswith("held: not answered, HTTP 502")
+
+
+def test_the_deadline_on_the_read_by_id_cuts_the_aspect_and_keeps_the_hold(caplog):
+    """"… or the deadline leaves the hold standing for that poll." The deadline is
+    the run's, so it cuts the aspect as it cuts any read — and the run held is still
+    held on the next poll, where the answer is checked again."""
+    caplog.set_level(logging.INFO, logger=_LOGGER)
+    check, github = _holding(), _RecordedGitHub()
+    github.runs[(_HELD_WF, "main")] = _page(_run(103, conclusion="failure"))
+    _poll(check, github)
+    now = [0.0]
+    github.runs[(_HELD_WF, "main")] = _page(_run(101))
+
+    def late(path):
+        if "/actions/runs/" in path:
+            now[0] = 1000.0               # the budget runs out on the read by id
+    github.before = late
+    with pytest.raises(DeadlineExceeded):
+        _poll(check, github, deadline=Deadline(300, clock=lambda: now[0]))
+    assert _contradictions(caplog)[-1].endswith("held: not answered, the deadline")
+    github.before = None
+    github.by_id[103] = _by_id(_run(103, conclusion="failure"))
+    third, _client = _poll(check, github)
+    assert _completed(third) == (103, 1, "failed")
+
+
+def test_a_wait_past_the_pause_budget_cuts_the_aspect_and_keeps_the_hold(caplog):
+    """The throttle's other ending: a wait the pause budget cannot take ends the run
+    as the deadline does (ADR-0007) — said on the line, and the run held is still
+    held on the next poll."""
+    caplog.set_level(logging.INFO, logger=_LOGGER)
+    check, github = _holding(), _RecordedGitHub()
+    github.runs[(_HELD_WF, "main")] = _page(_run(103, conclusion="failure"))
+    _poll(check, github)
+    github.runs[(_HELD_WF, "main")] = _page(_run(101))
+    github.by_id[103] = lambda: _http_error(
+        403, b'{"message": "You have exceeded a secondary rate limit"}',
+        {"Retry-After": "60"})
+    with pytest.raises(mod_github._PauseBudgetSpent):
+        _poll(check, github, max_pause=10.0)
+    assert _contradictions(caplog)[-1].endswith(
+        "held: not answered, the pause budget")
+    github.by_id[103] = _by_id(_run(103, conclusion="failure"))
+    third, _client = _poll(check, github)
+    assert _completed(third) == (103, 1, "failed")
+
+
+def test_the_hold_keeps_what_the_line_is_rendered_from_and_nothing_else():
+    """GitHub's run object carries the repository, the commit and the actor, and a
+    line reads none of them: the hold keeps the fields the line is rendered from."""
+    check, github = _holding(), _RecordedGitHub()
+    heavy = {**_run(103, conclusion="failure"), "head_commit": {"message": "x" * 999},
+             "repository": {"full_name": _HELD_REPO}, "actor": {"login": "someone"}}
+    github.runs[(_HELD_WF, "main")] = _page(heavy)
+    _poll(check, github)
+    line = (_repo_id("platform-a"), _HELD_WF, "main")
+    assert set(check._hold.get(line)) == set(mod_github._HELD_FIELDS)
+
+
+def test_the_budget_fallback_reads_nothing_by_id_and_the_hold_stands(caplog):
+    """"… none when the guard has made the run fall back for budget. Then the hold
+    stands for that poll, as it does on a throttle." The wide page the fallback reads
+    contradicts the held run, and nothing is asked about it."""
+    caplog.set_level(logging.INFO, logger=_LOGGER)
+    check, github = _holding(), _RecordedGitHub()
+    github.runs[(_HELD_WF, "main")] = _page(_run(103, conclusion="failure"))
+    _poll(check, github)
+    github.budget = {"X-RateLimit-Limit": "5000", "X-RateLimit-Remaining": "0",
+                     "X-RateLimit-Used": "5000", "X-RateLimit-Reset": "4000000000",
+                     "X-RateLimit-Resource": "core"}
+    github.runs["wide"] = _page(_run(101))
+    second, _client = _poll(check, github)
+    assert any(path.endswith("/actions/runs?per_page=100&branch=main")
+               for path, _ in github.asked)
+    assert _completed(second) == (103, 1, "failed")
+    assert github.read_by_id() == []
+    assert _contradictions(caplog)[-1].endswith(
+        "held: not asked, the budget fallback")
+
+
+def test_two_runs_started_in_the_same_minute_are_ordered_by_id():
+    """Ordered by the id GitHub gave each run, not by when it started: the newer
+    run of two started in one minute can start first, when the older one waited
+    for a runner, and it is still the newer."""
+    check, github = _holding(), _RecordedGitHub()
+    github.runs[(_HELD_WF, "main")] = _page(
+        _run(5001, conclusion="success", started="2026-09-20T10:00:40Z"),
+        _run(5002, conclusion="failure", started="2026-09-20T10:00:10Z"))
+    result, _client = _poll(check, github)
+    assert _completed(result) == (5002, 1, "failed")
+
+
+def test_the_run_in_flight_comes_from_the_current_answer_only():
+    """"It holds the completed verdict only, the run in flight coming from the
+    current answer": the newest run in flight by id rides on the line; an answer
+    with none in it has none on the line, whatever the last one had — and a held
+    line keeps its verdict and nothing else."""
+    check, github = _holding(), _RecordedGitHub()
+    github.runs[(_HELD_WF, "main")] = _page(
+        _run(5008, status="in_progress"), _run(5007),
+        _run(5010, status="queued"), _run(5009, conclusion="failure"))
+    first, _client = _poll(check, github)
+    line = _held_line(first)
+    assert line.data["running"]["id"] == 5010
+    assert _completed(first) == (5009, 1, "failed")
+    github.runs[(_HELD_WF, "main")] = _page(_run(5009, conclusion="failure"))
+    second, _client = _poll(check, github)
+    assert "running" not in _held_line(second).data
+    github.runs[(_HELD_WF, "main")] = _page()
+    github.by_id[5009] = _by_id(_run(5009, conclusion="failure"))
+    third, _client = _poll(check, github)
+    assert _completed(third) == (5009, 1, "failed")
+    assert "running" not in _held_line(third).data
+
+
+def test_the_first_answer_after_a_restart_is_believed(caplog):
+    """The hold is this process's and is lost at a restart, so the first answer
+    after one is believed: accepted in question 1, and nothing is read by id."""
+    caplog.set_level(logging.INFO, logger=_LOGGER)
+    github = _RecordedGitHub()
+    github.runs[(_HELD_WF, "main")] = _page(_run(103, conclusion="failure"))
+    _poll(_holding(), github)
+    github.runs[(_HELD_WF, "main")] = _page(_run(101))
+    restarted, _client = _poll(_holding(), github)
+    assert _completed(restarted) == (101, 1, "passed")
+    assert github.read_by_id() == [] and _contradictions(caplog) == []
+
+
+def test_the_contradiction_line_carries_every_field(caplog):
+    """One `INFO` line per contradiction, with a fixed phrase: the repository, the
+    workflow and branch, the held run, the answer's newest, its `total_count`, the
+    rows it returned, whether it was GitHub's (`200`) or the cache's (`304`), and
+    what the read by id found. The cache can only repeat an answer GitHub gave, and
+    the third poll here is that repeat, said as one."""
+    caplog.set_level(logging.INFO, logger=_LOGGER)
+    check = _holding()
+    github = _RecordedGitHub(workflows=((_HELD_WF, "build"),))
+    github.runs[(_HELD_WF, "main")] = _page(
+        _run(103, conclusion="failure", name="build"), etag='W/"a"')
+    _poll(check, github)
+    github.runs[(_HELD_WF, "main")] = _page(_run(101, name="build"), total=57,
+                                            etag='W/"b"')
+    github.by_id[103] = _by_id(_run(103, conclusion="failure", name="build"))
+    _poll(check, github)
+    github.runs[(_HELD_WF, "main")] = _UNCHANGED
+    _poll(check, github)
+    fresh, cached = _contradictions(caplog)
+    assert [record.levelno for record in caplog.records
+            if "contradicts the held run" in record.getMessage()] == [logging.INFO] * 2
+    assert fresh == (
+        "/github: actions: example-org/platform-a · build (5) on main — the "
+        "answer contradicts the held run 103/1: its newest completed run is "
+        "101/1 (total_count 57, 1 row, 200); held: the run is still there")
+    assert cached == fresh.replace(", 200)", ", 304)")
+
+
+def test_the_estate_counts_the_runs_held_and_this_runs_contradictions(monkeypatch):
+    """"The runs held is a level, as `cache_held` is; the contradictions and the
+    holds let go are this run's counts, as `free_reads` is" — and the node's report
+    says them beside the conditional cache's."""
+    monkeypatch.setenv("GITHUB_TOKEN", "t")
+    check = _holding(disabled_aspects=_NOT_ACTIONS)
+    github = _RecordedGitHub()
+    github.runs[(_HELD_WF, "main")] = _page(_run(103, conclusion="failure"),
+                                            _run(101))
+    monkeypatch.setattr(mod_github, "shared_ledger", Ledger)   # the guard's, apart
+    with _through(github.answer) as (build, _opener):
+        def client(token, deadline=None):
+            return build(cache=check._conditional, deadline=deadline,
+                         ledger=Ledger())
+        check._make_client = client  # type: ignore[method-assign]
+
+        def estate():
+            (reading, *_rest) = measured(check)
+            return {name: reading.record[name]
+                    for name in ("runs_held", "contradictions", "holds_let_go")}
+        assert estate() == {"runs_held": 1, "contradictions": 0,
+                            "holds_let_go": 0}
+        github.runs[(_HELD_WF, "main")] = _page(_run(101))     # 103 is gone
+        assert estate() == {"runs_held": 1, "contradictions": 1,
+                            "holds_let_go": 1}
+        assert estate() == {"runs_held": 1, "contradictions": 0,
+                            "holds_let_go": 0}
+        report = run_check(check).report
+    assert ("held runs: 1 kept; this run's answers contradicted them 0 time(s), "
+            "0 let go") in report
+
+
+def test_a_held_run_nobody_asks_about_for_two_passes_is_swept():
+    """"Its entries are swept as the cache's are": a workflow gone from the list
+    for two passes is forgotten, so when it comes back its first answer is believed
+    — while one missed pass forgets nothing."""
+    check, github = _holding(), _RecordedGitHub()
+    github.runs[(_HELD_WF, "main")] = _page(_run(103, conclusion="failure"))
+    _poll(check, github)
+    github.workflows = []
+    _poll(check, github)                               # one pass without it
+    github.workflows = [(_HELD_WF, "ci")]
+    github.runs[(_HELD_WF, "main")] = _page(_run(101))
+    github.by_id[103] = _by_id(_run(103, conclusion="failure"))
+    kept, _client = _poll(check, github)
+    assert _completed(kept) == (103, 1, "failed")      # still held
+    github.workflows = []
+    _poll(check, github)
+    _poll(check, github)                               # two passes without it
+    github.workflows = [(_HELD_WF, "ci")]
+    swept, _client = _poll(check, github)
+    assert _completed(swept) == (101, 1, "passed")
+    assert github.read_by_id() == []
+
+
+def test_a_held_run_on_a_named_branch_keeps_the_repository_matched():
+    """ADR-0009's line says no watched workflow ran on any named branch; a run the
+    read by id says is still there is one, so the line stays silent while it holds."""
+    check, github = _holding(actions_branches=("release",)), _RecordedGitHub()
+    github.runs[(_HELD_WF, "release")] = _page(
+        _run(103, conclusion="failure", branch="release"))
+    _poll(check, github)
+    github.runs[(_HELD_WF, "release")] = _page()
+    github.by_id[103] = _by_id(_run(103, conclusion="failure", branch="release"))
+    second, _client = _poll(check, github)
+    assert _completed(second, branch="release") == (103, 1, "failed")
+    assert "branches-unmatched" not in [line.slug for line in second.reason_entries]
+
+
+def test_a_line_is_named_after_its_workflow_and_after_its_run_only_without_one():
+    """"An actions line and its record's workflow field take the workflow's name
+    from the list the check reads every run, and the run's name is dropped" — a
+    workflow whose runs are each named after their job, as Dependabot's are, reads
+    one name on every run. Where the list gives none, the run's name stands in, the
+    reverse of the old order. No slug moves: it is keyed on ids."""
+    check = _holding()
+    github = _RecordedGitHub(workflows=((_HELD_WF, "update jobs"), (6, "")))
+    github.runs[(_HELD_WF, "main")] = _page(
+        _run(201, name="npm in / - Update #111"))
+    github.runs[(6, "main")] = _page(_run(301, wf_id=6, name="nightly sweep"))
+    result, _client = _poll(check, github)
+    named = _held_line(result)
+    assert named.data["workflow"] == "update jobs"
+    assert "/ update jobs" in named.text and "Update #111" not in named.text
+    assert named.slug == _slug("platform-a", "workflow", _HELD_WF, "main")
+    assert _held_line(result, workflow_id=6).data["workflow"] == "nightly sweep"
+
+
+# --- a reset no clock can write (ADR-0007 decision 5) ---------------------------
+
+#: Window ends GitHub could send in `x-ratelimit-reset` that the machine's clock
+#: cannot hold: on the device VM `time.localtime` refuses the first with `OSError`
+#: and the other two with `OverflowError`.
+_UNWRITABLE_RESETS = (10**18, 10**20, -10**20)
+
+#: A window's end as a clock time, the way `_resets_at` writes one beside the minutes.
+_CLOCK_TIME = re.compile(r"\(\d{2}:\d{2}:\d{2}\)")
+
+
+def _routed(bodies, headers):
+    """An answer for `_Opener` that serves a whole run by path — each from `bodies`,
+    `[]` where it names none — with the same budget headers on every response."""
+    def answer(request, _timeout):
+        path = urllib.parse.urlsplit(request.full_url).path
+        return _Answer(body=json.dumps(bodies.get(path, [])).encode(),
+                       headers=headers)
+    return answer
+
+
+@pytest.mark.parametrize("reset", _UNWRITABLE_RESETS)
+def test_a_reset_no_clock_can_write_costs_a_run_its_clock_time_and_nothing_else(
+        reset, monkeypatch, caplog):
+    """ADR-0007 decision 5: where the machine's clock cannot write a
+    window's end, the line keeps the minutes alone. A whole `github` run, through
+    its own client and the library's `fetch`, with every response saying its window
+    ends at `reset` and has spend on it — so the first sight of the window writes
+    its line, and the aspect's line says what GitHub said. The run finishes with its
+    readings, and every line naming the window says how long it has left and no
+    clock time."""
+    monkeypatch.setenv("GITHUB_TOKEN", "x")
+    caplog.set_level(logging.INFO, logger=_LOGGER)
+    bodies = {
+        "/users/example-org": {"type": "Organization"},
+        "/orgs/example-org/teams": [{"slug": "platform", "name": "platform"}],
+        "/orgs/example-org/teams/platform/repos": [_repo("platform-a")],
+        "/rate_limit": {"resources": {"core": {
+            "limit": 5000, "remaining": 4900, "reset": _AHEAD}}},
+        "/repos/example-org/platform-a/pulls": [
+            {"number": 3, "title": "Bump", "user": {"login": "bot"},
+             "html_url": "https://gh/pr/3"}],
+    }
+    check = _check(disabled_aspects=tuple(
+        aspect for aspect in GitHubCheck.ASPECTS if aspect != "pull_requests"))
+    opener = _Opener(_routed(bodies, _budget_headers(4900, reset)))
+    with mock.patch.object(ls_fetch, "_FOLLOWING", opener):
+        readings = measured(check)
+    assert [reading.record["kind"] for reading in readings] == [
+        "estate", "repository", "pull_request"]
+    named = [line for line in _lines(caplog)
+             if "resets in" in line or "resetting now" in line]
+    assert any(": first reading of the core window, " in line for line in named)
+    assert any("GitHub says core: 4900 of 5000 left, 100 used, " in line
+               for line in named)
+    clause = "resetting now" if reset < 0 else "resets in "
+    assert [line for line in named
+            if clause not in line or _CLOCK_TIME.search(line)] == []

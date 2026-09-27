@@ -1,13 +1,15 @@
 # ADR-0005 — The `actions` aspect asks per workflow
 
 - **Status:** Accepted
-- **Date:** 2026-09-20 (accepted 2026-08-30)
+- **Date:** 2026-09-27 (accepted 2026-08-30)
 - **Related:** [ADR-0003](0003-an-aspect-is-one-question-asked-of-the-whole-scope.md)
   (an aspect is one question asked of the whole scope, which this changes the *asking*
   of), [ADR-0002](0002-a-read-failure-is-not-a-finding.md) (a line that grades nothing,
   and why the coverage line here is not one of those),
   [ADR-0001](0001-a-second-check-type-in-this-package.md) (the API budget, and the run
-  this check declines to make)
+  this check declines to make),
+  [ADR-0015](0015-a-workflow-line-holds-the-newest-run-it-has-read.md) (the newest run
+  a line holds when an answer goes back on it)
 
 A bare ADR number here is this repository's; a reference to one of little-sister's
 is always written out, because the two numbering spaces overlap.
@@ -41,9 +43,15 @@ Two bounded reads about a repository cannot answer a question about a workflow.
 ## Decision
 
 **The default-branch mode asks per workflow.**
-`/repos/<repo>/actions/workflows/<id>/runs?branch=<default>&per_page=10` is exact by
-construction: an empty answer means this workflow does not run on this branch, which
-is an answer and not a gap. The aspect reads the workflow list once per repository as
+`/repos/<repo>/actions/workflows/<id>/runs?branch=<default>&per_page=10` is exact as a
+question, and GitHub does not always answer it exactly: it documents the `branch`
+filter as a search, and it has answered one out of order and without its newest runs.
+So each answer's runs are sorted by run id before the scan, and the check holds the
+newest completed run each line has read; an answer that goes back on it — an empty one
+included — is checked by reading that run by id
+([ADR-0015](0015-a-workflow-line-holds-the-newest-run-it-has-read.md)). *Nothing back*
+means this workflow does not run on this branch — an answer and not a gap — where
+nothing is held. The aspect reads the workflow list once per repository as
 it already did, filters it by `ignore_workflow_name_patterns` **before** spending
 anything, and asks once per surviving workflow.
 

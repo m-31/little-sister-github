@@ -1,7 +1,7 @@
 # ADR-0012 — The `actions` line carries what it read
 
 - **Status:** Accepted
-- **Date:** 2026-09-19
+- **Date:** 2026-09-27 (accepted 2026-09-19)
 - **Related:** [ADR-0004](0004-a-finding-grades-the-repository-does-not.md) (the
   finding is what grades, and the repository is its subject),
   [ADR-0005](0005-the-actions-aspect-asks-per-workflow.md) (the read this record
@@ -11,7 +11,13 @@
   which is **not** a record and is deliberately nowhere near one), little-sister
   **ADR-0082** (the field, its vocabulary and its limit), little-sister **ADR-0050**
   (the id a slug is keyed on, which is also the subject), little-sister **ADR-0018**
-  (escaping is a render-time step)
+  (escaping is a render-time step),
+  [ADR-0013](0013-the-object-of-an-actions-line-is-the-workflow-on-its-branch.md) (the
+  workflow on its branch, the subject of a run line),
+  [ADR-0014](0014-a-run-is-its-readings-and-the-estate-is-its-object.md) (every time
+  this package's records carry, and the heaviest of them declared),
+  [ADR-0015](0015-a-workflow-line-holds-the-newest-run-it-has-read.md) (the workflow's
+  name the record carries)
 - **Register:** [`../decisions.md`](../decisions.md)
 
 A bare ADR number here is this repository's; a reference to one of little-sister's is
@@ -32,13 +38,19 @@ because those names are read by things that are not this package.
 
 ## Decision
 
-### 1. The subject is the repository, as its id
+### 1. The subject is the workflow on its branch, as ids
 
-Every `actions` line that is about one repository carries `subject=str(repo.id)` —
-the numeric id, which is the only field a rename cannot change and which the line's
-slug is already keyed on ([ADR-0004](0004-a-finding-grades-the-repository-does-not.md),
-little-sister [ADR-0050](0050-slugs-from-provider-identifiers.md) in that repository).
-The name a human reads goes in the record instead, under `repository`.
+A run line's subject is the **workflow on its branch**,
+`<repository id>:<workflow id>:<branch>`, and a disabled line's is the workflow,
+`<repository id>:<workflow id>` — the numeric ids, which are the only fields a rename
+cannot change and which the line's slug is already keyed on
+([ADR-0004](0004-a-finding-grades-the-repository-does-not.md), little-sister
+[ADR-0050](0050-slugs-from-provider-identifiers.md) in that repository). Not the
+repository: little-sister ADR-0086 hands the grading one measurement per object and
+never one object twice, and a repository has many workflow-branches
+([ADR-0013](0013-the-object-of-an-actions-line-is-the-workflow-on-its-branch.md)). The
+names a human reads go in the record instead, under `repository` and `workflow`, beside
+`repository_id` and `workflow_id`.
 
 Two lines are deliberately **without** a subject: the coverage line and the
 `runs-window-partial` line are about the estate this leaf was asked about, not about
@@ -53,8 +65,12 @@ per-repository status, and a subject pin would be one by the back door.
 ### 2. What the record carries, and the two words for one outcome
 
 The run line's record is the repository, the workflow, the branch, the verdict, and a
-block per run — the newest useful **completed** one, and the **running** one where
-there is one. Each block carries the run number, the URL, GitHub's `status` and
+block per run. The workflow is its name as the workflow list gives it, and the run's
+only where the list gives none
+([ADR-0015](0015-a-workflow-line-holds-the-newest-run-it-has-read.md) §5): a workflow
+whose runs are named after their jobs, as Dependabot's are, reads one name on every
+run, and no slug moves. The run blocks are the newest useful **completed** run, and
+the **running** one where there is one. Each block carries the run number, the URL, GitHub's `status` and
 `conclusion`, and its times.
 
 **`conclusion` and `verdict` are both there because they have different jobs.**
@@ -65,23 +81,31 @@ cannot compute *failed* from *failure*, and a grading map must not read a word t
 package invented, so neither field can stand in for the other.
 
 The disabled line's record is smaller and has no run in it: the repository, the
-workflow, its URL, and GitHub's `state`
-([ADR-0010](0010-a-disabled-workflow-is-a-line-not-a-read.md)). `state` is free-form
+workflow, its URL, GitHub's `state`
+([ADR-0010](0010-a-disabled-workflow-is-a-line-not-a-read.md)), and when the workflow
+last changed, as `updated.at`
+([ADR-0013](0013-the-object-of-an-actions-line-is-the-workflow-on-its-branch.md) §5). `state` is free-form
 here; the library types three names and this is not one of them.
 
 ### 3. `started` is claimed, `ended` is not
 
 Of the three names little-sister reads as an instant — `at`, `started`, `ended` —
-this record uses exactly one. `run_started_at` is GitHub's own field and means what
+this record claims `started` at the top of a run block and `at` only nested, as
+`updated.at`. `run_started_at` is GitHub's own field and means what
 `started` means, so it is claimed. There is **no completion time on a workflow run**
 at all; the nearest thing is `updated_at`, which is when anything about the run last
-changed. That is worth keeping and is kept, under the free-form name `updated` — not
-under `ended`, which would publish an inference as a fact for the sake of a prettier
-vocabulary.
+changed. That is worth keeping and is kept as `updated.at`, under the name the library
+reads as an instant at any depth of a record, so a surface that shows a record's times
+shows it as one — not under `ended`, which would publish an inference as a fact for the
+sake of a prettier vocabulary, and not as the record's own top-level `at`, since it is
+not the instant the record is of.
 
-A field GitHub did not send is `null` and never `""`. The library refuses a timed name
-whose value is not a time, so an empty string there would fail the whole result — and
-*this run has not started* is a fact the record should be able to state.
+A field GitHub did not send is `null` and never `""`, and `started` and `updated.at` are
+each read as a time or `null`, so a value GitHub sent that is not an instant with an
+offset costs that field and not the whole result — *this run has not started* is a fact
+the record should be able to state. Every other time a record of this package carries
+is kept the same way
+([ADR-0014](0014-a-run-is-its-readings-and-the-estate-is-its-object.md) §8).
 
 ### 4. The sentence does not move
 
@@ -93,10 +117,8 @@ half of it here would leave two places deciding what a line says.
 
 ## Consequences
 
-- **The floor rises to `little-sister>=0.3.17`**, because `Entry.subject` and
-  `Entry.data` are that release's surface. Until it is on the index this package
-  resolves the library from the checkout beside it (PL2's window) and **cannot be
-  released**.
+- **The floor rose to `little-sister>=0.3.17`**, because `Entry.subject` and
+  `Entry.data` are that release's surface.
 - **The record's field names are stored keys now**, in the sense that matters: a
   deployment's line template and its grading map will address them, so renaming one
   is a breaking change even though nothing in this package's code says so (PL10).
@@ -104,9 +126,9 @@ half of it here would leave two places deciding what a line says.
 - **The escaping moves, but not yet.** A record field is data escaped at render
   (little-sister ADR-0018), which is what will let `_action_text` stop escaping names
   itself — when the template stage arrives, not here.
-- **Each record is a few hundred bytes**, comfortably inside the two-kilobyte limit;
-  no `expected_record()` is declared, because a declaration that only repeats *this
-  fits easily* is a number to keep honest for nothing.
+- **A run's record is 1,521 bytes at its heaviest**, its branch clipped at 300 bytes,
+  against the 2 KB default. The type declares its heaviest record, a dependency
+  graph's ([ADR-0014](0014-a-run-is-its-readings-and-the-estate-is-its-object.md) §4).
 - **A reader of the leaf sees nothing new** until the node's own page is opened,
   where the record renders as a plain list of dotted names and values.
 

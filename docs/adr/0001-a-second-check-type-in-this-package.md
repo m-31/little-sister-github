@@ -1,11 +1,13 @@
 # ADR-0001 — The API budget is a check type of its own, not an eighth aspect
 
 - **Status:** Accepted
-- **Date:** 2026-09-20 (accepted 2026-08-15)
+- **Date:** 2026-09-27 (accepted 2026-08-15)
 - **Related:** [`../../README.md`](../../README.md) (how both types are configured),
   little-sister ADR-0042 (an entry carries its own code), little-sister ADR-0050 (a
   slug is an identifier, never a position), little-sister ADR-0051 (one bare type
-  name, claimed once), little-sister ADR-0023 (secret references)
+  name, claimed once), little-sister ADR-0023 (secret references),
+  [ADR-0014](0014-a-run-is-its-readings-and-the-estate-is-its-object.md) (the account a
+  budget's reading names, asked once per process)
 
 This is the **first ADR in this repository's sequence**. A reference to one of
 little-sister's is always written `little-sister ADR-00NN`; a bare number here is ours.
@@ -55,8 +57,11 @@ own cadence, and what it reports is the explanation of the other check's skipped
 
 **Reading the endpoint is free, and the two checks want different frequencies.**
 GitHub does not count `GET /rate_limit` against the budget it reports. A check that
-costs nothing can run every minute; the `github` check runs every fifteen because it
-costs `repos × aspects` calls. An aspect is tied to its check's `frequency:`, so
+costs nothing past its first run can run every minute — that run asks `GET /user` whose
+token it is, one `core` request per process, because the readings of a budget name that
+account's budget as their object and `/rate_limit` never says whose it is
+([ADR-0014](0014-a-run-is-its-readings-and-the-estate-is-its-object.md) §6). The `github`
+check runs every fifteen because it costs `repos × aspects` calls. An aspect is tied to its check's `frequency:`, so
 folding the cheap reading into the expensive check would either make the budget stale
 or make the expensive check run too often.
 

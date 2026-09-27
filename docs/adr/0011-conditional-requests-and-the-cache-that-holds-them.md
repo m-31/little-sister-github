@@ -115,9 +115,9 @@ A second run against an unchanged organization spends a fraction of the requests
 to, and no promise changes: a `304` returns exactly the payload the `200` returned.
 
 The cache is invisible to everything the library can attribute — it is not entries, so
-`entry_limit` never sees it, and ADR-0075's declarations cover worker seconds and entry
-counts rather than held bytes. The observed limit is the backstop and the report line is
-so that a reader can see the thing that grew.
+`entry_limit` never sees it, and little-sister ADR-0075's declarations cover worker
+seconds and entry counts rather than held bytes. The observed limit is the backstop and
+the report line is so that a reader can see the thing that grew.
 
 `sbom_check` is outside this: it reads `POST /graphql`, conditional requests are a
 `GET`/`HEAD` mechanism, and the answer carries no `ETag`. Seven aspects and discovery,

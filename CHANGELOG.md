@@ -11,6 +11,163 @@ the code says so.
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-09-27
+
+**Nothing you configure or pin moves** — no `type:` name, no configuration key, and no
+slug but one on a branch name of some 180 characters with non-ASCII letters among them.
+What moves is the `subject` an `actions` line carries, which nothing pins, and **one
+field of its record: a run block's `updated` is now `updated.at`**, so a line template
+or a grading map that reads it must read the new name. See *Changed*.
+
+### Added
+
+- **The two check types run as two halves, on the library's third check API
+  epoch.** Each run first reads GitHub and hands back what it read, then says what that
+  means from those readings alone, so the same verdict can be reached again later over
+  a reading this process did not take
+  ([ADR-0014](docs/adr/0014-a-run-is-its-readings-and-the-estate-is-its-object.md),
+  little-sister ADR-0086). A `github` run's first reading is about the **estate** the
+  check watches, and it names it: the owner, then only the filters your configuration
+  set away from their defaults — `example-org;prefix=web`,
+  `example-org;team=platform;forks=no`. Two checks watching one account through two
+  prefixes are two estates, and say so. A `github-rate-limit` run reads one record per
+  watched resource, and each names **whose budget** it is:
+  `example-user;resource=core`. A window's reset in it — the tightest one's, and each
+  other one's under `others` — is a time, `reset.at`, where GitHub counts seconds.
+  Each resource is its own budget at GitHub, so each is its own object — and each line
+  carries its reading: the budget as its `subject` and what was read as its `data`,
+  the line for a resource GitHub did not report included. With an installation token
+  the `data` is still there and the `subject` is empty.
+- **Every pull request, alert, issue and dependency-graph line carries what was read
+  about it**, and so does each line about a repository that could not be read or is
+  gone: the reading's record as the line's `data`, as the `actions` and
+  `github-rate-limit` lines already do
+  ([ADR-0014](docs/adr/0014-a-run-is-its-readings-and-the-estate-is-its-object.md)).
+  No sentence, slug or pin moves. The record shows on the node's own page and in the
+  JSON a client reads — a few hundred bytes a finding — and its field names are keys
+  from now on, so a line template or a grading map may be written against them. A time
+  in it is kept as one: a secret-scanning alert's creation is `created.at`.
+- **`github-rate-limit` asks `GET /user` once per process**, on its first run, to learn
+  whose token it reads the budget of — one `core` request, where every run before spent
+  none, and every later run still spends none; a lookup GitHub throttles for longer
+  than the run's `timeout:` is not waited out but asked again next run. A GitHub App
+  installation token is not a user and GitHub refuses it there; its readings then name
+  no account, because its budget is the installation's and nothing at run time names
+  that. No new permission is needed.
+- **An `actions` reading names the run attempt it is of**, so a `github` check with
+  `series_keep` set keeps each run of a workflow on its branch once, where it kept one
+  record per poll: a finished run read again replaces its own record, a re-run is a
+  record of its own beside the attempt it retried, and a run in flight rides on the
+  record of the run before it until it completes. Each run block of the record gains
+  GitHub's `id` for the run and its `attempt`
+  ([ADR-0013](docs/adr/0013-the-object-of-an-actions-line-is-the-workflow-on-its-branch.md)).
+  A `github-rate-limit` reading names none: every poll is a new reading of the budget.
+- **A switched-off workflow's reading names when the workflow last changed**, so a
+  `github` check with `series_keep` set keeps one record per change of it — each time it
+  is switched off, and whenever else GitHub updates it — where it kept one per poll for
+  as long as it stayed off. Its record gains `updated.at`, GitHub's `updated_at` for
+  the workflow, and the reading names that instant in UTC, however GitHub writes it;
+  where GitHub sends none, it names the workflow's `state` instead
+  ([ADR-0013](docs/adr/0013-the-object-of-an-actions-line-is-the-workflow-on-its-branch.md)).
+  The line's sentence, code and slug do not move.
+- **A `github` check declares the heaviest record it writes**, 1605 bytes — a
+  dependency graph's, with every field at its longest — so a deployment whose
+  `record_limit` is set below that is refused at startup, naming the check, rather
+  than failing a run on that reading
+  ([ADR-0014](docs/adr/0014-a-run-is-its-readings-and-the-estate-is-its-object.md)).
+  At the library's default of 2048 nothing changes, and no start says the record is
+  close to the limit.
+- **One `INFO` line in the log for every answer that goes back on a held run**, with a
+  fixed phrase to count it by — *contradicts the held run* — naming the line's
+  repository, workflow and branch, the held run and the answer's newest, the answer's
+  `total_count` and the rows it returned, whether GitHub or the conditional cache gave
+  it (`200` or `304`), and what reading the run by id found. The `github` check's
+  estate reading gains `runs_held`, the runs held when the run ended, and
+  `contradictions` and `holds_let_go`, that run's counts; its node's report says them
+  after the cache's line
+  ([ADR-0015](docs/adr/0015-a-workflow-line-holds-the-newest-run-it-has-read.md)).
+
+### Changed
+
+- **A run block's `updated` is now `updated.at`** — `completed.updated.at` and
+  `running.updated.at` in an `actions` line's record — a time, under the name a
+  surface that shows a record's times reads as one; it is still not `ended`, since a
+  workflow run has no completion time
+  ([ADR-0012](docs/adr/0012-the-actions-line-carries-what-it-read.md)). **A line
+  template or a grading map that reads `updated` must read `updated.at`.** Every other
+  time a record carries is typed the same way from its first release
+  ([ADR-0014](docs/adr/0014-a-run-is-its-readings-and-the-estate-is-its-object.md)).
+- **An `actions` line is about the workflow on its branch, not the repository.** Its
+  `subject` was the repository's numeric id and is now
+  `<repository id>:<workflow id>:<branch>` — `1001:42:main` — and a disabled
+  workflow's line is `<repository id>:<workflow id>`
+  ([ADR-0013](docs/adr/0013-the-object-of-an-actions-line-is-the-workflow-on-its-branch.md)).
+  Nothing is pinned by subject, so no pin moves; a view that grouped lines by it groups
+  per workflow now, and groups per repository through the record's new
+  `repository_id`. The record also gains `workflow_id`, `aspect` and `kind`; every
+  field it had keeps its name but a run block's `updated`, above. A renamed branch
+  starts a new history.
+- **Free text is clipped once, at 300 characters**, so that what a check read always
+  fits the record it is kept in. A pull request title, an alert's summary or rule, a
+  secret's type and the error a failed read quotes are shorter on their line than they
+  were when they ran past that — the line says exactly the text the record keeps. A
+  workflow's name is clipped at 150 bytes: one past 148 ASCII characters, or 12
+  emoji, is shorter on its line than it was; a slug is keyed on ids, so no pin moves
+  with it. A branch is clipped at 300 bytes wherever a line names it — a workflow's
+  line, and the one that says the configured branches matched nothing — so one past
+  49 Cyrillic letters or 24 emoji is shorter there than it was, and no plain ASCII
+  branch GitHub allows is. A workflow line's slug is still built from the whole
+  branch, so no pin moves with it either, but on a branch of some 180 characters that
+  is clipped too: its slug is now built from a digest of its name, and a pin held on it
+  has to be made again, once. A dependency manifest's path is kept to 70 bytes, from
+  its end: past 68 characters, the line that names an unparseable manifest names the
+  end of its path behind a `…`, where it named the whole path.
+- **An `actions` line is named after its workflow**, as the workflow list names it,
+  and after its latest run only where the list gives no name. Dependabot's lines — its
+  update jobs and its dependency-graph jobs, whose runs are each named after their job
+  — now read `Dependabot Updates` and `Dependency Graph` in the line and in the
+  record's `workflow` field, from run to run, where they changed their name with every
+  job. No slug moves: a slug is keyed on ids
+  ([ADR-0015](docs/adr/0015-a-workflow-line-holds-the-newest-run-it-has-read.md)).
+
+### Fixed
+
+- **An `actions` line no longer goes back to an older run.** GitHub's runs read for a
+  workflow on a branch is a search, and it has answered out of order and without its
+  newest runs, so a line could show a run older than one it had already read — an
+  older failure over a newer pass, and an older success over a newer failure. Each
+  answer is now sorted by run id, and the check holds the newest completed run each
+  line has read: an answer that goes back on it is checked by reading that run by id,
+  and the line lets it go only when GitHub no longer has it. That read is one request
+  per such answer, and a repeat is a `304`, which GitHub does not charge. The hold is
+  kept in the process, so the first answer after a restart is believed
+  ([ADR-0015](docs/adr/0015-a-workflow-line-holds-the-newest-run-it-has-read.md)).
+- **A time GitHub sends that is not one no longer fails the whole run.** A workflow
+  run whose `run_started_at` had no offset, or was not a time at all, made the library
+  refuse the `github` check's whole result, every aspect of the run with it; that time
+  is now `null`, and so is any other time GitHub gets wrong
+  ([ADR-0014](docs/adr/0014-a-run-is-its-readings-and-the-estate-is-its-object.md)).
+- **A window's end the machine's clock cannot hold no longer ends a run.** Every log
+  line naming a budget window writes its end as a clock time, and an
+  `x-ratelimit-reset` past what the platform's clock holds raised out of that line and
+  ended the run of either check type; such a line now says the minutes alone
+  ([ADR-0007](docs/adr/0007-the-budget-is-read-where-it-is-spent.md)).
+- **`github-rate-limit` no longer waits however long GitHub asks.** Its `timeout:`
+  bounded each request and nothing else, so a throttle on the `/rate_limit` read was
+  waited out whatever its length. It is now the whole run's budget, as the `github`
+  check's is: a wait the run cannot afford is refused, and the node says it could not
+  ask GitHub for the rate limit, as it does when GitHub does not answer
+  ([ADR-0002](docs/adr/0002-a-read-failure-is-not-a-finding.md)). Each request keeps
+  `timeout:` as its limit, and nothing new is configurable.
+
+### Requires
+
+- **little-sister 0.3.18 or newer.** The floor rises from 0.3.17 because that release
+  is the first to speak check API epoch 3, where a check type measures and then grades
+  (little-sister ADR-0086); this package says `require_api(3)`, and against an older
+  library it refuses at import, naming both epochs. Upgrade the library first; no
+  configuration changes with it.
+
 ## [0.1.8] - 2026-09-20
 
 **Breaking for anyone who pinned a disabled workflow's line**: that line is keyed
