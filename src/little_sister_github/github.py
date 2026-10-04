@@ -59,6 +59,7 @@ from little_sister.checks import (
 )
 from little_sister.fetch import Response, fault_for, fetch, retry_after
 from little_sister.reasons import MAX_SUBJECT_LENGTH, clip, slug
+from little_sister.spans import local_time
 from little_sister.status import StatusCode
 from little_sister.transport import (
     Deadline,
@@ -1490,21 +1491,25 @@ def _resets_at(reset_epoch: int, now: float) -> str:
     A token has more than one window per resource (ADR-0007), and two trace lines
     saying `resets in 34min` and `resets in 39min` read as one window that moved
     until the clock time shows they are two. The clock is the log's own — the
-    machine's local time, which the timestamp at the head of the line is written
-    in — so the two are compared on one clock. The node keeps `_resets_in`: a
+    configured zone's, which little-sister stamps a line of its default log in
+    (little-sister ADR-0120 decision 9) — so the time at the head of a line and
+    the one inside it are compared on one clock. The library writes it: the
+    window's end is handed to `local_time` as an instant, and this type formats no
+    time of its own (that record's decision 8). The node keeps `_resets_in`: a
     reader there wants the wait, not the hour.
 
-    **Where the machine's clock cannot write the end, the minutes stand alone**
-    (ADR-0007 decision 5). The epoch is GitHub's — an
-    `x-ratelimit-reset`, or a `/rate_limit` row's `reset` — read as any integer,
-    and `time.localtime` refuses one its platform's `time_t` cannot hold, with
-    `OverflowError` or `OSError`, and a value that is no number of seconds at all
-    with `ValueError`. Every line naming a window is written while measuring, so a
-    clause that raised would end the run over a sentence in its log.
+    **Where no time can be written for the end, the minutes stand alone**
+    (ADR-0007 decision 5). The epoch is GitHub's — an `x-ratelimit-reset`, or a
+    `/rate_limit` row's `reset` — read as any integer. One the platform's `time_t`
+    cannot hold is refused with `OverflowError` or `OSError`, one outside the
+    years 1 to 9999 with `ValueError`, and one the configured zone's offset
+    carries out of them with `OverflowError`, by the library's conversion. Every
+    line naming a window is written while measuring, so a clause that raised would
+    end the run over a sentence in its log.
     """
     minutes = _resets_in(reset_epoch, now)
     try:
-        clock = time.strftime("%H:%M:%S", time.localtime(reset_epoch))
+        clock = local_time(datetime.fromtimestamp(reset_epoch, UTC), "%H:%M:%S")
     except (OverflowError, OSError, ValueError):
         return minutes
     return f"{minutes} ({clock})"

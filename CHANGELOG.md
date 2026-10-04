@@ -11,6 +11,40 @@ the code says so.
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-10-04
+
+**Upgrade the library first:** this release needs little-sister 0.3.19 (see
+*Requires*). Nothing you configure or pin moves — no `type:` name, no configuration
+key, no slug. What moves is in the log: the clock time a line names a budget window's
+end with is the configured timezone's, where it was the machine's (see *Changed*).
+
+### Changed
+
+- **A log line names a budget window's end in the configured timezone.** Every log
+  line that names a rate-limit window writes its end as a clock time beside the
+  minutes — `resets in 34min (21:50:07)`. That time was the machine's local clock,
+  because the stamp at the head of a little-sister log line was. little-sister 0.3.19
+  stamps its log in the zone `timezone` names, and the clause follows it: it is the
+  time of day in that zone, written by the library, so a line's stamp and the time
+  inside it are one clock on a machine in any zone. On a machine whose zone is the
+  configured one nothing changes; on any other, the clock times in these lines move
+  to the configured zone's at the upgrade, as the log's stamps do. A node's own lines
+  keep the minutes alone, as before. A window's end no time can be written for still
+  costs its line the clock time and nothing else, and an end past the year 9999 is
+  now one of those
+  ([ADR-0007](docs/adr/0007-the-budget-is-read-where-it-is-spent.md), little-sister
+  ADR-0120).
+
+### Requires
+
+- **little-sister 0.3.19 or newer.** The floor rises from 0.3.18 because that release
+  is the first to stamp its log's lines in the configured timezone (little-sister
+  ADR-0120), the clock this package's log lines now name a window's end on. Against
+  an older library nothing fails, and a line's stamp and the clock time inside it are
+  two clocks wherever the machine's zone is not the configured one. Upgrade the
+  library first, and read its notes for that release before you do: they say what the
+  upgrade asks of a running instance. Nothing you configure changes with this package.
+
 ## [0.1.9] - 2026-09-27
 
 **Nothing you configure or pin moves** — no `type:` name, no configuration key, and no

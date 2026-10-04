@@ -1,7 +1,7 @@
 # ADR-0007 — The budget is read where it is spent, and there is more than one of it
 
 - **Status:** Accepted
-- **Date:** 2026-09-27 (accepted 2026-09-13)
+- **Date:** 2026-10-04 (accepted 2026-09-13)
 - **Related:** [ADR-0001](0001-a-second-check-type-in-this-package.md) (the budget is
   the token's and a type of its own — this record keeps that and corrects what it says
   about `core` and about the guard), [ADR-0002](0002-a-read-failure-is-not-a-finding.md)
@@ -12,7 +12,9 @@
   never a position), little-sister ADR-0058 (one transport policy; the sleep this record
   names is the library's), [ADR-0014](0014-a-run-is-its-readings-and-the-estate-is-its-object.md)
   (a reset the record keeps as `null`), [ADR-0015](0015-a-workflow-line-holds-the-newest-run-it-has-read.md)
-  (the held runs read by id, which the guard does not price)
+  (the held runs read by id, which the guard does not price), little-sister ADR-0120
+  (the log's lines are stamped in the configured zone, and a check type writes no time
+  of its own; decision 5's clock time follows both)
 
 A bare ADR number here is this repository's; a reference to one of little-sister's
 is always written out, because the two numbering spaces overlap.
@@ -257,12 +259,22 @@ without a response reports the previous aspect's headers as its own, because
    windows, which `resets in Nmin` alone cannot show; the node keeps the minutes, since
    a reader there wants the wait.
 
-   The clock time is written where the machine's clock can write it, and nowhere else. A
-   window's end past what the platform's `time_t` holds — an epoch `time.localtime`
-   refuses with `OverflowError` or `OSError` — would raise out of the line naming it, and
-   every such line is written while measuring, so one `x-ratelimit-reset` like it would
-   end a run of either type. Where the time cannot be written, the line keeps the
-   minutes alone, `resets in …min` or `resetting now`, and the record keeps such a reset
+   The clock time is the configured zone's, and the library writes it. It is read
+   against the stamp at the head of its log line, and little-sister ADR-0120 stamps the
+   lines of the library's default log in the configured timezone, with its offset
+   (decision 9 there), and has a check type write no time of its own (decision 8). So a
+   line hands the window's end to `little_sister.spans.local_time` as an instant, and
+   the clause is that zone's time of day, on a machine in any zone, and stands on the
+   clock of its line's stamp. An application that configured its own logging keeps its
+   own stamp, and the clause is the configured zone's there too.
+
+   The clock time is written where a time can be written, and nowhere else. A window's
+   end the platform's `time_t` cannot hold, or one outside the years 1 to 9999, read in
+   UTC or in the configured zone, is refused with `OverflowError`, `OSError` or
+   `ValueError`, and would raise out of the line naming it; every such line is written
+   while measuring, so one `x-ratelimit-reset` like it would end a run of either type.
+   Where the time cannot be written, the line keeps the minutes alone,
+   `resets in …min` or `resetting now`, and the record keeps a reset no calendar holds
    as `null` ([ADR-0014](0014-a-run-is-its-readings-and-the-estate-is-its-object.md) §8).
 
 ## Consequences
@@ -292,6 +304,10 @@ without a response reports the previous aspect's headers as its own, because
   finding the window ends before the run would, leaves it alone (decision 3).
 - **Nothing here changes a stored key.** No slug, `type:` name or configuration key
   moves; the CHANGELOG entry that ships this is *Changed*, not a break.
+- **The floor rose to `little-sister>=0.3.19`** with the clock time of decision 5: that
+  is the release that stamps the default log in the configured zone, and against an
+  older library a line's stamp and its clock time would be two clocks wherever the
+  machine's zone is not the configured one.
 - The `RateLimitHeaders` trace of 0.1.3 has done its work: the disagreement it was built
   to catch does not exist, and the one it found instead is this record. The trace stays,
   because it is the ledger's source.

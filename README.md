@@ -24,7 +24,7 @@ is [`docs/decisions.md`](docs/decisions.md) and the records in
 
 ## The contract
 
-- **Requires** `little-sister >= 0.3.18` — a floor, never a pin.
+- **Requires** `little-sister >= 0.3.19` — a floor, never a pin.
 - **Runs on** Python **3.11 or newer** — the library's floor, not a higher
   one of its own.
 - **Registers** two check types: **`github`** and **`github-rate-limit`**. One
@@ -38,7 +38,7 @@ is [`docs/decisions.md`](docs/decisions.md) and the records in
 # Pin them. A deployment names exact versions so an upgrade is a deliberate edit
 # rather than drift; a plugin is the one that declares a floor, because two plugins
 # that each pinned could not be installed together.
-dependencies = ["little-sister==0.3.18", "little-sister-github==0.1.9"]
+dependencies = ["little-sister==0.3.19", "little-sister-github==0.1.10"]
 ```
 
 ```python

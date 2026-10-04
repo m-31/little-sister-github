@@ -10,11 +10,16 @@ import inspect
 import io
 import json
 import logging
+import os
 import re
+import subprocess
+import sys
+import time
 import urllib.error
 import urllib.parse
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from email.message import Message
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -1169,10 +1174,16 @@ def test_a_reset_that_is_not_an_instant_is_null_and_the_run_stands():
 
 # --- a reset GitHub sends neither ends nor stalls a run (ADR-0007, ADR-0002) ----
 
-#: Window ends GitHub could send that the machine's clock cannot hold: on the
-#: device VM `time.localtime` refuses the first with `OSError` and the other two
-#: with `OverflowError`, and `time.sleep` refuses the waits the first two ask for.
+#: Window ends GitHub could send that the platform's clock cannot hold: on the
+#: device VM `datetime.fromtimestamp` refuses the first with `OSError` and the other
+#: two with `OverflowError`, and `time.sleep` refuses the waits the first two ask for.
 _UNWRITABLE_RESETS = (10**18, 10**20, -10**20)
+
+#: Those, and two the platform's clock holds and no time can be written for: the
+#: year 33658, which no calendar holds — a `ValueError` — and the last second of the
+#: year 9999, which the zone this suite's settings name, ahead of UTC, would show as
+#: the year 10000 — an `OverflowError` out of the library's conversion.
+_UNWRITABLE_ENDS = (*_UNWRITABLE_RESETS, 10**12, 253_402_300_799)
 
 #: A window's end as a clock time, the way `_resets_at` writes one beside the minutes.
 _CLOCK_TIME = re.compile(r"\(\d{2}:\d{2}:\d{2}\)")
@@ -1295,7 +1306,7 @@ def _package_lines(caplog):
             if record.name.startswith("little_sister_github")]
 
 
-@pytest.mark.parametrize("reset", _UNWRITABLE_RESETS)
+@pytest.mark.parametrize("reset", _UNWRITABLE_ENDS)
 def test_a_reset_no_clock_can_write_costs_a_budget_run_its_clock_time_and_nothing_else(
         reset, monkeypatch, caplog):
     """ADR-0007 decision 5, for this type: the account lookup and the
@@ -1322,6 +1333,45 @@ def test_a_reset_no_clock_can_write_costs_a_budget_run_its_clock_time_and_nothin
     clause = "resetting now" if reset < 0 else "resets in "
     assert [line for line in named
             if clause not in line or _CLOCK_TIME.search(line)] == []
+
+
+#: The head of a line as little-sister's default log writes it: the stamp, the
+#: offset in force at it, and the logger that said it.
+_STAMPED = re.compile(r"(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d),\d{3} ([+-]\d{4}) - (\S+) - ")
+
+
+def test_a_process_in_another_zone_names_a_windows_end_on_the_clock_of_its_stamp(
+        tmp_path):
+    """ADR-0007, decision 5: the clause "stands on the clock of its line's stamp".
+    The whole of it, in a process of its own, because the stamp is the library's
+    default log's and pytest owns the logging in this one: on a machine in New York
+    whose settings name Asia/Kathmandu, a run logs the first sight of a window with
+    spend on it, and its own line with what the response's headers said. Each is
+    stamped on Kathmandu's clock, with its offset, and names the window's end as the
+    time that clock shows."""
+    settings = tmp_path / "settings.yaml"
+    settings.write_text("timezone: Asia/Kathmandu\n")
+    reset = int(time.time()) + 34 * 60
+    environment = {**os.environ, "TZ": "America/New_York",
+                   "LITTLE_SISTER_CONFIG": str(settings), "GITHUB_TOKEN": "x",
+                   "LOG_FILE": os.devnull}
+    environment.pop("LOG_LEVEL", None)
+    done = subprocess.run(
+        [sys.executable, str(Path(__file__).with_name("budget_run.py")), str(reset)],
+        env=environment, cwd=tmp_path, capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stderr
+    lines = [line for line in done.stderr.splitlines()
+             if " - little_sister_github." in line]
+    assert [": first reading of the core window, " in line for line in lines] == [
+        True, False], done.stderr
+    assert "| that response's own headers: core: " in lines[1]
+    for line in lines:
+        stamp = _STAMPED.match(line)
+        assert stamp is not None, line
+        stamped = datetime.strptime(f"{stamp[1]} {stamp[2]}", "%Y-%m-%d %H:%M:%S %z")
+        assert stamped.utcoffset() == timedelta(hours=5, minutes=45), line
+        on_that_clock = datetime.fromtimestamp(reset, stamped.tzinfo)
+        assert _CLOCK_TIME.findall(line) == [f"({on_that_clock:%H:%M:%S})"], line
 
 
 def test_a_throttled_account_lookup_is_not_waited_out(monkeypatch):

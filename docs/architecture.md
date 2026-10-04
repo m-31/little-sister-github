@@ -16,7 +16,7 @@ because the two numbering spaces overlap.
 |---|---|
 | Package | `little_sister_github` — importing it registers **`github`** and **`github-rate-limit`** in little-sister's check registry; `require_api(3)` refuses at startup, naming both epochs, when the library has moved past check API epoch 3 |
 | Modules | `github.py` (the client and the `github` check), `rate_limit.py` (the `github-rate-limit` check), `budget.py` (the ledger both write to and read from) |
-| Library floor | `little-sister >= 0.3.18`, the release that speaks check API epoch 3 — a check is `measure()` and `grade()` (little-sister ADR-0086) — and promises the surface this package imports — `little_sister.checks`, `little_sister.fetch`, `little_sister.transport`, `little_sister.reasons`, `little_sister.status`, `little_sister.values` (little-sister `architecture.md` §11) — and never a pin, because two plugins that each pinned could not be installed together |
+| Library floor | `little-sister >= 0.3.19`, the release that stamps its default log in the configured timezone, which is the clock this package's log lines name a window's end on (§5; little-sister ADR-0120). It speaks check API epoch 3 — a check is `measure()` and `grade()` (little-sister ADR-0086) — and promises the surface this package imports — `little_sister.checks`, `little_sister.fetch`, `little_sister.transport`, `little_sister.reasons`, `little_sister.spans`, `little_sister.status`, `little_sister.values` (little-sister `architecture.md` §11) — and it is never a pin, because two plugins that each pinned could not be installed together |
 | Beneath it | the standard library's `urllib`, through the library's `fetch`; no dependency but little-sister itself |
 | Credential | one token per check, a **reference** (`env://NAME`) resolved once at startup (little-sister ADR-0023); a reference that resolves to nothing pins the check to a visible ERROR before it ever runs |
 
@@ -525,7 +525,11 @@ node's own ERROR, `could not ask GitHub for the rate limit: …`.
 
 Both checks log under their node path — the client's own lines carry the request path
 that produced them, or nothing — and every line below is `INFO` unless it says
-otherwise. A run of the `github` check reads top to bottom as:
+otherwise. A clock time in a line is a budget window's end, beside the minutes it has
+left: the time of day in the configured timezone, written by the library
+(`little_sister.spans.local_time`), so on a machine in any zone it reads on the clock
+little-sister stamps the line in. A window's end no time can be written for has the
+minutes alone (ADR-0007 §5). A run of the `github` check reads top to bottom as:
 
 - `run starting — timeout 60s, request timeout 15s, max pause 30s, 8 aspect(s)`: the
   budgets in force, two of them derived;
@@ -563,10 +567,11 @@ otherwise. A run of the `github` check reads top to bottom as:
 - `run ended after 48.1s of its 60s timeout — 213 read(s) in 40.2s, slowest read 6.3s
   (…/actions/workflows/12/runs), 3s paused, 8 of 8 aspects reported`: the receipt.
 
-The `github-rate-limit` check writes one line per run: every entry's text, then
-`| that response's own headers: core: 4990 of 5000 left, 10 used, resets in 12min
-(21:28:00)` — the bucket GitHub charged that very lookup to, worth nothing until it
-disagrees with the body beside it.
+The `github-rate-limit` check writes one line per run: what it read of each watched
+resource — `core: 4990 of 5000 requests left`, and `search: absent` for one it read no
+numbers of — then `| that response's own headers: core: 4990 of 5000 left, 10 used,
+resets in 12min (21:28:00)`: the bucket GitHub charged that very lookup to, worth
+nothing until it disagrees with the body beside it.
 
 ---
 

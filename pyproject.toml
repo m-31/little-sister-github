@@ -1,6 +1,6 @@
 [project]
 name = "little-sister-github"
-version = "0.1.9"
+version = "0.1.10"
 description = "GitHub check types for little-sister: repository overview, and API rate limit."
 authors = [
     { name = "Michael Meyling" }
@@ -35,11 +35,20 @@ requires-python = ">=3.11"
 # a release. The upgrade a floor cannot see, the library moving *past* the
 # surface, is caught by `require_api()` in `__init__.py`.
 #
-# **0.3.18** is the release that speaks **check API epoch 3**: `run()` became
-# `measure()` and `grade()` (little-sister ADR-0086), and a type written for the old
-# shape cannot be adapted at runtime. `require_api()` catches that direction — but only
-# at startup, and a floor naming an older release would let a resolver install the
-# very library that call is about to reject.
+# **0.3.19** is the release that stamps the default log's lines in the configured
+# timezone, with its offset (little-sister ADR-0120 decision 9). This package's log
+# lines name a budget window's end as a clock time and write it through
+# `little_sister.spans.local_time`, in that zone, so that a line's stamp and the time
+# inside it are one clock (ADR-0007 decision 5). The name is older than this floor;
+# what arrived with 0.3.19 is the stamp. Against an older library the two would be two
+# clocks wherever the machine's zone is not the configured one, and nothing would fail
+# — so the floor is the only thing that can say it.
+#
+# What the floor named before still holds beneath it. 0.3.18 speaks **check API epoch
+# 3**: `run()` became `measure()` and `grade()` (little-sister ADR-0086), and a type
+# written for the old shape cannot be adapted at runtime. `require_api()` catches that
+# direction — but only at startup, and a floor naming an older release would let a
+# resolver install the very library that call is about to reject.
 #
 # The floor's other job is unchanged, and is why it has always named a real release
 # rather than the first one with the surface: 0.3.11 has neither
@@ -51,7 +60,7 @@ requires-python = ">=3.11"
 # redirect further down — and restores `uv.lock` with it. See `### Requires` in the
 # CHANGELOG for when the floor last moved.
 dependencies = [
-    "little-sister>=0.3.18",
+    "little-sister>=0.3.19",
 ]
 
 # public-urls:begin
@@ -137,16 +146,18 @@ target-version = "py311"
 # ruff-selection:begin
 # One selection for the whole family, so every project lints identically and a
 # fix argued in one of them is a fix in all of them. Beyond ruff's default (E, F):
-# import sorting (I), pyupgrade (UP), bugbear (B), comprehensions (C4) and Ruff's
-# own rules (RUF). Selecting explicitly also pins the gate against ruff's own
-# defaults shifting between releases.
+# import sorting (I), pyupgrade (UP), bugbear (B), comprehensions (C4), the
+# time-zone rules (DTZ) and Ruff's own rules (RUF). DTZ refuses a clock read and a
+# time built without a zone, and a time that is meant as a wall time says so with
+# a `noqa` and its reason (little-sister ADR-0120). Selecting explicitly also pins
+# the gate against ruff's own defaults shifting between releases.
 #
 # The ambiguous-unicode rules are off, and stay off. This family's user-facing
 # text — reasons, subnode titles, chip labels — uses typographic "—", "…", "×" and
 # "·" on purpose, and a rule that flags them would be answered with a `noqa` on
 # every line that has an opinion about punctuation.
 # ruff-selection:end
-select = ["E", "F", "W", "I", "UP", "B", "C4", "RUF"]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "DTZ", "RUF"]
 ignore = ["RUF001", "RUF002", "RUF003"]
 
 [tool.mypy]

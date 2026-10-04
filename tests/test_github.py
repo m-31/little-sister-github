@@ -5,8 +5,11 @@ import contextlib
 import inspect
 import json
 import logging
+import os
 import re
+import time
 import urllib.parse
+from datetime import UTC, datetime
 from email.message import Message
 from unittest import mock
 
@@ -4460,10 +4463,9 @@ def test_an_aspect_line_times_the_aspect_and_not_the_run(caplog):
 
 def test_the_cut_short_log_names_the_aspect_and_the_starving_tail(caplog):
     """The node counts; the log names. The aspects a cut-short run never reaches
-    are this run's tail — the next run starts at them (ADR-0002 §7's 2026-09-06
-    update), which is exactly why the line has to name them rather than leave a
-    reader to rebuild the roster by hand from `ASPECTS` minus their own
-    `disabled_aspects`.
+    are this run's tail — the next run starts at them (ADR-0002 §7), which is
+    exactly why the line has to name them rather than leave a reader to rebuild
+    the roster by hand from `ASPECTS` minus their own `disabled_aspects`.
 
     An aspect is switched **off** here on purpose: every count on the line is the
     active roster's and not `ASPECTS`', and with a full roster the two agree, so a
@@ -5086,8 +5088,7 @@ def test_every_answer_leaves_its_budget_headers_on_the_client():
         resource="core", limit=5000, remaining=4841, used=159,
         reset=1_700_000_060)
     assert client.last_rate_limit.text(1_700_000_060 - 2280) == (
-        f"core: 4841 of 5000 left, 159 used, resets in 38min "
-        f"({_clock(1_700_000_060)})")
+        "core: 4841 of 5000 left, 159 used, resets in 38min (03:59:20)")
 
 
 def test_a_refusal_carries_the_budget_too_and_is_kept():
@@ -5146,11 +5147,9 @@ def test_a_partial_reading_leaves_the_parts_it_does_not_have_out():
     assert RateLimitHeaders(remaining=1, limit=2).text() == "budget: 1 of 2 left"
 
 
-def _clock(reset):
-    """The window's end as the trace writes it: the log's own clock, which is the
-    machine's local time — the one the timestamp at the head of the line is in."""
-    import time
-    return time.strftime("%H:%M:%S", time.localtime(reset))
+#: A window's end: 16:05:07 UTC on 2023-11-14, which the clock of the zone this
+#: suite's settings name, Asia/Kathmandu, shows as 21:50:07.
+_ENDS_AT = 1_699_977_907
 
 
 def test_a_trace_line_names_the_windows_end_as_a_clock_time_beside_the_minutes():
@@ -5159,15 +5158,62 @@ def test_a_trace_line_names_the_windows_end_as_a_clock_time_beside_the_minutes()
     about two windows read as two windows, which `resets in Nmin` alone cannot
     show." Two windows five minutes apart, two clock times; the node's own line
     keeps the minutes and is not under test here."""
-    reset_a, reset_b = 1_700_000_060, 1_700_000_360
+    reset_a, reset_b = _ENDS_AT, _ENDS_AT + 300
     now = float(reset_a - 34 * 60)
     a = RateLimitHeaders(resource="core", limit=5000, remaining=4841, used=159,
                          reset=reset_a)
     b = RateLimitHeaders(resource="core", limit=5000, remaining=3932, used=1068,
                          reset=reset_b)
-    assert a.text(now).endswith(f"resets in 34min ({_clock(reset_a)})")
-    assert b.text(now).endswith(f"resets in 39min ({_clock(reset_b)})")
+    assert a.text(now).endswith("resets in 34min (21:50:07)")
+    assert b.text(now).endswith("resets in 39min (21:55:07)")
     assert budget_said(a, now) != budget_said(b, now)
+
+
+@contextlib.contextmanager
+def _machine_in(zone):
+    """Run the block on a machine whose own clock is in ``zone``."""
+    try:
+        with mock.patch.dict(os.environ, {"TZ": zone}):
+            time.tzset()
+            yield
+    finally:
+        time.tzset()          # back to whatever the real environment says
+
+
+@pytest.mark.parametrize("machine", ["America/New_York", "Asia/Tokyo"])
+def test_the_clock_time_is_the_configured_zones_on_a_machine_in_any_zone(machine):
+    """ADR-0007, decision 5: the "clock time is the configured zone's" — "on a
+    machine in any zone" — where it was the machine's own. The window ends at
+    16:05:07 UTC, which a clock in New York shows as 11:05:07 and one in Tokyo as
+    01:05:07 of the next day; the line says 21:50:07 on both, the time of the zone
+    the settings name."""
+    headers = RateLimitHeaders(resource="core", limit=5000, remaining=4841,
+                               used=159, reset=_ENDS_AT)
+    with _machine_in(machine):
+        assert headers.text(float(_ENDS_AT - 34 * 60)) == (
+            "core: 4841 of 5000 left, 159 used, resets in 34min (21:50:07)")
+
+
+def test_the_library_writes_the_clock_time_from_the_windows_end_as_an_instant(
+        monkeypatch):
+    """ADR-0007, decision 5: "the library writes it" — the type formats no time of
+    its own (little-sister ADR-0120 decision 8). It hands little-sister's
+    `local_time` the window's end as an instant, a time with its zone, and asks for
+    a time of day; the clause carries what came back. A time without a zone equals
+    no instant, so the comparison is also the test that one was handed over."""
+    handed = []
+
+    def written(moment, fmt=None):
+        handed.append((moment, fmt))
+        return "WHAT THE LIBRARY WROTE"
+
+    monkeypatch.setattr(mod_github, "local_time", written)
+    headers = RateLimitHeaders(resource="core", limit=5000, remaining=4841,
+                               used=159, reset=_ENDS_AT)
+    assert headers.text(float(_ENDS_AT - 34 * 60)) == (
+        "core: 4841 of 5000 left, 159 used, resets in 34min "
+        "(WHAT THE LIBRARY WROTE)")
+    assert handed == [(datetime(2023, 11, 14, 16, 5, 7, tzinfo=UTC), "%H:%M:%S")]
 
 
 def test_a_read_that_got_no_answer_leaves_no_budget_claim():
@@ -7059,10 +7105,14 @@ def test_a_line_is_named_after_its_workflow_and_after_its_run_only_without_one()
 
 # --- a reset no clock can write (ADR-0007 decision 5) ---------------------------
 
-#: Window ends GitHub could send in `x-ratelimit-reset` that the machine's clock
-#: cannot hold: on the device VM `time.localtime` refuses the first with `OSError`
-#: and the other two with `OverflowError`.
-_UNWRITABLE_RESETS = (10**18, 10**20, -10**20)
+#: Window ends GitHub could send in `x-ratelimit-reset` that no time can be written
+#: for. The first three are past what the platform's clock holds: on the device VM
+#: `datetime.fromtimestamp` refuses the first with `OSError` and the next two with
+#: `OverflowError`. The fourth the platform holds and the calendar does not — the
+#: year 33658, a `ValueError`. The fifth is the last second of the year 9999, which
+#: the zone this suite's settings name, ahead of UTC, would show as the year 10000:
+#: the library's conversion refuses it with `OverflowError`.
+_UNWRITABLE_RESETS = (10**18, 10**20, -10**20, 10**12, 253_402_300_799)
 
 #: A window's end as a clock time, the way `_resets_at` writes one beside the minutes.
 _CLOCK_TIME = re.compile(r"\(\d{2}:\d{2}:\d{2}\)")
@@ -7081,8 +7131,8 @@ def _routed(bodies, headers):
 @pytest.mark.parametrize("reset", _UNWRITABLE_RESETS)
 def test_a_reset_no_clock_can_write_costs_a_run_its_clock_time_and_nothing_else(
         reset, monkeypatch, caplog):
-    """ADR-0007 decision 5: where the machine's clock cannot write a
-    window's end, the line keeps the minutes alone. A whole `github` run, through
+    """ADR-0007 decision 5: where no time can be written for a window's
+    end, the line keeps the minutes alone. A whole `github` run, through
     its own client and the library's `fetch`, with every response saying its window
     ends at `reset` and has spend on it — so the first sight of the window writes
     its line, and the aspect's line says what GitHub said. The run finishes with its
