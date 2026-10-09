@@ -2,7 +2,9 @@
 # names this file before anything imports the library, which reads it once.
 #
 # One key, the only one a line of this package reads: a log line that names a budget
-# window writes the window's end on this zone's clock (ADR-0007 decision 5). Kathmandu,
+# window writes the window's end on this zone's clock (ADR-0007 decision 5), and a
+# dependency graph that stands for a repository GitHub did not answer for says *as of*
+# when on it, on its node's line and in the log (ADR-0008 decision 7). Kathmandu,
 # because no machine that runs the suite is there: its clock is three quarters of an
 # hour off every clock that stands on a whole hour, and it keeps no summer time — so
 # a clock time a test states is this zone's on any machine, on any day of the year.

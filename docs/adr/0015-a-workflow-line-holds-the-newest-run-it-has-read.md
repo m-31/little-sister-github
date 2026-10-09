@@ -1,7 +1,7 @@
 # ADR-0015 — A workflow line holds the newest run it has read
 
 - **Status:** Accepted
-- **Date:** 2026-09-26
+- **Date:** 2026-10-10 (accepted 2026-09-26)
 - **Related:** [ADR-0005](0005-the-actions-aspect-asks-per-workflow.md) (the
   per-workflow read, which this finds is a search),
   [ADR-0013](0013-the-object-of-an-actions-line-is-the-workflow-on-its-branch.md) (the
@@ -15,7 +15,9 @@
   price the reads this adds),
   [ADR-0014](0014-a-run-is-its-readings-and-the-estate-is-its-object.md) (the estate
   reading that counts them), [ADR-0002](0002-a-read-failure-is-not-a-finding.md) (a read
-  that fails is not a finding)
+  that fails is not a finding),
+  [ADR-0016](0016-an-aspect-asks-the-whole-scope-a-finding-grades-and-a-workflow-is-a-node.md)
+  (§18, the node the workflow's name titles)
 - **Register:** [`../decisions.md`](../decisions.md)
 
 A bare ADR number here is this repository's; a reference to one of little-sister's is
@@ -165,9 +167,12 @@ Dependabot's update jobs, `Dependency Graph` for its dependency-graph jobs — a
 workflow renamed in GitHub shows its new name on the next poll even while the hold
 stands. The run's name is dropped. The record and the hold gain nothing by it, and the
 run the line links to still carries it. **No slug moves**: a slug is keyed on ids
-(ADR-0013 §2).
+(ADR-0013 §2). The same name titles the workflow's node, which is named after the last
+segment of the workflow's `path`
+([ADR-0016](0016-an-aspect-asks-the-whole-scope-a-finding-grades-and-a-workflow-is-a-node.md)
+§18).
 
-A workflow the list's one page leaves out has no line at all, as before: its runs are
+A workflow the list's one page leaves out has no line and no node: its runs are
 not asked for on the exact read and are skipped on the wide page, and its repository is
 named on the line that says not all runs were read. The run's name stands in only for a
 list entry with no name.

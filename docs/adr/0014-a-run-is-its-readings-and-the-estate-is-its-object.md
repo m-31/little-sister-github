@@ -1,22 +1,24 @@
 # ADR-0014 — A run is its readings, and the estate is the check's object
 
 - **Status:** Accepted
-- **Date:** 2026-09-20
+- **Date:** 2026-10-10 (accepted 2026-09-20)
 - **Related:** [ADR-0013](0013-the-object-of-an-actions-line-is-the-workflow-on-its-branch.md)
   (the one reading besides the estate that has a subject),
   [ADR-0002](0002-a-read-failure-is-not-a-finding.md) (the coverage the readings
-  carry), [ADR-0003](0003-an-aspect-is-one-question-asked-of-the-whole-scope.md) (the
-  node's own reading), [ADR-0007](0007-the-budget-is-read-where-it-is-spent.md) (the
-  ledger `github-rate-limit` reads), little-sister **ADR-0086** (the split, and the
-  purity this is written against), little-sister **ADR-0085** (what a subject is for,
-  decision 2),
+  carry),
+  [ADR-0016](0016-an-aspect-asks-the-whole-scope-a-finding-grades-and-a-workflow-is-a-node.md)
+  (§4, the node's own reading; §18, the workflow's file a run's record carries),
+  [ADR-0007](0007-the-budget-is-read-where-it-is-spent.md) (the ledger
+  `github-rate-limit` reads), little-sister **ADR-0086** (the split, and the purity this
+  is written against), little-sister **ADR-0085** (what a subject is for, decision 2),
   [ADR-0012](0012-the-actions-line-carries-what-it-read.md) (the first line to carry
   what it read, and the other aspects it left to their own surfaces), little-sister
   **ADR-0082** (a line's `data` and `subject`, and the three names it reads as an
-  instant), little-sister **ADR-0087** (a series, which finds the line a reading
-  became by the record it carries, and the identity a budget's reading does not
-  name), little-sister **ADR-0075** (what a type declares it costs, a record's weight
-  among it)
+  instant), little-sister **ADR-0087** (a series, which finds the line a reading became
+  by the record it carries, and the identity a budget's reading does not name),
+  little-sister **ADR-0075** (what a type declares it costs, a record's weight among
+  it), [ADR-0008](0008-the-dependency-graph-is-asked-not-exported.md) (decision 7, a
+  graph that stands on its last answer, and the time it carries)
 - **Register:** [`../decisions.md`](../decisions.md)
 
 A bare ADR number here is this repository's; a reference to one of little-sister's is
@@ -48,6 +50,12 @@ A `github` run hands back, in this order:
   request, issue, Dependabot alert, code-scanning alert, secret-scanning alert,
   dependency graph and workflow, and one per repository the aspect could not read or
   was told is gone.
+
+A dependency graph that **stands** for a repository GitHub did not answer for — its last
+answer, which the check holds
+([ADR-0008](0008-the-dependency-graph-is-asked-not-exported.md), decision 7) — is a
+dependency graph's reading, with no subject (§2), in the place of the one that would say
+the repository could not be read.
 
 Every record names the **`aspect`** it was read for — `null` for the estate and the
 roster — and its **`kind`**, the shape the rest of it has; a reading about one
@@ -105,16 +113,17 @@ shape on every run**: a field the run did not come to stands as `null` or zero.
 
 A title, a summary, a rule, an error: at most 300 characters and then 600 of the bytes
 the seam weighs a record in, by the library's `clip` (little-sister ADR-0086 decision
-7). A field that shares its record gets less. A workflow's name gets 150 bytes, since
-its record also holds a branch and two run blocks. Every record's copy of a branch — a
-run line's, and the default branch the line names when none of the configured branches
-has a run — gets 300, cut at the end like the rest: no plain ASCII branch GitHub allows
-reaches it, and one past 49 letters of Cyrillic or 24 emoji does. The subject keeps the
-branch as it did (ADR-0013 §2), and a run line's slug is built from what the subject spells,
-so the clip moves no pin but one: a branch too long for a subject as well, which the
-subject spells as its digest, has its slug built from that digest — moved once, where a
-slug built from the clipped copy would put two branches alike up to the clip on one
-line. The line is written from the text the reading kept, so the two never disagree.
+7). A field that shares its record gets less. A workflow's name gets 150 bytes, and its
+file as many, since the record also holds a branch and two run blocks. Every record's
+copy of a branch — a run line's, and the default branch the line names when none of the
+configured branches has a run — gets 300, cut at the end like the rest: no plain ASCII
+branch GitHub allows reaches it, and one past 49 letters of Cyrillic or 24 emoji does.
+The subject keeps the branch as it did (ADR-0013 §2), and a run line's slug is built
+from what the subject spells, so the clip moves no pin but one: a branch too long for a
+subject as well, which the subject spells as its digest, has its slug built from that
+digest — moved once, where a slug built from the clipped copy would put two branches
+alike up to the clip on one line. The line is written from the text the reading kept, so
+the two never disagree.
 
 A dependency manifest's path gets 70 bytes, since ten of them share a record, and it is
 cut **from the front**, behind a `…` weighed with what it keeps, at a code point as
@@ -127,22 +136,34 @@ start there, and real paths do, not only pathological ones. The cut lives in thi
 package, beside its one use; if a second type ever needs it, it moves to the library
 then.
 
-**The heaviest reading is a dependency graph's, and the type declares it.** With the
-longest owner and repository names GitHub allows, a ten-digit repository id, a manifest
-count at a GraphQL `Int`'s largest and ten manifests with neither flag set, each path at
-its 70 bytes, it weighs 1605 bytes — 78% of the default `record_limit` of 2048, under
-the 80% at which the library says at every start that a declared record is close to its
-limit (little-sister ADR-0075 decision 5). A workflow run's comes next, at 1521 with the
-longest names, its branch and its workflow name in emoji at their clips, ten-digit
-repository and workflow ids, eleven-digit run ids, a two-digit attempt, a six-digit run
-number and `startup_failure`, both run blocks filled; the heaviest pull request is 1090.
-`expected_record()` answers the 1605, so startup holds it against a deployment's
-`record_limit` and refuses one set lower by name, before any run meets that reading
-(little-sister ADR-0075). What makes a reading heavy is bounded by GitHub or clipped
-here, but for its ids and counters, which are as long as GitHub's are today, and for one
-field: a disabled workflow's link, which GitHub writes with the default branch and the
-workflow file's name in it, and which nothing here shortens. One test rebuilds the graph
-and holds the declaration to it; another holds the declaration under the library's line,
+**The heaviest reading is a workflow run's, and the type declares it past the library's
+warning line.** With the longest owner and repository names GitHub allows, ten-digit
+repository and workflow ids, the workflow's name and its file at their clips, a branch
+of 255 `"` — which git allows, and which the seam's JSON writes in 512 bytes — at its
+300, `waiting`, two run blocks at their longest — eleven-digit run ids, a two-digit
+attempt, a six-digit run number, `startup_failure` and `in_progress`, the completed
+one's duration across every instant an ISO date can hold — and the record's own time,
+the start of the run it names ([ADR-0012](0012-the-actions-line-carries-what-it-read.md)
+§3), it weighs 1773 bytes. A dependency graph that stands on its last answer comes next:
+with the longest names, a ten-digit repository id, a manifest count at a GraphQL `Int`'s
+largest, ten manifests with neither flag set, each path at its 70 bytes, and the time
+GitHub answered with it, to the second
+([ADR-0008](0008-the-dependency-graph-is-asked-not-exported.md), decision 7; §8), it
+weighs 1635, and 1617 on the run that read it, its time `null`; the heaviest pull
+request is 1090. 1773 is 87 % of the default `record_limit` of 2048, past the 80 % at
+which every start says that a declared record is close to its limit — a warning in the
+log and a fact on the engine's report, never a line (little-sister ADR-0075 decision 5).
+The declaration stands there on purpose, and the clips are not tightened to bring it
+under: a deployment that wants a quiet start sets its `record_limit` to 2217 or more,
+which is its own to decide (little-sister ADR-0082). `expected_record()` answers the
+1773, so startup holds it against a deployment's `record_limit` and refuses one set
+lower by name, before any run meets that reading (little-sister ADR-0075). What makes a
+reading heavy is bounded by GitHub or clipped here, but for its ids and counters, which
+are as long as GitHub's are today, and for one field: a disabled workflow's link, which
+GitHub writes with the default branch and the workflow file's name in it, and which
+nothing here shortens. One test rebuilds the run and holds the declaration to it, one
+rebuilds the graph and holds it under the run, and another holds the declaration past
+the library's line and inside the limit, and says what a limit of 2217 changes,
 importing the library's `AMBER_SHARE` and `RECORD_LIMIT` from `little_sister.limits` — a
 module the library does not promise to keep, on purpose, so that the day the line moves
 there, the test says so here.
@@ -154,12 +175,16 @@ it saves is never taken: an aspect switched off, `sbom_check.ignore`, `issues.ig
 `actions.ignore_workflow_name_patterns` and `advanced_security_on_private`. A filter
 that only **chooses what is said** moves to the grading, because a reading that left
 something out would be a reading of the configuration rather than of GitHub:
-`pull_requests.ignore_title_prefixes`, the Dependabot `severities`, `show_healthy`,
+`pull_requests.ignore_title_prefixes`, the Dependabot `severities`,
 `secret_scanning.require_enabled`, and every severity and disabled-state map.
 
-What the measuring half keeps on the check between runs — where the roster resumes,
-how many workflows each repository had, how long the last run took, the conditional
-cache — is for the **next run's measuring**, and the grading reads none of it.
+What the measuring half keeps on the check between runs — where the roster resumes, how
+many workflows each repository had, how long the last run took, the conditional cache,
+the runs [ADR-0015](0015-a-workflow-line-holds-the-newest-run-it-has-read.md) holds, and
+the last answer `sbom_check` holds for each repository
+([ADR-0008](0008-the-dependency-graph-is-asked-not-exported.md), decision 7) — is for
+the **next run's measuring**, and the grading reads none of it: what stands is handed to
+it as a reading.
 
 ### 6. `github-rate-limit` is one reading per watched resource, about that budget
 
@@ -254,9 +279,23 @@ them: a run block's `started`, and GitHub's `updated_at` beside it as `updated.a
 a disabled workflow's `updated_at` as `updated.at`
 ([ADR-0013](0013-the-object-of-an-actions-line-is-the-workflow-on-its-branch.md) §5); a
 secret-scanning alert's `created_at` as `created.at`; and a budget's reset, and each
-other window's, as `reset.at` (§6). Each is nested where the name is not the instant
-the record is of, so that none is claimed as `ended`, or as the top-level `at` that
-places a kept reading in its series.
+other window's, as `reset.at` (§6). None is claimed as `ended`, and one that is the
+instant the record is of is carried a second time, as the record's own top-level `at`,
+which places a kept reading in its series.
+
+Three kinds of record carry a top-level `at`, because that time is the instant the
+record is of: a run line's, the start of the run it names
+([ADR-0012](0012-the-actions-line-carries-what-it-read.md) §3); a disabled line's, the
+instant its `updated.at` keeps
+([ADR-0013](0013-the-object-of-an-actions-line-is-the-workflow-on-its-branch.md) §5);
+and a dependency graph's own time — `null` on the run that read the graph and, on a
+graph that stands for a repository GitHub did not answer for, when GitHub answered with
+it, in UTC and to the second
+([ADR-0008](0008-the-dependency-graph-is-asked-not-exported.md), decision 7). A run's
+reading and a disabled workflow's each name a subject, so their `at` places each in its
+series, and one that is `null` leaves the record where it was first seen; a graph's
+names none (§2), so nothing keeps it and the `at` places it in no series, and the line's
+*as of* is written from it.
 
 **GitHub's text is read as a time or `null`.** A value under one of those names that is
 not ISO-8601 with an offset has the library refuse the whole result, every aspect of
@@ -298,11 +337,12 @@ Every kind of record the type writes is held to this by one run that writes them
   [`../architecture.md`](../architecture.md) §3.7.
 - **Every time a record carries reads as a time** on a surface that shows a record's
   times (§8), and one GitHub got wrong costs its field and not the run.
-- **A deployment whose `record_limit` is below 1605 is refused at startup**, naming the
-  `github` check, where a run would have failed on its heaviest reading, a dependency
-  graph's (§4). A workflow name past 148 ASCII characters or 12 emoji, a branch past 49
-  letters of Cyrillic or 24 emoji, and a manifest path past 68 characters are shorter
-  on their lines than they were — the path by its start.
+- **A deployment whose `record_limit` is below 1773 is refused at startup**, naming the
+  `github` check, where a run would have failed on its heaviest reading, a workflow
+  run's (§4), and at the default limit every start says the declared record is close,
+  until a deployment sets 2217 or more. A workflow name past 148 ASCII characters or 12
+  emoji, a branch past 49 letters of Cyrillic or 24 emoji, and a manifest path past 68
+  characters are shorter on their lines than they were — the path by its start.
 - **A run line's pin moves once on a branch too long for its subject**, some 180
   characters with non-ASCII letters among them: its slug is built from the subject's
   digest now, where it was built from the branch (§4).
@@ -330,25 +370,30 @@ Every kind of record the type writes is held to this by one run that writes them
   it came in, and nesting `updated` and `created` would have put two more fields in that
   position. Refused in §8.
 - **No declared record size**, as ADR-0012 had it while a record was a few hundred
-  bytes. At 1605 of 2048 a lowered `record_limit` would first be met by a run.
+  bytes. At 1773 of 2048 a lowered `record_limit` would first be met by a run.
 - **A branch kept verbatim in the record**, as the subject keeps it. The run reading
-  weighs 1996, past the library's line, and every start would say so to every
-  deployment — a line nobody can act on, and one everybody learns to skip.
+  would weigh 1985, 63 bytes under the default limit: a deployment could lower its
+  `record_limit` by no more than that, and the next field the record gained would pass
+  it.
+- **The workflow's name and its file clipped at 81 bytes**, which brings the run down to
+  the graph's 1635, under the line. Refused in §4: a name is clipped on every line it
+  is written on, where the declaration past the line costs a warning at start and never
+  a line.
+- **A `record_limit` the type sets for itself.** Refused by little-sister ADR-0082: the
+  limit is the deployment's, and a limit its subject can raise is not one.
 - **A run line's slug built from the record's copy of its branch.** It would move the
   pin of every line whose branch the clip cuts, and put two branches alike up to the
   clip on one line.
-- **Manifest paths at 100 bytes**, as they were. With the branch clipped, the graph
-  is the heaviest reading at 1905, past the line.
+- **Manifest paths at 100 bytes**, as they were. The graph that stands on its last
+  answer would weigh 1935, more than any run.
 - **A manifest path cut at its end**, as every other clip here is. Two long paths in
   one repository would read alike on the red line, where what tells them apart is their
   end.
-- **Eight manifests instead of ten**, at 100 bytes each: 1579. But the grading reads a
+- **Eight manifests instead of ten**, at 100 bytes each: 1609. But the grading reads a
   graph of ten manifests or fewer as none parseable only when it has read all of them
   (ADR-0008), and a repository of nine or ten unparseable manifests would go silent.
 - **The library's line moved for a declared record**, or its share raised. The line is
   the library's to draw, and this package does not ask it to move for one type.
-- **A higher `record_limit` where the family deploys.** The warning would leave those
-  starts and stay at every other deployment's.
 - **The API host, or the token's digest, as the object of a budget GitHub will not
   name.** The host would make two installations one object; the digest is an identity
   `budget.py` keeps precisely because it is never published, and a new token would

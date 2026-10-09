@@ -4,10 +4,10 @@
 - **Date:** 2026-08-16 (the split shipped in 0.1.1; this record is where its reasoning
   lives for the people who receive it, which the release notes were the only place
   for until now)
-- **Related:** [ADR-0003](0003-an-aspect-is-one-question-asked-of-the-whole-scope.md)
-  (what an aspect is — this record makes one of its seven into two),
-  [ADR-0004](0004-a-finding-grades-the-repository-does-not.md) (how a banded aspect
-  grades; the defaults below are its decision 8 read per scale),
+- **Related:**
+  [ADR-0016](0016-an-aspect-asks-the-whole-scope-a-finding-grades-and-a-workflow-is-a-node.md)
+  (§2, what an aspect is — this record made one of them two; §12, how a banded aspect
+  grades; §15, the defaults, read per scale below),
   [ADR-0001](0001-a-second-check-type-in-this-package.md) (the API budget the
   single-read split leaves untouched)
 
@@ -54,8 +54,8 @@ so a dashboard went red for a lint finding.
 
 - The check has **eight aspects**: five flat ones (`pull_requests`,
   `secret_scanning_alerts`, `sbom_check`, `actions`, `issues`) and **three banded**
-  ones (`security_advisories` and the two above). ADR-0003's table and ADR-0004's
-  counts are read with that in mind; both records say so at their head.
+  ones (`security_advisories` and the two above). ADR-0016 counts them so, in its table
+  (§2) and wherever it numbers them.
 - The severity rows share one glyph ramp across two scales, and the repeats are the
   point: `error` and `high` are comparable rungs of scales GitHub keeps apart, and
   since the split they never sit in one row (`BAND_GLYPHS` in `github.py`).

@@ -1,16 +1,19 @@
 # ADR-0013 — The object of an `actions` line is the workflow on its branch
 
 - **Status:** Accepted
-- **Date:** 2026-09-20
-- **Related:** [ADR-0012](0012-the-actions-line-carries-what-it-read.md) (whose §1 this
-  replaces, and whose record this keeps), [ADR-0010](0010-a-disabled-workflow-is-a-line-not-a-read.md)
-  (the disabled line, keyed without a branch), [ADR-0009](0009-named-branches-replace-the-default-branch.md)
-  and [ADR-0005](0005-the-actions-aspect-asks-per-workflow.md) (the reads that name the
+- **Date:** 2026-10-10 (accepted 2026-09-20)
+- **Related:** [ADR-0012](0012-the-actions-line-carries-what-it-read.md) (the record
+  this keeps, whose §1 states the same subject),
+  [ADR-0016](0016-an-aspect-asks-the-whole-scope-a-finding-grades-and-a-workflow-is-a-node.md)
+  (§18, the node a record's `file` names; §21, every workflow's line written),
+  [ADR-0010](0010-a-disabled-workflow-is-a-line-not-a-read.md) (the disabled line, keyed
+  without a branch), [ADR-0009](0009-named-branches-replace-the-default-branch.md) and
+  [ADR-0005](0005-the-actions-aspect-asks-per-workflow.md) (the reads that name the
   pair), little-sister **ADR-0086** (the split this is the first multi-object case of,
   and whose decision 8 forces it), little-sister **ADR-0050** (why a slug cannot be a
   subject), little-sister **ADR-0085** (what a subject is for), little-sister
-  **ADR-0087** (the identity that keeps one event in a series once, and what a
-  reading of a frozen state names instead, decision 3)
+  **ADR-0087** (the identity that keeps one event in a series once, and what a reading
+  of a frozen state names instead, decision 3)
 - **Register:** [`../decisions.md`](../decisions.md)
 
 A bare ADR number here is this repository's; a reference to one of little-sister's is
@@ -18,12 +21,12 @@ always written out, because the two numbering spaces overlap.
 
 ## Context
 
-ADR-0012 §1 made the **repository** the subject of every `actions` line. That was
-sound while a subject was only a grouping hint on a line. little-sister ADR-0086 made it
-more: a check now hands its grading one `Measurement` per object it read, and decision 8
-says a run hands over **one measurement per object, never one object twice**. A
-repository with fifteen workflow-branches would hand over fifteen readings with one
-subject, which is the shape that decision refuses.
+The **repository** would be a sound subject for every `actions` line if a subject were
+only a grouping hint on a line. little-sister ADR-0086 makes it more: a check hands its
+grading one `Measurement` per object it read, and decision 8 says a run hands over **one
+measurement per object, never one object twice**. A repository with fifteen
+workflow-branches would hand over fifteen readings with one subject, which is the shape
+that decision refuses.
 
 The other way out was measured and fails. One measurement per repository, carrying all
 its workflows, would have to hold every line the grading derives, because the grading
@@ -59,7 +62,7 @@ could index it.
   all GitHub keys a branch by.
 - **Not the slug.** `slug()` narrows what it is given, so `feature/a-b` and
   `feature-a/b` can meet — the lossiness little-sister ADR-0050 documents. A slug only
-  has to tell siblings apart on one leaf; a subject names a thing in the world across
+  has to tell siblings apart on one node; a subject names a thing in the world across
   every run, so it keeps the branch **verbatim**.
 - **The colon, because git refuses it.** `git check-ref-format` forbids `:` anywhere
   in a ref name, so no branch contains one and the string splits back into its parts
@@ -76,17 +79,18 @@ could index it.
 
 Each workflow-branch the run read is one `Measurement`, and each maps one-to-one onto
 the line the grading writes for it: the grading carries the reading through onto that
-`Entry` as its `data`, and the line's `subject` is the measurement's. A reading the
-grading writes no line for — a healthy idle workflow under `show_healthy: false` — is
-still measured; the grading's choice not to show it does not unmake what was read.
+`Entry` as its `data`, and the line's `subject` is the measurement's. Every reading is a
+line, a passing idle workflow's too, on its workflow's node — or its branch's, where the
+configuration names several (ADR-0016 §19, §21).
 
-The record keeps ADR-0012 §2's names and gains **`repository_id`** and
-**`workflow_id`**, the same ids the subject is built from, so a projection that groups
-by repository survives the rename that changes `repository` — and, like every reading
-of this check, its `aspect` and `kind`
-([ADR-0014](0014-a-run-is-its-readings-and-the-estate-is-its-object.md)). `verdict` stays: it is a
-fixed reading of GitHub's `status` and `conclusion` that no configuration enters, and
-keeping it is what makes the line's `data` and the measurement's record one value.
+The record keeps ADR-0012 §2's fields, the workflow's `file` among them (ADR-0016 §18),
+and gains **`repository_id`** and **`workflow_id`**, the same ids
+the subject is built from, so a projection that groups by repository survives the rename
+that changes `repository` — and, like every reading of this check, its `aspect` and
+`kind` ([ADR-0014](0014-a-run-is-its-readings-and-the-estate-is-its-object.md)).
+`verdict` stays: it is a fixed reading of GitHub's `status` and `conclusion` that no
+configuration enters, and keeping it is what makes the line's `data` and the
+measurement's record one value.
 
 ### 4. A reading names the attempt of the run its verdict is of
 
@@ -143,9 +147,12 @@ reads said the same as the workflow at every step. What keeps two switch-offs ap
 only that the value changes somewhere between them, and it changes at each.
 
 **So the identity is the instant the workflow's `updated_at` names, exactly as the
-record keeps it under `updated.at`** — typed as a run block's is (ADR-0012 decision 3),
-and not the record's own top-level `at`, because it is when anything
-about the workflow last changed and not the instant the record is of. The identity is
+record keeps it under `updated.at`** — typed as a run block's is (ADR-0012 decision 3) —
+and the record's own `at` is the same instant. While the workflow is off, the instant it
+last changed is the switch that turned it off, or a later change, which is a record of
+its own, so it is the instant the record is of, and its series places the record there,
+as a run line's stands at its run's start (ADR-0012 decision 3). Where GitHub sent no
+instant, `at` is `null`, and the record stands where it was first seen. The identity is
 read back out of the record little-sister built, so it is the library's own string for
 the instant, in UTC with a `Z`, and never GitHub's text for it: the values above came
 with offsets, and one instant is one identity however GitHub writes it. Where GitHub
@@ -173,7 +180,7 @@ refuses, which would be an error out of the measuring half on every poll.
 
 The line's `text` and its slug are unchanged, so no pin moves. The coverage line,
 `runs-window-partial` and `branches-unmatched` stay without a subject: they are about
-the estate the leaf was asked about. The other aspects keep emitting lines with no
+the estate the aspect was asked about. The other aspects keep emitting lines with no
 subject — whether a pull request or a finding is an object with a history is its own
 decision, taken against its own surface.
 
@@ -195,7 +202,8 @@ decision, taken against its own surface.
   included, rather than how often somebody looked.
 - **A switched-off workflow keeps one record per change** — each time it is switched
   off, and whenever else GitHub updates it — where it kept one per poll for as long as
-  it stayed off. Its record grows by `updated.at`, some forty-three bytes.
+  it stayed off. Its record grows by `updated.at` and by its own `at`, the same instant,
+  some seventy-three bytes together.
 
 ## Alternatives considered
 
@@ -203,8 +211,8 @@ decision, taken against its own surface.
   Refused by little-sister ADR-0086 decision 8: one object, twice.
 - **One measurement per repository, carrying its workflows.** Measured above: the
   record passes `record_limit` at ten workflow-branches, before any other aspect.
-- **The slug as the subject.** It is already an identifier and already unique on the
-  leaf, but it narrows the branch name, so two branches can share one.
+- **The slug as the subject.** It is already an identifier and already unique on its
+  node, but it narrows the branch name, so two branches can share one.
 - **The workflow's name, or its file path, in place of its id.** Readable, and moved
   by a rename.
 - **The measurement declaring its own place for the engine to put it**, the other
@@ -226,7 +234,5 @@ decision, taken against its own surface.
   so a second switch-off by the same cause would replace the first.
 - **`updated_at` as GitHub sent it**, offset and all. It moves at every switch too, and
   needs no parsing; refused in §5, because it is not the string the record keeps.
-- **`updated_at` as the disabled record's top-level `at`**, placing it by GitHub's
-  clock. It is when anything about the workflow last changed, so it would claim an
-  instant the record is not of — the reason ADR-0012 keeps a run's under `updated.at`
-  rather than `at`.
+- **No top-level `at` on a disabled record**, which would leave it where the check first
+  saw it: on a first start, a switch-off of months before would stand at that start.

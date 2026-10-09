@@ -8,7 +8,8 @@
 > spaces overlap. What the decisions add up to, as one document, is
 > [`architecture.md`](architecture.md).
 >
-> A decision is in force unless its heading is marked **superseded**.
+> Every decision here is in force: a record that is superseded or withdrawn leaves, and
+> its digest with it.
 
 ---
 
@@ -33,28 +34,6 @@ answers, a payload of the wrong shape is malformed. Only a transient failure is 
 once; its line is `UNDEFINED` and grades nothing, so the aspect grades its own coverage
 gap in one WARN line and the node states the run's total once; the deadline keeps what
 finished, and a run resumes after the last aspect that finished. → [record](adr/0002-a-read-failure-is-not-a-finding.md)
-
-### ADR-0003 — An aspect is one question asked of the whole scope
-
-The tree is aspect-first: one child per aspect, and a repository is a keyed line, never
-a node. One aspect is one question, and the endpoint follows the question (`issues`
-drops the pull-request rows). Scope is discovered once — the kind verified, then the
-organization, team or user listing, filtered by `name_prefix`, `include_archived` and
-`include_forks` — and every aspect starts from that set, narrowing it only where it says
-so; the check's own node says only how much was looked at. `enabled: false` switches an
-aspect off whole, all off is refused, an aspect a release adds arrives on, and
-`secret_scanning:` keeps switching `secret_scanning_alerts`. → [record](adr/0003-an-aspect-is-one-question-asked-of-the-whole-scope.md)
-
-### ADR-0004 — A finding grades; the repository does not
-
-A line is what carries a status, keyed by what GitHub minted — the repository's numeric
-id with the pull request, issue or alert number, the finding's URL, the workflow and
-branch, or the aspect — never by a name or a position. Amber is a queue, red is something
-to do now: an open pull request or issue is WARN; a secret alert, scanning switched off,
-a missing dependency graph and a failed workflow are ERROR; the flat aspects' codes are
-fixed and only the banded ones are a setting, where the band grades and the alert does
-not, a watched band reports while empty, `severities` selects, `severity_map` grades and
-the defaults are strict. A workflow's verdict is its last run that said something. → [record](adr/0004-a-finding-grades-the-repository-does-not.md)
 
 ### ADR-0005 — The `actions` aspect asks per workflow
 
@@ -93,11 +72,11 @@ The `github` guard prices the run per window it will spend; a pause is named by 
 `sbom_check` asks GitHub's GraphQL API whether a repository has dependency manifests —
 `repository { dependencyGraphManifests(first: 10) { totalCount nodes { filename
 parseable exceedsMaxSize } } }`, one query per repository, one point each — in place of
-the synchronous SBOM export, which GitHub removes on `2026-11-13`. Zero manifests is no
-dependency graph and grades ERROR, as before; manifests none of which are parseable
-grade ERROR with the cause on the line; more than ten is a graph. `GitHubClient` grows
-`graphql()`, a POST with every REST read's deadline, retry and throttle reading, and a
-`200` with a per-repository error is read as ADR-0002 reads a status. Every key stays. → [record](adr/0008-the-dependency-graph-is-asked-not-exported.md)
+the SBOM export. Zero manifests, or none parseable, is ERROR with the cause on the line;
+more than ten is a graph. A `200` with a per-repository error is read as ADR-0002 reads a
+status: `timedout`, GitHub's own time limit, is *could not ask* and asked once more. A
+repository GitHub does not answer for is graded on its last answer, *as of* its time,
+while that is younger than `sbom_check.max_answer_age` (1h), out of the check's memory. Every stored key stays. → [record](adr/0008-the-dependency-graph-is-asked-not-exported.md)
 
 ### ADR-0009 — Named branches replace the default branch
 
@@ -112,14 +91,14 @@ saw; only an exact read may raise it, and not while a held run stands (ADR-0015)
 
 ### ADR-0010 — A disabled workflow is a line, not a read
 
-Its runs are not asked for: the state is on the list read already made, and the newest run
-is frozen at whatever it was when the workflow was switched off. One line instead, naming
-the cause in GitHub's wording and ending `no runs read`. Disabled is the `disabled_` prefix
-rather than a list, so a state GitHub adds later is graded (WARN, as an undeclared severity
-is) and not silently read. Shipped: `disabled_manually` and `disabled_inactivity` WARN,
-`disabled_fork` OK because forks are discovered by default and nobody chose that state;
-`actions.disabled_severity_map` overrides, and an OK line follows `show_healthy`. The line
-is keyed without a branch, so a pin on the old frozen verdict must be made again. → [record](adr/0010-a-disabled-workflow-is-a-line-not-a-read.md)
+Its runs are not asked for: the state is on the list already read, and the newest run is
+frozen from when the workflow was switched off. One line instead, naming the cause in
+GitHub's words and ending `no runs read`. Disabled is the `disabled_` prefix, so a state
+GitHub adds later is graded (WARN, as an undeclared severity is) and not silently read.
+Shipped: `disabled_manually` and `disabled_inactivity` WARN, `disabled_fork` OK, a state
+nobody chose on a fork discovered by default; `actions.disabled_severity_map` overrides,
+and an OK line is written as any other (ADR-0016). Keyed without a branch, so a pin on
+the old frozen verdict must be made again. → [record](adr/0010-a-disabled-workflow-is-a-line-not-a-read.md)
 
 ### ADR-0011 — Conditional requests, and the cache that holds them
 
@@ -131,16 +110,17 @@ the ledger as a reading of the window the path is charged to that spent nothing 
 The budget read is never held: its body is itself a reading. Entries go after two missed
 passes of the aspect that asked, never on a pass the deadline cut short. No byte cap; the
 run's `report` says what is held and what it spent against the guard's estimate. → [record](adr/0011-conditional-requests-and-the-cache-that-holds-them.md)
+
 ### ADR-0012 — The `actions` line carries what it read
 
 Every `actions` line says what it is about — the workflow on its branch, as ids — and
-carries a **record**: repository, workflow (named as the list names it), branch,
-verdict, and a block per run with its number, URL, `status`, `conclusion` and times.
-`conclusion` is GitHub's word for a grading map, `verdict` ours for a line template;
-neither replaces the other. `started` is claimed and `ended` never is — a run has no
-completion time — so `updated_at` is kept as `updated.at`, typed; a time that is not one
-is null, `text` does not move, and the names are keys.
-→ [record](adr/0012-the-actions-line-carries-what-it-read.md)
+carries a **record**: repository, workflow (named as the list names it) and its file,
+branch, verdict, and a block per run with its number, URL, `status`, `conclusion`, times
+and, once completed, how long it took. `conclusion` is GitHub's word for a grading map,
+`verdict` ours for a line template; neither replaces the other. `started` is claimed,
+and the named run's is the record's own `at`; `ended` never is — a run has no completion
+time — so `updated_at` is kept as `updated.at`, typed; a time that is not one is null,
+`text` does not move, and the names are keys. → [record](adr/0012-the-actions-line-carries-what-it-read.md)
 
 ### ADR-0013 — The object of an `actions` line is the workflow on its branch
 
@@ -149,9 +129,9 @@ A run line's subject is `<repository id>:<workflow id>:<branch>`, a disabled lin
 joined by a colon git forbids in a ref name; past 200 characters the branch is `sha256:`
 and 32 hex digits. One measurement per line, its record the `Entry`'s `data`, with
 `repository_id`, `workflow_id` and each run's `id` and `attempt`. A run line names
-`<run id>/<attempt>` of the verdict's run, or of the run in flight before any; a disabled
-line its `updated_at` as `updated.at` keeps it, in UTC, or its `state` failing that.
-Replaces ADR-0012 §1; a renamed branch starts a new history. → [record](adr/0013-the-object-of-an-actions-line-is-the-workflow-on-its-branch.md)
+`<run id>/<attempt>` of the verdict's run, or of the run in flight before any; a
+disabled line its `updated_at` as `updated.at` and the record's `at` keep it, in UTC, or
+its `state` failing that. A renamed branch starts a new history. → [record](adr/0013-the-object-of-an-actions-line-is-the-workflow-on-its-branch.md)
 
 ### ADR-0014 — A run is its readings, and the estate is the check's object
 
@@ -162,7 +142,7 @@ became carries that reading as its `data`. Subjects only where there is to be a 
 the estate, `<owner>[;team=][;prefix=][;archived=yes][;forks=no][;host=]`; an `actions`
 line; a budget, `<login>;resource=<resource>[;host=]`, asked of `/user` once per
 process, none for an installation token, and no identity. Free text is clipped once, a
-workflow name at 150 bytes, a branch's copy at 300, a manifest path at 70 cut from its front; the heaviest record, a graph's at 1605 bytes, is declared under the library's warning line; every time is typed, or null. → [record](adr/0014-a-run-is-its-readings-and-the-estate-is-its-object.md)
+workflow's name and its file at 150 bytes, a branch's copy at 300, a manifest path at 70 cut from its front; the heaviest record, a workflow run's at 1773 bytes, is declared past the library's warning line at the default limit, on purpose; every time is typed, or null. → [record](adr/0014-a-run-is-its-readings-and-the-estate-is-its-object.md)
 
 ### ADR-0015 — A workflow line holds the newest run it has read
 
@@ -174,3 +154,14 @@ attempt replaces it, anything else keeps it for the poll; none on the budget fal
 the guard prices none. Each contradiction is one `INFO` line; the estate carries
 `runs_held`, a level, and this run's `contradictions` and `holds_let_go`. A line is named
 after its workflow, from the list. → [record](adr/0015-a-workflow-line-holds-the-newest-run-it-has-read.md)
+
+### ADR-0016 — An aspect asks the whole scope, a finding grades, and a workflow is a node
+
+The tree is aspect-first, an aspect one question asked of one discovered scope, and the
+check's own node says how much was looked at; a keyed line carries the status, amber for
+a queue and red for something to do now, a band grading banded alerts. In `actions` a
+repository is a node grading nothing of its own unless it could not be read, a workflow
+a node beneath it named by its file and titled by its name, a branch a level beneath
+that only where several are configured, a disabled workflow's line on its own node;
+`show_healthy` is retired, nodes say their children are complete and that a run names
+them, and nothing migrates. → [record](adr/0016-an-aspect-asks-the-whole-scope-a-finding-grades-and-a-workflow-is-a-node.md)

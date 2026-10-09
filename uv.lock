@@ -399,7 +399,7 @@ wheels = [
 
 [[package]]
 name = "little-sister"
-version = "0.3.19"
+version = "0.3.20"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "flask" },
@@ -408,14 +408,14 @@ dependencies = [
     { name = "pyyaml" },
     { name = "tzdata" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/01/7c/8533e21d7158f4bf6475a60a28c87cc3d8e22563a9493a076091ba5696a2/little_sister-0.3.19.tar.gz", hash = "sha256:391b2af2d99020770e5b6a22ba18182c3a1379b69591bb71dfe9b142948f1a12", size = 688953, upload-time = "2026-10-04T22:42:35.197Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/aa/b6/b52805a34ce7e4abcfb25228e8a574d98073e7c6e55d4fe4f2727f5f9c01/little_sister-0.3.20.tar.gz", hash = "sha256:c7332f1d9e5232f3dceef24f598e7da134554ce6a502626847c24c108d9818a0", size = 725497, upload-time = "2026-10-09T23:29:23.563Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/91/1d/61134f755c6737cc63b5c5fa7847b2a99551a03e717d19335d9dae33d753/little_sister-0.3.19-py3-none-any.whl", hash = "sha256:3e47b5219840f1a08f99a5c69d33704d3c46a377ccef57ff8a2931d2f2be67ff", size = 783437, upload-time = "2026-10-04T22:42:32.207Z" },
+    { url = "https://files.pythonhosted.org/packages/11/74/d558b9e775a21f7c073f5dd9a46ce5aaba749fc73d42097224411f0150db/little_sister-0.3.20-py3-none-any.whl", hash = "sha256:72891ffc1ba06ed7c363535cbdf6c2d08de9be714cf4a6be52570b2a01afa637", size = 820251, upload-time = "2026-10-09T23:29:21.365Z" },
 ]
 
 [[package]]
 name = "little-sister-github"
-version = "0.1.10"
+version = "0.1.11"
 source = { editable = "." }
 dependencies = [
     { name = "little-sister" },

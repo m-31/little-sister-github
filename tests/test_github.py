@@ -18,7 +18,7 @@ from little_sister import fetch as ls_fetch
 from little_sister.checks import CheckError, Measurement
 from little_sister.fetch import Response
 from little_sister.reasons import MAX_SUBJECT_LENGTH, RECORD_TIMESTAMP_KEYS, slug
-from little_sister.status import StatusCode
+from little_sister.status import StatusCode, effective_code
 from little_sister.transport import Deadline, DeadlineExceeded, Fault
 from running import (
     aspect_readings,
@@ -60,6 +60,12 @@ def _graph(count, *nodes):
 
 _GRAPH_PRESENT = _graph(3, _MANIFEST)
 
+#: A repository GitHub's own time limit reached, as `FakeClient(graphs=...)` names
+#: it. The error is the one a deployment's log shows — the message `timedout`, no
+#: `type`, and a `path` that begins with the alias — and the alias answers `null`,
+#: as GraphQL answers for a field it errs at (ADR-0008, decision 4).
+_TIMED_OUT = object()
+
 #: `FakeClient(last_rate_limit=...)` left unset — the headers agree with whatever
 #: that double's `rate_limit()` answers. A sentinel and not `None`, because `None`
 #: is a **reading** here (GitHub sent no budget headers) and a test asks for it.
@@ -90,9 +96,12 @@ class FakeClient:
     ``data`` maps ``(repo_full_name, kind)`` -> list (kind: pulls / dependabot /
     code_scanning / secret_scanning); ``errors`` maps the same key -> a
     ``GitHubError`` to raise; ``graphs`` maps repo_full_name -> a
-    `dependencyGraphManifests` connection (``_graph``) or a GraphQL error type
-    (``"FORBIDDEN"``, ``"NOT_FOUND"``) for that repository's alias (absent -> a
-    graph with manifests); ``graph_answer`` is one whole canned answer to every
+    `dependencyGraphManifests` connection (``_graph``), a GraphQL error type
+    (``"FORBIDDEN"``, ``"NOT_FOUND"``) for that repository's alias, ``_TIMED_OUT``,
+    the error GitHub's own time limit leaves there, a ``GitHubError`` the query
+    for it raises, or a list of those — one for each time the repository is
+    asked, the last of them from then on (absent -> a graph with manifests);
+    ``graph_answer`` is one whole canned answer to every
     query, ``graph_error`` a ``GitHubError`` every query raises; ``runs`` maps
     repo_full_name -> an ``/actions/runs`` object or a ``GitHubError`` (absent ->
     no runs).
@@ -164,6 +173,9 @@ class FakeClient:
         self.paginated_params: list[tuple[str, dict]] = []
         self.rate_limit_calls = 0
         self.graphql_queries: list[str] = []
+        # Whether each query was asked as one request — no retry, no wait — which
+        # the real client takes as `once=` and the double only records.
+        self.graphql_once: list[bool] = []
 
     @property
     def reads_made(self):
@@ -221,11 +233,13 @@ class FakeClient:
             # default: every workflow_id seen in this repo's runs, all active, each
             # carrying the name its runs carry — GitHub states the name in both
             # places and the ignore patterns are now read off this one, because a
-            # workflow filtered out should not cost a request either.
+            # workflow filtered out should not cost a request either — and a file
+            # named after it, which names its node (ADR-0016 §18).
             runs = self._runs.get(full, {"workflow_runs": []})
             rows = runs.get("workflow_runs") or []
             names = {r.get("workflow_id"): r.get("name", "") for r in rows}
-            return {"workflows": [{"id": i, "name": names[i], "state": "active"}
+            return {"workflows": [{"id": i, "name": names[i], "state": "active",
+                                   "path": f".github/workflows/{names[i] or i}.yml"}
                                   for i in names if i is not None]}
         if "/actions/workflows/" in path and path.endswith("/runs"):
             # `/repos/<full>/actions/workflows/<id>/runs` — the same fixture the
@@ -265,7 +279,7 @@ class FakeClient:
             return value
         return {}
 
-    def graphql(self, query, variables=None):
+    def graphql(self, query, variables=None, *, once=False):
         """The dependency-graph query, answered the way GitHub answers an aliased
         query: one object per alias under `data`, `null` for an alias that
         errored, and that alias's error under `errors` with its `path`. The
@@ -273,6 +287,7 @@ class FakeClient:
         query the code builds is what is exercised."""
         self.calls.append("graphql")
         self.graphql_queries.append(query)
+        self.graphql_once.append(once)
         if self._graph_error is not None:
             raise self._graph_error
         if self._graph_answer is not None:
@@ -281,7 +296,14 @@ class FakeClient:
         for alias, owner, name in re.findall(
                 r'(\w+): repository\(owner: "([^"]+)", name: "([^"]+)"\)', query):
             value = self._graphs.get(f"{owner}/{name}", _GRAPH_PRESENT)
-            if isinstance(value, str):
+            if isinstance(value, list):
+                value = value.pop(0) if len(value) > 1 else value[0]
+            if isinstance(value, GitHubError):
+                raise value
+            if value is _TIMED_OUT:
+                data[alias] = None
+                errors.append({"message": "timedout", "path": [alias]})
+            elif isinstance(value, str):
                 data[alias] = None
                 errors.append({"type": value, "path": [alias],
                                "message": f"{value} for {owner}/{name}"})
@@ -291,6 +313,12 @@ class FakeClient:
         if errors:
             answer["errors"] = errors
         return answer
+
+    def affords(self, seconds):
+        """Whether the run has more than ``seconds`` left. The double has no
+        deadline, so it always has; what the real client answers is read by a
+        test that runs one against a clock."""
+        return True
 
     def rate_limit(self):
         # Counted apart from `calls`: the real endpoint read is free and is not on
@@ -1210,6 +1238,39 @@ def test_sbom_a_not_found_alias_grades_nothing():
     assert unreachable() == 0
 
 
+@pytest.mark.parametrize("gone", [("platform-a",), ("platform-a", "platform-c")],
+                         ids=["one gone", "two gone"])
+def test_sbom_a_repository_that_is_gone_is_one_of_the_repositories_tried(gone):
+    """"The denominator is every repository the aspect tried" (ADR-0002 §5), and a
+    repository GitHub answered `NOT_FOUND` about was tried once: "answered, so a
+    read and not a gap". Beside one GitHub did not answer for, each one that is
+    gone is one of the total — once — and no part of the count before it: four
+    repositories in scope read *1 of 4*, however many of them are gone."""
+    check = _check()
+    names = ["platform-a", "platform-b", "platform-c", "platform-d"]
+    fake = FakeClient([_repo(name) for name in names], graphs={
+        "example-org/platform-b": _transient(),
+        **{f"example-org/{name}": "NOT_FOUND" for name in gone}})
+    discovered = check._discover(fake)
+    readings, read = aspect_readings(check, "sbom_check", fake, discovered)
+    result = check._grade_sbom_check(readings, read, discovered)
+    lines = {entry.slug: (entry.code, entry.text)
+             for entry in result.reason_entries}
+    assert lines == {
+        **{_slug(name, "unreadable"): (
+            StatusCode.UNDEFINED,
+            f"{name}: not found — gone since discovery "
+            f"(NOT_FOUND for example-org/{name})") for name in gone},
+        _slug("platform-b", "unreadable"): (
+            StatusCode.UNDEFINED,
+            "platform-b: could not ask GitHub (502 Bad Gateway)"),
+        "read": (StatusCode.WARN,
+                 "GitHub did not answer for 1 of 4 repositories"),
+    }
+    # what arrived is the measuring half's count, and a `NOT_FOUND` arrived
+    assert read == 3 and unreachable() == 1
+
+
 def test_sbom_an_errors_only_answer_is_could_not_ask():
     """"A `200` with `errors` and no `data` is the query failing whole, and the
     aspect says it could not ask — the coverage line, never a claim about any
@@ -1272,6 +1333,89 @@ def test_sbom_an_alias_error_of_a_kind_the_record_does_not_name_is_could_not_rea
     assert unreachable() == 0
 
 
+def test_sbom_the_alias_error_timedout_is_could_not_ask_and_grades_nothing():
+    """Decision 4: the alias error `timedout` "is `TRANSIENT`: a line
+    that grades nothing and that the coverage line counts, never a claim about the
+    repository". The answer is built from what a deployment's log shows of it — a
+    `200` whose `errors` hold one error with that message, no `type`, and a `path`
+    that begins with the one alias the query carries — with `null` under the
+    alias, as GraphQL answers for a field it errs at."""
+    check = _check()
+    fake = FakeClient([_repo("platform-a")], graph_answer={
+        "data": {"r0": None},
+        "errors": [{"message": "timedout", "path": ["r0"]}]})
+    result = _sbom(check, fake)
+    note, gap = result.reason_entries
+    assert note.slug == _slug("platform-a", "unreadable")
+    assert note.code is StatusCode.UNDEFINED
+    assert note.text == "platform-a: could not ask GitHub (error: timedout)"
+    assert note.data["fault"] == "transient"
+    assert (gap.slug, gap.code) == ("read", StatusCode.WARN)
+    assert gap.text == "GitHub did not answer for 1 of 1 repositories"
+    assert unreachable() == 1
+
+
+def test_sbom_the_cut_is_known_however_deep_its_path_goes():
+    """"A `path` that begins with the one alias the query carries": what the log
+    shows is where the path begins, not how far it goes, and the error is matched
+    "wherever its path goes on to after the alias" — GraphQL answers `null` "for
+    the repository or for the connection beneath it". An error whose path goes on
+    past the alias is the same cut, about the same repository."""
+    check = _check()
+    fake = FakeClient([_repo("platform-a")], graph_answer={
+        "data": {"r0": {"dependencyGraphManifests": None}},
+        "errors": [{"message": "timedout",
+                    "path": ["r0", "dependencyGraphManifests"],
+                    "locations": [{"line": 1, "column": 73}]}]})
+    note, gap = _sbom(check, fake).reason_entries
+    assert note.code is StatusCode.UNDEFINED
+    assert note.text == "platform-a: could not ask GitHub (error: timedout)"
+    assert gap.text == "GitHub did not answer for 1 of 1 repositories"
+    assert unreachable() == 1
+
+
+def test_sbom_a_cut_repository_costs_its_own_line_and_no_other():
+    """One repository a query, so "a cut costs exactly that repository's line": the
+    repository beside it that has no dependency graph keeps its red line, and the
+    cut one is the one repository the coverage line counts."""
+    check = _check()
+    fake = FakeClient([_repo("platform-a"), _repo("platform-b")], graphs={
+        "example-org/platform-a": _TIMED_OUT,
+        "example-org/platform-b": _graph(0)})
+    result = _sbom(check, fake)
+    codes = {entry.slug: entry.code for entry in result.reason_entries}
+    assert codes == {_slug("platform-b", "sbom"): StatusCode.ERROR,
+                     _slug("platform-a", "unreadable"): StatusCode.UNDEFINED,
+                     "read": StatusCode.WARN}
+    gap = next(e for e in result.reason_entries if e.slug == "read")
+    assert gap.text == "GitHub did not answer for 1 of 2 repositories"
+    assert unreachable() == 1
+
+
+@pytest.mark.parametrize("error, said", [
+    ({"message": "Something went wrong", "path": ["r0"]},
+     "error: Something went wrong"),
+    ({"type": "SERVICE_UNAVAILABLE", "message": "timedout", "path": ["r0"]},
+     "SERVICE_UNAVAILABLE: timedout"),
+    ({"message": "timedout after 10s", "path": ["r0"]},
+     "error: timedout after 10s"),
+    ({"message": "Timedout", "path": ["r0"]}, "error: Timedout"),
+])
+def test_sbom_only_the_error_as_it_was_seen_is_could_not_ask(error, said):
+    """"The error is matched as it was seen — that message, whole, and no `type`",
+    and any other "still reads as *could not read* with what it said on the line": so
+    another message without a type, that message under a type, and a message that
+    merely holds or resembles the word are each still an answer this check cannot
+    read, amber on the repository's line and no outage on the node."""
+    check = _check()
+    fake = FakeClient([_repo("platform-a")],
+                      graph_answer={"data": {"r0": None}, "errors": [error]})
+    (note,) = _sbom(check, fake).reason_entries
+    assert note.code is StatusCode.WARN
+    assert note.text == f"platform-a: could not read ({said})"
+    assert unreachable() == 0
+
+
 def test_sbom_an_alias_with_neither_object_nor_error_cannot_be_read():
     check = _check()
     fake = FakeClient([_repo("platform-a")], graph_answer={"data": {"r0": None}})
@@ -1315,6 +1459,37 @@ def test_sbom_the_synchronous_export_is_gone_from_the_code():
 
 
 # --- actions (failed workflow runs) -----------------------------------------
+#
+# The aspect is a tree (ADR-0016 §17–§22): a node for each repository it has
+# something to say about, beneath it one for each workflow with a line, named by
+# the workflow's file — and beneath that one for each branch, where the
+# configuration names several. These read the tree as the wall does.
+
+def _tree_lines(result):
+    """Every line of ``result`` and of the nodes beneath it — a node's own before
+    its children's — wherever in the aspect's tree they stand."""
+    return [*result.reason_entries,
+            *(line for child in result.children for line in _tree_lines(child))]
+
+
+def _tree_texts(result):
+    """The sentences of :func:`_tree_lines`."""
+    return [line.text for line in _tree_lines(result)]
+
+
+def _derived(result):
+    """The code the engine shows a node at: the worst of its own and its
+    children's, `UNDEFINED` skipped (little-sister's `effective_code`)."""
+    return effective_code(result.stored_code,
+                          [_derived(child) for child in result.children])
+
+
+def _node(result, *names):
+    """The node ``names`` lead to beneath ``result``, a name a level."""
+    for name in names:
+        (result,) = [child for child in result.children if child.name == name]
+    return result
+
 
 def test_actions_failure_is_error():
     check = _check()
@@ -1323,9 +1498,10 @@ def test_actions_failure_is_error():
     result = run_aspect(check, "actions", fake, check._discover(fake))
     assert result.name == "actions"
     assert result.code is None
-    assert result.stored_code is StatusCode.ERROR
-    assert result.reason_entries[0].code is StatusCode.ERROR
-    assert "failed" in result.reason_texts[0]
+    assert _derived(result) is StatusCode.ERROR
+    line, = _node(result, "platform-a", "ci.yml").reason_entries
+    assert line.code is StatusCode.ERROR
+    assert "failed" in line.text
 
 
 def test_actions_entry_carries_its_subject_and_its_record():
@@ -1339,7 +1515,7 @@ def test_actions_entry_carries_its_subject_and_its_record():
                     started="2026-09-19T09:12:00Z",
                     updated="2026-09-19T09:20:14Z")]}})
     result = run_aspect(check, "actions", fake, check._discover(fake))
-    entry, = [e for e in result.reason_entries if e.data]
+    entry, = [e for e in _tree_lines(result) if e.data]
     # the object is the workflow on its branch (ADR-0013): the repository's id,
     # the workflow's id, and the branch verbatim
     assert entry.subject == f"{_repo_id('platform-a')}:1:main"
@@ -1348,6 +1524,8 @@ def test_actions_entry_carries_its_subject_and_its_record():
     assert entry.data["repository_id"] == _repo_id("platform-a")
     assert entry.data["workflow_id"] == 1
     assert entry.data["workflow"] == "ci"
+    # and the workflow's file, which names its node (ADR-0016 §18)
+    assert entry.data["file"] == "ci.yml"
     assert entry.data["branch"] == "main"
     # two words for the outcome, and they are not the same field: `conclusion` is
     # GitHub's, for a grading map; `verdict` is ours, for a line template
@@ -1361,6 +1539,8 @@ def test_actions_entry_carries_its_subject_and_its_record():
     assert entry.data["completed"]["started"] == "2026-09-19T09:12:00Z"
     assert entry.data["completed"]["updated"] == {"at": "2026-09-19T09:20:14Z"}
     assert "ended" not in entry.data["completed"]
+    # how long the completed run took, in whole seconds: 8 min 14 s
+    assert entry.data["completed"]["duration_s"] == 494
     assert "running" not in entry.data
 
 
@@ -1373,7 +1553,7 @@ def test_actions_the_sentence_does_not_move_when_the_record_arrives():
             _wf_run(conclusion="failure", run_number=41,
                     url="https://gh/run/41")]}})
     result = run_aspect(check, "actions", fake, check._discover(fake))
-    assert result.reason_texts[0] == (
+    assert _tree_texts(result)[0] == (
         "[platform-a (main) / ci](https://gh/run/41): failed (#41)")
 
 
@@ -1386,9 +1566,11 @@ def test_actions_an_absent_time_is_null_and_not_an_empty_string():
         "example-org/platform-a": {"workflow_runs": [
             _wf_run(conclusion="failure")]}})
     result = run_aspect(check, "actions", fake, check._discover(fake))
-    entry, = [e for e in result.reason_entries if e.data]
+    entry, = [e for e in _tree_lines(result) if e.data]
     assert entry.data["completed"]["started"] is None
     assert entry.data["completed"]["updated"] == {"at": None}
+    # and a run with no times has no span between them
+    assert entry.data["completed"]["duration_s"] is None
 
 
 def test_actions_an_in_flight_run_rides_its_own_block():
@@ -1400,12 +1582,14 @@ def test_actions_an_in_flight_run_rides_its_own_block():
             _wf_run(conclusion="success", run_number=41,
                     url="https://gh/run/41")]}})
     result = run_aspect(check, "actions", fake, check._discover(fake))
-    entry, = [e for e in result.reason_entries if e.data]
+    entry, = [e for e in _tree_lines(result) if e.data]
     assert entry.data["verdict"] == "passed"
     assert entry.data["completed"]["run_number"] == 41
     assert entry.data["running"]["run_number"] == 42
     assert entry.data["running"]["started"] == "2026-09-19T10:00:00Z"
     assert entry.data["running"]["conclusion"] is None
+    # a run in flight has no duration yet
+    assert entry.data["running"]["duration_s"] is None
 
 
 def test_actions_waiting_is_warn():
@@ -1415,8 +1599,8 @@ def test_actions_waiting_is_warn():
             _wf_run(status="waiting", conclusion="")]}})
     result = run_aspect(check, "actions", fake, check._discover(fake))
     assert result.code is None
-    assert result.stored_code is StatusCode.WARN
-    assert "waiting" in result.reason_texts[0]
+    assert _derived(result) is StatusCode.WARN
+    assert "waiting" in _tree_texts(result)[0]
 
 
 def test_actions_running_keeps_the_last_success_visible():
@@ -1428,25 +1612,27 @@ def test_actions_running_keeps_the_last_success_visible():
             _wf_run(conclusion="success", run_number=11,
                     url="https://gh/run/11")]}})
     result = run_aspect(check, "actions", fake, check._discover(fake))
-    assert result.stored_code is StatusCode.OK
-    assert len(result.reason_entries) == 1
-    assert result.reason_entries[0].code is StatusCode.OK
-    assert result.reason_entries[0].running is True
-    assert "passed (#11)" in result.reason_texts[0]
-    assert "#12 running" in result.reason_texts[0]
+    assert _derived(result) is StatusCode.OK
+    line, = _tree_lines(result)
+    assert line.code is StatusCode.OK
+    assert line.running is True
+    assert "passed (#11)" in line.text
+    assert "#12 running" in line.text
 
 
-def test_actions_healthy_idle_is_hidden_by_default_and_can_be_enabled():
+def test_actions_a_passing_idle_workflow_has_its_line_on_its_node():
+    """"Every workflow's node carries its line — a passing idle workflow's says it
+    passed": the line is what makes the node stand for the workflow and draw its
+    runs (ADR-0016 §21, little-sister ADR-0106)."""
     fake = FakeClient([_repo("platform-a")], runs={
         "example-org/platform-a": {"workflow_runs": [
             _wf_run(conclusion="success")]}})
-    hidden = run_aspect(_check(), "actions", fake, _repos("platform-a"))
-    shown = run_aspect(_check(actions_show_healthy=True), "actions", fake,
-                       _repos("platform-a"))
-    assert hidden.stored_code is StatusCode.OK
-    assert hidden.reason_texts == []
-    assert shown.reason_entries[0].code is StatusCode.OK
-    assert shown.reason_entries[0].running is False
+    result = run_aspect(_check(), "actions", fake, _repos("platform-a"))
+    assert _derived(result) is StatusCode.OK
+    line, = _node(result, "platform-a", "ci.yml").reason_entries
+    assert line.code is StatusCode.OK
+    assert line.running is False
+    assert line.subject == f"{_repo_id('platform-a')}:1:main"
 
 
 def test_actions_latest_run_per_workflow_branch_wins():
@@ -1456,8 +1642,8 @@ def test_actions_latest_run_per_workflow_branch_wins():
             _wf_run(conclusion="failure", wf_id=1),     # newest
             _wf_run(conclusion="success", wf_id=1)]}})   # older, same (wf, branch)
     result = run_aspect(check, "actions", fake, check._discover(fake))
-    assert result.stored_code is StatusCode.ERROR
-    assert len(result.reason_texts) == 1
+    assert _derived(result) is StatusCode.ERROR
+    assert len(_tree_texts(result)) == 1
 
 
 def test_actions_retry_does_not_hide_the_last_failure():
@@ -1467,8 +1653,8 @@ def test_actions_retry_does_not_hide_the_last_failure():
             _wf_run(status="in_progress", conclusion="", run_number=22),
             _wf_run(conclusion="failure", run_number=21)]}})
     result = run_aspect(check, "actions", fake, check._discover(fake))
-    entry = result.reason_entries[0]
-    assert result.stored_code is StatusCode.ERROR
+    entry, = _tree_lines(result)
+    assert _derived(result) is StatusCode.ERROR
     assert entry.code is StatusCode.ERROR
     assert entry.running is True
     assert "failed (#21)" in entry.text
@@ -1482,8 +1668,8 @@ def test_actions_cancelled_retry_does_not_hide_the_last_failure():
             _wf_run(conclusion="cancelled", run_number=22),
             _wf_run(conclusion="failure", run_number=21)]}})
     result = run_aspect(check, "actions", fake, check._discover(fake))
-    assert result.stored_code is StatusCode.ERROR
-    assert "failed (#21)" in result.reason_texts[0]
+    assert _derived(result) is StatusCode.ERROR
+    assert "failed (#21)" in _tree_texts(result)[0]
 
 
 def test_actions_a_first_run_in_flight_is_undefined_but_visible():
@@ -1492,14 +1678,20 @@ def test_actions_a_first_run_in_flight_is_undefined_but_visible():
         "example-org/platform-a": {"workflow_runs": [
             _wf_run(status="queued", conclusion="", run_number=1)]}})
     result = run_aspect(check, "actions", fake, check._discover(fake))
-    assert result.stored_code is StatusCode.UNDEFINED
-    assert result.reason_entries[0].code is StatusCode.UNDEFINED
-    assert result.reason_entries[0].running is True
-    assert "no completed run" in result.reason_texts[0]
+    node = _node(result, "platform-a", "ci.yml")
+    assert node.stored_code is StatusCode.UNDEFINED
+    line, = node.reason_entries
+    assert line.code is StatusCode.UNDEFINED
+    assert line.running is True
+    assert "no completed run" in line.text
 
 
-def test_actions_order_problems_then_running_then_healthy():
-    check = _check(actions_show_healthy=True)
+def test_actions_each_workflow_is_a_node_beneath_its_repository():
+    """"`actions` hands back a node for each repository it reads workflows of, and
+    beneath it one for each workflow on its branch", named by the workflow's file
+    and titled by its name (ADR-0016 §17, §18) — each holding its own line, so the
+    order a reader meets them in is the wall's, by name."""
+    check = _check()
     fake = FakeClient([_repo("platform-a")], runs={
         "example-org/platform-a": {"workflow_runs": [
             _wf_run(name="healthy", wf_id=3, conclusion="success"),
@@ -1510,9 +1702,19 @@ def test_actions_order_problems_then_running_then_healthy():
             _wf_run(name="broken", wf_id=1, conclusion="failure"),
         ]}})
     result = run_aspect(check, "actions", fake, check._discover(fake))
-    assert [entry.code for entry in result.reason_entries] == [
-        StatusCode.ERROR, StatusCode.OK, StatusCode.OK]
-    assert [entry.running for entry in result.reason_entries] == [False, True, False]
+    assert result.reason_entries == ()
+    repository, = result.children
+    assert (repository.name, repository.reason_entries) == ("platform-a", ())
+    nodes = {node.name: node for node in repository.children}
+    assert {name: node.title for name, node in nodes.items()} == {
+        "broken.yml": "broken", "rebuilding.yml": "rebuilding",
+        "healthy.yml": "healthy"}
+    assert {name: [(line.code, line.running) for line in node.reason_entries]
+            for name, node in nodes.items()} == {
+        "broken.yml": [(StatusCode.ERROR, False)],
+        "rebuilding.yml": [(StatusCode.OK, True)],
+        "healthy.yml": [(StatusCode.OK, False)]}
+    assert _derived(result) is StatusCode.ERROR
 
 
 def test_actions_ignore_pattern_skips_workflow():
@@ -1522,6 +1724,7 @@ def test_actions_ignore_pattern_skips_workflow():
             _wf_run(name="Nightly Load", conclusion="failure")]}})
     result = run_aspect(check, "actions", fake, check._discover(fake))
     assert result.stored_code is StatusCode.OK
+    assert result.children == ()
 
 
 def test_actions_default_branch_asks_each_workflow_about_that_branch():
@@ -1553,7 +1756,8 @@ def _listed(*rows):
     workflows = []
     for workflow_id, name, state, *updated in rows:
         row = {"id": workflow_id, "name": name, "state": state,
-               "html_url": f"https://gh/wf/{workflow_id}"}
+               "html_url": f"https://gh/wf/{workflow_id}",
+               "path": f".github/workflows/{name}.yml"}
         if updated:
             (row["updated_at"],) = updated
         workflows.append(row)
@@ -1571,8 +1775,8 @@ def test_a_manually_disabled_workflow_is_a_line_and_costs_no_read():
         workflows=_listed((1, "ci", "active"),
                           (2, "nightly", "disabled_manually")))
     result = run_aspect(check, "actions", fake, check._discover(fake))
-    assert result.stored_code is StatusCode.WARN
-    line, = result.reason_entries
+    assert _derived(result) is StatusCode.WARN
+    line, = _node(result, "platform-a", "nightly.yml").reason_entries
     assert line.text == ("[platform-a / nightly](https://gh/wf/2): disabled "
                          "manually, no runs read")
     # the read it saved: workflow 2 was never asked about
@@ -1584,21 +1788,24 @@ def test_a_disabled_line_carries_its_subject_and_its_record():
     """The disabled line is an `actions` line about a repository too, so it groups
     with the rest of them. `state` is GitHub's own word and free-form — the
     library types three names and this is not one of them — and `updated.at` is
-    GitHub's `updated_at`, under one that is."""
+    GitHub's `updated_at`, under one that is; the same instant is the record's own
+    time, `at`, since the switch is what the record is of."""
     check = _check()
     fake = FakeClient(
         [_repo("platform-a")],
         workflows=_listed((2, "nightly", "disabled_manually",
                            "2026-09-01T08:15:00Z")))
     result = run_aspect(check, "actions", fake, check._discover(fake))
-    line, = result.reason_entries
+    line, = _tree_lines(result)
     # its object is the workflow everywhere, so its subject has no branch part
     assert line.subject == f"{_repo_id('platform-a')}:2"
     assert line.data == {"aspect": "actions", "kind": "disabled",
                          "repository": "example-org/platform-a",
                          "repository_id": _repo_id("platform-a"),
+                         "at": "2026-09-01T08:15:00Z",
                          "workflow": "nightly",
                          "workflow_id": 2,
+                         "file": "nightly.yml",
                          "url": "https://gh/wf/2",
                          "state": "disabled_manually",
                          "updated": {"at": "2026-09-01T08:15:00Z"}}
@@ -1612,7 +1819,7 @@ def test_a_disabled_line_is_keyed_without_a_branch():
     fake = FakeClient(
         [_repo("platform-a")],
         workflows=_listed((2, "nightly", "disabled_manually")))
-    line, = run_aspect(check, "actions", fake, check._discover(fake)).reason_entries
+    line, = _tree_lines(run_aspect(check, "actions", fake, check._discover(fake)))
     assert line.slug == _slug("platform-a", "workflow", 2)
     assert line.slug != _slug("platform-a", "workflow", 2, "main")
 
@@ -1625,29 +1832,25 @@ def test_inactivity_is_amber_and_says_what_github_did():
     fake = FakeClient(
         [_repo("platform-a")],
         workflows=_listed((3, "soak", "disabled_inactivity")))
-    line, = run_aspect(check, "actions", fake, check._discover(fake)).reason_entries
+    line, = _tree_lines(run_aspect(check, "actions", fake, check._discover(fake)))
     assert line.code is StatusCode.WARN
     assert line.text == ("[platform-a / soak](https://gh/wf/3): disabled by "
                          "GitHub after 60 days without repository activity, "
                          "no runs read")
 
 
-def test_a_fork_disabled_workflow_is_ok_and_hidden_like_a_passing_one():
+def test_a_fork_disabled_workflow_is_ok_and_its_line_written_as_any_other():
     """GitHub disables scheduled workflows on a fork by default and `include_forks`
     is true unless a deployment says otherwise, so grading this would put one
-    standing amber on the leaf per fork — a state nobody chose. `OK`, and it follows
-    `show_healthy` exactly as a passing idle workflow does (ADR-0004 §9)."""
+    standing amber on the aspect per fork — a state nobody chose. `OK`, and written
+    as any other line: it is what makes the workflow's node stand for the workflow
+    while it is off (ADR-0016 §20, §21)."""
     check = _check()
     fake = FakeClient(
         [_repo("platform-a")],
         workflows=_listed((4, "release", "disabled_fork")))
     result = run_aspect(check, "actions", fake, check._discover(fake))
-    assert result.reason_texts == []
-    shown = _check(actions_show_healthy=True)
-    fake2 = FakeClient(
-        [_repo("platform-a")],
-        workflows=_listed((4, "release", "disabled_fork")))
-    line, = run_aspect(shown, "actions", fake2, shown._discover(fake2)).reason_entries
+    line, = _node(result, "platform-a", "release.yml").reason_entries
     assert line.code is StatusCode.OK
     assert line.text == ("[platform-a / release](https://gh/wf/4): disabled by "
                          "GitHub on this fork, no runs read")
@@ -1658,27 +1861,26 @@ def test_the_deployment_grades_a_disabled_state_for_itself():
     that runs seasonal workflows quiets `disabled_manually`, one that wants to hear
     about its forks raises `disabled_fork`."""
     check = _check(actions_disabled_map={"disabled_manually": StatusCode.OK,
-                                         "disabled_fork": StatusCode.ERROR},
-                   actions_show_healthy=True)
+                                         "disabled_fork": StatusCode.ERROR})
     fake = FakeClient(
         [_repo("platform-a")],
         workflows=_listed((2, "nightly", "disabled_manually"),
                           (4, "release", "disabled_fork")))
     result = run_aspect(check, "actions", fake, check._discover(fake))
-    codes = {entry.code for entry in result.reason_entries}
+    codes = {entry.code for entry in _tree_lines(result)}
     assert codes == {StatusCode.OK, StatusCode.ERROR}
-    assert result.stored_code is StatusCode.ERROR
+    assert _derived(result) is StatusCode.ERROR
 
 
 def test_a_disabled_state_this_package_has_not_met_is_amber_and_said_as_given():
-    """An undeclared state grades WARN, as an undeclared severity does (ADR-0004
-    §6), and is said the way GitHub spelled it — a state GitHub adds later arrives
+    """An undeclared state grades WARN, as an undeclared severity does (ADR-0016
+    §13), and is said the way GitHub spelled it — a state GitHub adds later arrives
     as a word to look up rather than as silence or as a flat `disabled`."""
     check = _check()
     fake = FakeClient(
         [_repo("platform-a")],
         workflows=_listed((5, "odd", "disabled_by_some_new_rule")))
-    line, = run_aspect(check, "actions", fake, check._discover(fake)).reason_entries
+    line, = _tree_lines(run_aspect(check, "actions", fake, check._discover(fake)))
     assert line.code is StatusCode.WARN
     assert line.text == ("[platform-a / odd](https://gh/wf/5): disabled "
                          "(disabled_by_some_new_rule), no runs read")
@@ -1709,20 +1911,20 @@ def test_an_ignored_disabled_workflow_is_neither_read_nor_reported():
         [_repo("platform-a")],
         workflows=_listed((2, "nightly", "disabled_manually")))
     result = run_aspect(check, "actions", fake, check._discover(fake))
-    assert result.reason_texts == []
+    assert _tree_texts(result) == []
     assert check._workflow_counts == {"example-org/platform-a": 0}
 
 
 def test_a_deleted_workflow_is_still_dropped_rather_than_called_disabled():
     """`deleted` is in the same enum and is not a disabled state: such a workflow
     is dropped, and its last failure is not a fact about the repository today
-    (ADR-0004 §9)."""
+    (ADR-0016 §16)."""
     check = _check()
     fake = FakeClient(
         [_repo("platform-a")],
         workflows=_listed((6, "gone", "deleted")))
     result = run_aspect(check, "actions", fake, check._discover(fake))
-    assert result.reason_texts == []
+    assert _tree_texts(result) == []
     assert check._workflow_counts == {"example-org/platform-a": 0}
 
 
@@ -1822,7 +2024,7 @@ def test_actions_a_repository_with_no_watched_workflow_is_not_called_unmatched()
         runs=_runs([], 0),
         workflows=_named((1, "ci")))
     result = run_aspect(check, "actions", fake, check._discover(fake))
-    assert result.reason_texts == []
+    assert _tree_texts(result) == []
 
 
 def test_actions_more_than_one_named_branch_degrades_to_an_unfiltered_page():
@@ -1843,12 +2045,14 @@ def test_actions_more_than_one_named_branch_degrades_to_an_unfiltered_page():
     wide = [params for (p, params) in fake.get_calls
             if p.endswith("/actions/runs")]
     assert wide and all("branch" not in params for params in wide)
-    assert result.stored_code is StatusCode.ERROR
-    # the `wip` row is dropped, the `release` one grades, and the page is short
-    assert "(release)" in result.reason_texts[0]
-    assert not any("wip" in text for text in result.reason_texts)
-    assert [entry.slug for entry in result.reason_entries] == [
-        _slug("platform-a", "workflow", 1, "release"), "runs-window-partial"]
+    assert _derived(result) is StatusCode.ERROR
+    # the `wip` row is dropped, the `release` one grades on the branch's node, and
+    # the page is short, which the aspect says
+    line, = _node(result, "platform-a", "ci.yml", "release").reason_entries
+    assert "(release)" in line.text
+    assert not any("wip" in text for text in _tree_texts(result))
+    assert [entry.slug for entry in _tree_lines(result)] == [
+        "runs-window-partial", _slug("platform-a", "workflow", 1, "release")]
 
 
 def test_actions_one_named_branch_is_filtered_by_github_on_the_degraded_read():
@@ -1970,9 +2174,9 @@ def test_actions_ignores_runs_of_deleted_workflows():
             {"id": 1, "state": "active"}]}},          # workflow 99 no longer exists
     )
     result = run_aspect(check, "actions", fake, check._discover(fake))
-    assert result.stored_code is StatusCode.ERROR
-    assert len(result.reason_texts) == 1                    # only the existing workflow
-    assert "old-ci" not in result.reason_texts[0]           # the deleted one is dropped
+    assert _derived(result) is StatusCode.ERROR
+    assert len(_tree_texts(result)) == 1                    # only the existing workflow
+    assert "old-ci" not in _tree_texts(result)[0]           # the deleted one is dropped
 
 
 def test_actions_deleted_only_repo_is_ok():
@@ -1987,6 +2191,7 @@ def test_actions_deleted_only_repo_is_ok():
     result = run_aspect(check, "actions", fake, check._discover(fake))
     assert result.stored_code is StatusCode.OK
     assert result.reason_texts == []
+    assert result.children == ()
 
 
 def test_actions_workflow_state_deleted_is_excluded():
@@ -2000,6 +2205,7 @@ def test_actions_workflow_state_deleted_is_excluded():
     )
     result = run_aspect(check, "actions", fake, check._discover(fake))
     assert result.stored_code is StatusCode.OK
+    assert result.children == ()
 
 
 # --- actions: the exact read, and the two places it is not exact ------------
@@ -2018,7 +2224,8 @@ def _runs(rows, total):
 
 def _named(*rows):
     return {"example-org/platform-a": {"workflows": [
-        {"id": i, "name": n, "state": "active"} for i, n in rows]}}
+        {"id": i, "name": n, "state": "active",
+         "path": f".github/workflows/{n}.yml"} for i, n in rows]}}
 
 
 def test_actions_a_workflow_that_does_not_run_on_the_branch_is_simply_absent():
@@ -2033,8 +2240,11 @@ def test_actions_a_workflow_that_does_not_run_on_the_branch_is_simply_absent():
         workflows=_named((1, "ci"), (2, "deploy")),
     )
     result = run_aspect(check, "actions", fake, check._discover(fake))
-    assert result.stored_code is StatusCode.OK
+    assert _derived(result) is StatusCode.OK
     assert result.reason_texts == []
+    # `ci` passed and has its node; `deploy` has none
+    assert [node.name for node in _node(result, "platform-a").children] == [
+        "ci.yml"]
     # it was asked about, and answered nothing — that is the difference
     assert ("/repos/example-org/platform-a/actions/workflows/2/runs"
             in [p for p, _ in fake.get_calls])
@@ -2068,7 +2278,7 @@ def test_actions_all_branches_reads_one_page_and_says_when_it_was_cut():
     assert result.stored_code is StatusCode.WARN
     assert result.reason_texts == [
         "not all runs read in 1 of 1 repository — a workflow whose newest run "
-        "falls outside the window has no state here and is not reported above: "
+        "falls outside the window has no state here and is not reported: "
         "platform-a"]
     assert result.reason_entries[0].slug == "runs-window-partial"
     assert not [p for p, _ in fake.get_calls if "/actions/workflows/" in p]
@@ -2088,9 +2298,9 @@ def test_actions_a_thin_budget_degrades_to_the_wide_read():
     result = run_aspect(check, "actions", fake, check._discover(fake))
     assert not [p for p, _ in fake.get_calls if "/actions/workflows/" in p]
     assert [p for p, _ in fake.get_calls if p.endswith("/actions/runs")]
-    assert result.stored_code is StatusCode.ERROR      # the failure is still found
-    assert "failed" in result.reason_texts[0]
-    assert result.reason_texts[1].startswith("not all runs read in 1 of 1 ")
+    assert _derived(result) is StatusCode.ERROR        # the failure is still found
+    assert "failed" in _node(result, "platform-a", "ci.yml").reason_texts[0]
+    assert result.reason_texts[0].startswith("not all runs read in 1 of 1 ")
 
 
 def test_actions_a_budget_that_covers_the_workflows_is_not_degraded():
@@ -2155,9 +2365,10 @@ def test_actions_a_repository_short_both_ways_is_counted_once():
     assert result.reason_texts[0].count("platform-a") == 1
 
 
-def test_actions_the_window_line_is_last_and_does_not_displace_a_failure():
-    """A finding is what an operator acts on; the window line is what tells them the
-    findings are not all of them."""
+def test_actions_the_window_line_is_the_aspects_and_does_not_displace_a_failure():
+    """A finding is what an operator acts on, and it stands on its workflow's node;
+    the window line is what tells them the findings are not all of them, and it is
+    said once, on the aspect (ADR-0016 §17)."""
     check = _check(actions_all_branches=True)
     fake = FakeClient(
         [_repo("platform-a")],
@@ -2165,10 +2376,366 @@ def test_actions_the_window_line_is_last_and_does_not_displace_a_failure():
         workflows=_named((1, "ci")),
     )
     result = run_aspect(check, "actions", fake, check._discover(fake))
-    assert result.stored_code is StatusCode.ERROR
-    assert len(result.reason_texts) == 2
-    assert "failed" in result.reason_texts[0]
-    assert result.reason_texts[1].startswith("not all runs read in ")
+    assert _derived(result) is StatusCode.ERROR
+    assert [line.slug for line in result.reason_entries] == ["runs-window-partial"]
+    assert "failed" in _node(result, "platform-a", "ci.yml", "main").reason_texts[0]
+
+
+# --- actions: the tree (ADR-0016 §17–§22) ------------------------------------
+#
+# The plan item's *done when*, a clause a test: each a whole aspect's read, and over
+# two runs where the clause is about what the second one does.
+
+def test_a_repository_and_its_workflow_are_nodes_a_run_names():
+    """"A repository with a workflow that has run on the watched branch is a node
+    beneath `actions`, named by the repository's name, and the workflow a node
+    beneath it, named by its file and titled by its display name, its line on it
+    standing for the workflow on its branch … and each of the two says that a run
+    names it" — so a repository called `issues`, or a workflow file called
+    `actions.yml`, is not shown under that aspect's label (little-sister ADR-0118)."""
+    fake = FakeClient(
+        [_repo("issues")],
+        runs={"example-org/issues": {"workflow_runs": [
+            _wf_run(name="Build and test", conclusion="failure", wf_id=7)]}},
+        workflows={"example-org/issues": {"workflows": [
+            {"id": 7, "name": "Build and test", "state": "active",
+             "path": ".github/workflows/actions.yml"}]}})
+    result = run_aspect(_check(), "actions", fake, _repos("issues"))
+    repository, = result.children
+    assert (repository.name, repository.dynamic) == ("issues", True)
+    workflow, = repository.children
+    assert (workflow.name, workflow.title, workflow.dynamic) == (
+        "actions.yml", "Build and test", True)
+    line, = workflow.reason_entries
+    assert line.subject == f"{_repo_id('issues')}:7:main"
+    assert line.code is StatusCode.ERROR
+
+
+def test_a_workflow_github_runs_itself_is_named_by_the_end_of_its_path():
+    """"For a workflow GitHub runs itself, such as Dependabot's, the last segment of
+    its `dynamic/…` path" — and where GitHub sent no path, the workflow's id, which
+    no rename moves either."""
+    fake = FakeClient(
+        [_repo("platform-a")],
+        runs=_runs([_wf_run(name="Dependabot Updates", wf_id=3),
+                    _wf_run(name="ci", wf_id=4)], 2),
+        workflows={"example-org/platform-a": {"workflows": [
+            {"id": 3, "name": "Dependabot Updates", "state": "active",
+             "path": "dynamic/dependabot/dependabot-updates"},
+            {"id": 4, "name": "ci", "state": "active"}]}})
+    result = run_aspect(_check(), "actions", fake, _repos("platform-a"))
+    assert {node.name: node.title for node in _node(result, "platform-a").children} \
+        == {"dependabot-updates": "Dependabot Updates", "4": "ci"}
+
+
+def test_an_edited_name_moves_no_node_and_a_renamed_file_is_a_new_one():
+    """"An edit to `name:` moves nothing, and a renamed file is a new node" — whose
+    line keeps its subject, keyed as it is by ids, so the series carries over
+    (ADR-0013 decision 2)."""
+    def read(name, path):
+        fake = FakeClient(
+            [_repo("platform-a")], runs=_runs([_wf_run(name=name, wf_id=1)], 1),
+            workflows={"example-org/platform-a": {"workflows": [
+                {"id": 1, "name": name, "state": "active", "path": path}]}})
+        repository = _node(run_aspect(_check(), "actions", fake,
+                                      _repos("platform-a")), "platform-a")
+        (workflow,) = repository.children
+        (line,) = workflow.reason_entries
+        return workflow.name, workflow.title, line.subject
+
+    named = read("CI", ".github/workflows/ci.yml")
+    renamed = read("Continuous integration", ".github/workflows/ci.yml")
+    moved = read("Continuous integration", ".github/workflows/build.yml")
+    assert named[0] == renamed[0] == "ci.yml"
+    assert (named[1], renamed[1]) == ("CI", "Continuous integration")
+    assert moved[0] == "build.yml"
+    assert named[2] == renamed[2] == moved[2] == f"{_repo_id('platform-a')}:1:main"
+
+
+def test_two_named_branches_put_a_node_for_each_beneath_the_workflow():
+    """"With two branches named, a node for each beneath the workflow's, a `/` in a
+    branch's name written `:`" — titled by the branch as GitHub names it, holding the
+    line, and saying that a run names it. The workflow's node grades nothing of its
+    own and says its branches are complete where the repository answered whole."""
+    check = _check(actions_branches=("main", "release/1.2"))
+    fake = FakeClient(
+        [_repo("platform-a")],
+        runs=_runs([_wf_run(name="ci", branch="main", wf_id=1),
+                    _wf_run(name="ci", branch="release/1.2", conclusion="failure",
+                            wf_id=1, url="https://gh/run/2", run_number=2)], 2),
+        workflows=_named((1, "ci")))
+    result = run_aspect(check, "actions", fake, check._discover(fake))
+    workflow = _node(result, "platform-a", "ci.yml")
+    assert workflow.reason_entries == ()
+    assert workflow.children_complete is True
+    assert {child.name: (child.title, child.dynamic)
+            for child in workflow.children} == {
+        "main": ("", True), "release:1.2": ("release/1.2", True)}
+    line, = _node(workflow, "release:1.2").reason_entries
+    assert line.subject == f"{_repo_id('platform-a')}:1:release/1.2"
+    assert line.code is StatusCode.ERROR
+
+
+def test_every_branch_puts_a_node_for_each_beneath_the_workflow():
+    """`all_branches` counts as several: the branches come and go with GitHub's one
+    page, each a node beneath its workflow's."""
+    check = _check(actions_all_branches=True)
+    fake = FakeClient(
+        [_repo("platform-a")],
+        runs=_runs([_wf_run(name="ci", branch="main", wf_id=1),
+                    _wf_run(name="ci", branch="feature/x", wf_id=1,
+                            url="https://gh/run/2", run_number=2)], 2),
+        workflows=_named((1, "ci")))
+    result = run_aspect(check, "actions", fake, check._discover(fake))
+    assert sorted(child.name for child in
+                  _node(result, "platform-a", "ci.yml").children) == [
+        "feature:x", "main"]
+
+
+def test_one_named_branch_and_the_default_put_no_level_beneath_the_workflow():
+    """"And with one, none": the workflow's node stands for the workflow on that
+    branch, and says its children are complete — it has none, so a branch's node an
+    earlier configuration left beneath it goes (ADR-0016 §19, §22)."""
+    for check in (_check(), _check(actions_branches=("main",))):
+        fake = FakeClient([_repo("platform-a")],
+                          runs=_runs([_wf_run(name="ci", wf_id=1)], 1),
+                          workflows=_named((1, "ci")))
+        workflow = _node(run_aspect(check, "actions", fake, _repos("platform-a")),
+                         "platform-a", "ci.yml")
+        assert (workflow.children, workflow.children_complete) == ((), True)
+        line, = workflow.reason_entries
+        assert line.subject == f"{_repo_id('platform-a')}:1:main"
+
+
+def test_a_disabled_workflows_line_is_on_its_own_node_over_a_switch_off_and_back():
+    """"A disabled workflow's line is on the workflow's own node, read over a
+    switch-off and back": its node stays where it is, standing for the workflow on
+    its branch while it runs and for the workflow while it is off — and where the
+    configuration names several branches, its branch nodes go while it is off and
+    come back with its next run (ADR-0016 §20)."""
+    def poll(check, state):
+        fake = FakeClient([_repo("platform-a")],
+                          runs=_runs([_wf_run(name="ci", wf_id=1)], 1),
+                          workflows=_listed((1, "ci", state)))
+        return _node(run_aspect(check, "actions", fake, _repos("platform-a")),
+                     "platform-a", "ci.yml")
+
+    one = _check()
+    running, off, back = (poll(one, state) for state in
+                          ("active", "disabled_manually", "active"))
+    subject = f"{_repo_id('platform-a')}:1"
+    assert [line.subject for line in running.reason_entries] == [f"{subject}:main"]
+    assert [line.subject for line in off.reason_entries] == [subject]
+    assert [line.subject for line in back.reason_entries] == [f"{subject}:main"]
+    several = _check(actions_branches=("main", "release"))
+    running, off, back = (poll(several, state) for state in
+                          ("active", "disabled_manually", "active"))
+    assert [child.name for child in running.children] == ["main"]
+    assert (off.children, off.children_complete) == ((), True)
+    assert [line.subject for line in off.reason_entries] == [subject]
+    assert [child.name for child in back.children] == ["main"]
+
+
+def test_show_healthy_is_refused_at_load_saying_why():
+    """"A configuration that sets `actions.show_healthy` is refused at load, saying
+    why", whatever it sets it to: `false` asked for what every workflow now gets,
+    and is a key that would do nothing (ADR-0016 §21)."""
+    for value in (True, False):
+        with pytest.raises(CheckError) as caught:
+            GitHubCheck._extra_from_config(
+                {"path": "/github", "owner": "example-org", "kind": "organization",
+                 "secrets": {"token": "env://GITHUB_TOKEN"},
+                 "actions": {"show_healthy": value}},
+                tmp_path_stub())
+        said = str(caught.value)
+        assert "'actions.show_healthy' is retired" in said
+        assert "is a node of its own" in said
+        assert said.endswith("Remove the key")
+
+
+def test_what_is_about_many_repositories_stays_on_the_aspect():
+    """"The `actions` node holds `read`, `runs-window-partial` and
+    `branches-unmatched`, and a repository's node grades nothing unless it could
+    not be read, its two read lines then standing on it" — and a repository whose
+    answer was short or missing says nothing of its workflows being complete, so
+    they stay as they were (ADR-0016 §17, §22)."""
+    active = {"workflows": [{"id": 1, "name": "ci", "state": "active",
+                             "path": ".github/workflows/ci.yml"}]}
+    fake = FakeClient(
+        [_repo("platform-a"), _repo("platform-b"), _repo("platform-c")],
+        runs={"example-org/platform-a": {"workflow_runs": [_wf_run(wf_id=1)]},
+              "example-org/platform-b": _transient(),
+              "example-org/platform-c": {"workflow_runs": [_wf_run(wf_id=1)]}},
+        workflows={"example-org/platform-a": active,
+                   "example-org/platform-b": active,
+                   "example-org/platform-c": {**active, "total_count": 137}})
+    result = run_aspect(_check(), "actions", fake,
+                        _repos("platform-a", "platform-b", "platform-c"))
+    assert [line.slug for line in result.reason_entries] == [
+        "runs-window-partial", "read"]
+    assert result.children_complete is True
+    whole, unread, short = (_node(result, name) for name in
+                            ("platform-a", "platform-b", "platform-c"))
+    assert (whole.reason_entries, whole.children_complete) == ((), True)
+    assert whole.stored_code is StatusCode.OK
+    line, = unread.reason_entries
+    assert (line.slug, line.code) == (_slug("platform-b", "runs-unreadable"),
+                                      StatusCode.UNDEFINED)
+    assert (unread.children, unread.children_complete) == ((), False)
+    assert (short.reason_entries, short.children_complete) == ((), False)
+    assert [node.name for node in short.children] == ["ci.yml"]
+
+
+def test_a_repository_with_actions_off_or_no_run_has_no_node():
+    """"It stands only where it has a workflow's node or a read line of its own — a
+    repository with Actions off, or with no run on the watched branch, has none."
+    """
+    fake = FakeClient(
+        [_repo("platform-a"), _repo("platform-b")],
+        workflows={"example-org/platform-a": _answered("Not Found", 404),
+                   "example-org/platform-b": {"workflows": [
+                       {"id": 1, "name": "ci", "state": "active",
+                        "path": ".github/workflows/ci.yml"}]}})
+    result = run_aspect(_check(), "actions", fake,
+                        _repos("platform-a", "platform-b"))
+    assert result.children == ()
+    assert result.stored_code is StatusCode.OK
+
+
+def test_a_workflow_deleted_and_a_repository_archived_leave_their_nodes(monkeypatch):
+    """"A workflow deleted and a repository archived leave their nodes once a run
+    that no longer names them has said its children are complete, and a repository
+    that did not answer keeps its workflows' nodes" — through the library's own
+    engine and tree, over runs of the whole check (little-sister ADR-0109)."""
+    from little_sister.engine import Engine
+    from little_sister.tree import StatusTree
+
+    # the engine runs a check only once its secret resolves; the double never
+    # reads the token
+    monkeypatch.setenv("GITHUB_TOKEN", "a-token-the-double-ignores")
+
+    both = {"workflow_runs": [_wf_run(name="ci", wf_id=1),
+                              _wf_run(name="deploy", wf_id=2)]}
+    polls = iter((
+        FakeClient([_repo("platform-a"), _repo("platform-b")],
+                   runs={"example-org/platform-a": both,
+                         "example-org/platform-b": both}),
+        # `deploy` deleted in platform-a, and platform-b archived
+        FakeClient([_repo("platform-a"), _repo("platform-b", archived=True)],
+                   runs={"example-org/platform-a": {"workflow_runs": [
+                       _wf_run(name="ci", wf_id=1)]}}),
+        # platform-a does not answer: what it had stays
+        FakeClient([_repo("platform-a")],
+                   runs={"example-org/platform-a": _transient()},
+                   workflows={"example-org/platform-a": {"workflows": [
+                       {"id": 1, "name": "ci", "state": "active",
+                        "path": ".github/workflows/ci.yml"}]}}),
+    ))
+    check = _check(disabled_aspects=_NOT_ACTIONS)
+    check._make_client = (  # type: ignore[method-assign]
+        lambda token, deadline=None: next(polls))
+    tree = StatusTree()
+    engine = Engine([check], tree)
+    engine.run_once()
+    assert tree.snapshot("/github/actions/platform-a/deploy.yml") is not None
+    assert tree.snapshot("/github/actions/platform-b/ci.yml") is not None
+    engine.run_once()
+    assert tree.snapshot("/github/actions/platform-a/deploy.yml") is None
+    assert tree.snapshot("/github/actions/platform-a/ci.yml") is not None
+    assert tree.snapshot("/github/actions/platform-b") is None
+    engine.run_once()
+    assert tree.snapshot("/github/actions/platform-a/ci.yml") is not None
+
+
+def test_the_tree_reads_the_same_over_two_runs(monkeypatch):
+    """"Each in a whole aspect's read over two runs": what a run of the whole check
+    builds beneath `actions` — a repository's node grading nothing, its workflows'
+    nodes named by their files and titled by their names, each line on its
+    workflow's node, a disabled workflow's on its own, the coverage line on the
+    aspect and a repository that could not be read holding its read line — stands
+    the same on the next run, through the library's engine and tree."""
+    from little_sister.engine import Engine
+    from little_sister.tree import StatusTree
+
+    # the engine runs a check only once its secret resolves; the double never
+    # reads the token
+    monkeypatch.setenv("GITHUB_TOKEN", "a-token-the-double-ignores")
+
+    def a_poll():
+        listed = {"example-org/platform-a": {"workflows": [
+            {"id": 1, "name": "Build and test", "state": "active",
+             "path": ".github/workflows/ci.yml"},
+            {"id": 2, "name": "Deploy", "state": "active",
+             "path": ".github/workflows/deploy.yml"},
+            {"id": 3, "name": "Nightly", "state": "disabled_manually",
+             "path": ".github/workflows/nightly.yml"}]},
+            "example-org/platform-b": {"workflows": [
+                {"id": 4, "name": "ci", "state": "active",
+                 "path": ".github/workflows/ci.yml"}]}}
+        return FakeClient(
+            [_repo("platform-a"), _repo("platform-b")],
+            runs={"example-org/platform-a": {"workflow_runs": [
+                      _wf_run(name="Build and test", wf_id=1),
+                      _wf_run(name="Deploy", conclusion="failure", wf_id=2)]},
+                  "example-org/platform-b": _transient()},
+            workflows=listed)
+
+    check = _check(disabled_aspects=_NOT_ACTIONS)
+    check._make_client = (  # type: ignore[method-assign]
+        lambda token, deadline=None: a_poll())
+    tree = StatusTree()
+    engine = Engine([check], tree)
+
+    def shape():
+        def walk(node):
+            yield node.path, node.title, tuple(line.slug for line in node.reasons)
+            for child in node.children:
+                yield from walk(child)
+        return list(walk(tree.snapshot("/github/actions")))
+
+    engine.run_once()
+    first = shape()
+    engine.run_once()
+    assert shape() == first
+    nodes = {path: (title, slugs) for path, title, slugs in first}
+    a, b = "/github/actions/platform-a", "/github/actions/platform-b"
+    assert nodes["/github/actions"][1] == ("read",)
+    assert nodes[a][1] == ()
+    assert {path: title for path, (title, _) in nodes.items()
+            if path.startswith(a + "/")} == {
+        f"{a}/ci.yml": "Build and test", f"{a}/deploy.yml": "Deploy",
+        f"{a}/nightly.yml": "Nightly"}
+    assert all(len(nodes[f"{a}/{file}"][1]) == 1
+               for file in ("ci.yml", "deploy.yml", "nightly.yml"))
+    assert nodes[b][1] == (_slug("platform-b", "runs-unreadable"),)
+
+
+def test_a_completed_run_says_how_long_it_took_and_a_run_in_flight_does_not():
+    """"Each run block gains `duration_s`, the whole seconds from `run_started_at`
+    to `updated_at` once GitHub says the run is `completed`, and `null` while it is
+    not, where either time is missing, and where the second lies before the first."
+    """
+    def block(**over):
+        return GitHubCheck._run_record({
+            "status": "completed", "run_started_at": "2026-09-20T10:00:00Z",
+            "updated_at": "2026-09-20T10:07:30.900000+00:00", **over})["duration_s"]
+
+    assert block() == 450                        # seconds completed, not rounded
+    assert block(status="in_progress") is None
+    assert block(status="waiting") is None
+    assert block(updated_at="") is None
+    assert block(updated_at="2026-09-20T09:59:59Z") is None    # no span, not 0
+    assert block(updated_at="2026-09-20T10:00:00Z") == 0
+
+
+def test_the_type_declares_a_completed_runs_duration_as_a_measure():
+    """"The type declares `completed.duration_s` as a measure in `s` labeled
+    *Duration*, … and a deployment takes it away by that name in its `measures:`
+    block" (little-sister ADR-0092 decisions 1 and 2)."""
+    measure = _check().measures["completed.duration_s"]
+    assert (measure.unit, measure.label) == ("s", "Duration")
+    assert "completed.duration_s" not in _check(
+        measures={"completed.duration_s": None}).measures
 
 
 # --- run() -------------------------------------------------------------------
@@ -3114,7 +3681,6 @@ def test_config_loads_via_loader(tmp_path):
         "  ignore: [platform-b]\n"
         "actions:\n"
         "  all_branches: true\n"
-        "  show_healthy: true\n"
         "  ignore_workflow_name_patterns: ['nightly']\n"
         "issues:\n"
         "  ignore: [platform-a]\n"
@@ -3130,7 +3696,6 @@ def test_config_loads_via_loader(tmp_path):
     assert checks[0].secret_scanning_require_enabled is False
     assert checks[0].sbom_ignore == ("platform-b",)
     assert checks[0].actions_all_branches is True
-    assert checks[0].actions_show_healthy is True
     assert len(checks[0].actions_ignore_patterns) == 1
     # the config has always written the nested `issues:` block; the parser used to
     # read a top-level `issues_ignore`, so this list silently had no effect
@@ -3434,9 +3999,9 @@ def test_a_workflow_line_is_keyed_on_the_id_too():
         return run_aspect(check, "actions",
                           FakeClient([row], runs=runs), [Repo.from_api(row)])
 
-    assert leaf("platform-a").reason_entries[0].slug == "4242-workflow-5-main"
-    assert (leaf("platform-renamed").reason_entries[0].slug
-            == leaf("platform-a").reason_entries[0].slug)
+    assert _tree_lines(leaf("platform-a"))[0].slug == "4242-workflow-5-main"
+    assert (_tree_lines(leaf("platform-renamed"))[0].slug
+            == _tree_lines(leaf("platform-a"))[0].slug)
 
 
 def test_a_repository_row_without_an_id_is_a_read_failure():
@@ -3634,9 +4199,9 @@ def test_a_workflow_line_is_keyed_by_workflow_and_branch_not_by_the_run():
                           _repos("platform-a"))
 
     first, second = leaf("https://gh/run/100"), leaf("https://gh/run/200")
-    assert first.reason_entries[0].slug == _slug(
+    assert _tree_lines(first)[0].slug == _slug(
         "platform-a", "workflow", 5, "release-1.2")
-    assert second.reason_entries[0].slug == first.reason_entries[0].slug
+    assert _tree_lines(second)[0].slug == _tree_lines(first)[0].slug
 
 
 def test_scanning_switched_off_is_its_own_kind_of_entry():
@@ -5338,6 +5903,24 @@ def test_a_graphql_5xx_and_a_throttle_read_as_they_do_for_a_rest_read():
     assert waited == [3.0] and client.throttled_seconds == 3.0
 
 
+@pytest.mark.parametrize("failure", [
+    _http_error(502, b"{}"),
+    _http_error(403, b'{"message":"rate limit"}', {"retry-after": "3"}),
+], ids=["a 502", "a throttle"])
+def test_a_graphql_query_asked_once_is_one_request_and_waits_for_nothing(failure):
+    """`once` "makes it one request: not retried, and no wait taken for a
+    throttle": the 502 a query is otherwise asked again after, and the
+    `retry-after` it otherwise waits out, are each handed back as they came."""
+    slept = []
+    with _through(failure) as (build, opener):
+        client = build(sleep=slept.append)
+        with pytest.raises(GitHubError) as caught:
+            client.graphql("query { x }", once=True)
+    assert caught.value.fault is Fault.TRANSIENT
+    assert len(opener.requests) == 1
+    assert slept == [] and client.paused_seconds == 0.0
+
+
 def test_the_enterprise_graphql_endpoint_is_the_sibling_of_api_v3():
     """"for a GitHub Enterprise Server `api_url` ending in `/api/v3`, its sibling
     `/api/graphql`" — GitHub's own layout for a server, where the REST root is
@@ -5608,13 +6191,15 @@ def test_actions_says_which_of_its_two_reads_failed():
     workflows = run_aspect(check, "actions",
                            FakeClient([_repo("platform-a")],
                    workflows={"example-org/platform-a": _transient()}), repos)
-    assert "could not ask GitHub workflows" in workflows.reason_entries[0].text
+    assert "could not ask GitHub workflows" in _node(
+        workflows, "platform-a").reason_entries[0].text
     runs = run_aspect(check, "actions",
                       FakeClient([_repo("platform-a")],
                    workflows={"example-org/platform-a":
                               {"workflows": [{"id": 1, "state": "active"}]}},
                    runs={"example-org/platform-a": _transient()}), repos)
-    assert "could not ask GitHub (" in runs.reason_entries[0].text
+    assert "could not ask GitHub (" in _node(
+        runs, "platform-a").reason_entries[0].text
 
 
 def test_a_permission_error_alone_does_not_add_the_read_line():
@@ -5771,15 +6356,15 @@ def test_a_run_line_carries_its_reading_as_one_value():
     readings = measured(check)
     result = run_check(check, measurements=readings)
     actions = next(c for c in result.children if c.name == "actions")
-    line = next(e for e in actions.reason_entries if e.data)
+    line = next(e for e in _tree_lines(actions) if e.data)
     reading = next(r for r in readings if r.record["kind"] == "run")
     assert line.data == dict(reading.record)
     assert line.subject == reading.subject
 
 
-def test_a_healthy_idle_workflow_is_measured_though_it_writes_no_line():
-    """`show_healthy: false` is the grading's choice not to show it, and it does
-    not unmake what was read."""
+def test_a_healthy_idle_workflow_is_measured_and_its_line_written():
+    """What was read is a line: a passing idle workflow's reading is graded into a
+    line on its node like any other's (ADR-0016 §21)."""
     fake = FakeClient([_repo("platform-a")], runs={
         "example-org/platform-a": {"workflow_runs": [
             _wf_run(conclusion="success")]}})
@@ -5789,7 +6374,8 @@ def test_a_healthy_idle_workflow_is_measured_though_it_writes_no_line():
             if r.record["kind"] == "run"] == ["passed"]
     actions = next(c for c in run_check(check, measurements=readings).children
                    if c.name == "actions")
-    assert actions.reason_entries == ()
+    line, = _node(actions, "platform-a", "ci.yml").reason_entries
+    assert (line.code, line.data["verdict"]) == (StatusCode.OK, "passed")
 
 
 def test_a_subject_keeps_the_branch_verbatim_where_a_slug_narrows_it():
@@ -6378,81 +6964,160 @@ def test_a_time_that_is_not_an_instant_costs_its_field_and_not_the_run():
 
 # --- the heaviest record, under the library's warning line (ADR-0014 §4) -------
 
-def _graph_at_its_heaviest(*paths):
+def _graph_at_its_heaviest(*paths, standing=False):
     """A dependency-graph reading with every field at its longest — the longest
     owner and repository names GitHub allows, a ten-digit repository id, a manifest
     count at a GraphQL `Int`'s largest, manifests with neither flag set — and
-    ``paths`` as the manifests' file names, read through the aspect."""
+    ``paths`` as the manifests' file names, read through the aspect. ``standing``
+    asks for the reading of the run after, which GitHub does not answer: the same
+    graph, carrying the time it was read (ADR-0008, decision 7)."""
     owner, name = "o" * 39, "platform-".ljust(100, "r")
     full = f"{owner}/{name}"
     graph = {"totalCount": 2_147_483_647, "nodes": [
         {"filename": path, "parseable": False, "exceedsMaxSize": False}
         for path in paths]}
-    fake = FakeClient([{**_repo(name), "id": 9_999_999_999, "full_name": full}],
-                      graphs={full: graph})
     check = _check()
-    readings, _read = aspect_readings(check, "sbom_check", fake,
-                                      check._discover(fake))
+    for graphs in ({full: graph}, {full: _TIMED_OUT})[:2 if standing else 1]:
+        fake = FakeClient([{**_repo(name), "id": 9_999_999_999, "full_name": full}],
+                          graphs=graphs)
+        readings, _read = aspect_readings(check, "sbom_check", fake,
+                                          check._discover(fake))
     (reading,) = readings
     return reading
 
 
-def test_the_heaviest_reading_is_what_the_type_declares():
+def test_a_graph_on_its_last_answer_is_the_next_heaviest_reading():
     """A dependency graph with every field at its longest and ten manifest paths
-    at their clip — one whole at 68 characters, nine cut from the front — weighs
-    exactly what the type declares for startup to hold against `record_limit`
-    (ADR-0014 §4)."""
-    reading = _graph_at_its_heaviest(
-        "p" * 68, *(f"services/{n}/" + "x" * 90 + "/package-lock.json"
-                    for n in range(9)))
-    kept = [manifest["filename"] for manifest in reading.record["manifests"]]
+    at their clip — one whole at 68 characters, nine cut from the front — standing
+    for a repository GitHub did not answer for, and so carrying the time GitHub
+    answered with it, to the second, weighs 1635 bytes (ADR-0014 §4; ADR-0008,
+    decision 7) — less than the workflow run the type declares. On the run that
+    read it the same graph carries `null` for that time, and is eighteen bytes
+    lighter."""
+    paths = ("p" * 68, *(f"services/{n}/" + "x" * 90 + "/package-lock.json"
+                         for n in range(9)))
+    standing = _graph_at_its_heaviest(*paths, standing=True)
+    kept = [manifest["filename"] for manifest in standing.record["manifests"]]
     assert len(kept) == 10
     assert all(len(json.dumps(filename)) == 70 for filename in kept)
-    weight = len(json.dumps(reading.record).encode("utf-8"))
-    assert weight == _check().expected_record()
+    moment = datetime.fromisoformat(standing.record["at"])
+    assert moment.microsecond == 0 and moment.utcoffset().total_seconds() == 0
+    weight = len(json.dumps(standing.record).encode("utf-8"))
+    assert weight == 1635 < _check().expected_record()
+    read = _graph_at_its_heaviest(*paths)
+    assert read.record == {**standing.record, "at": None}
+    assert weight - len(json.dumps(read.record).encode("utf-8")) == 18
 
 
-def test_the_declared_record_stands_under_the_librarys_warning_line():
-    """Every start weighs each type's declared record against `record_limit` and
-    says so while one stands at the library's share of it or past (little-sister
-    ADR-0075 decision 5). At the default limit, this type's starts without it.
+def test_the_declared_record_stands_past_the_warning_line_and_inside_the_limit():
+    """"It stands past the share of the library's default `record_limit` at which
+    every start says a declared record is close", and inside the limit itself: a
+    start at the default says so and refuses nothing, and a deployment's
+    `record_limit` of 2217 puts the declaration under the line (ADR-0014 §4,
+    little-sister ADR-0075 decision 5).
 
     This leans, on purpose, on `little_sister.limits`, a module the library does
-    not promise to keep: the share is the library's number and nowhere else, and a
-    copy of it here would stay green the day the library moved the line. Imported
-    in here, so that if the module goes, this test goes red and the rest stand."""
-    from little_sister.limits import AMBER_SHARE, RECORD_LIMIT
+    not promise to keep: the share and what a start says are the library's and
+    nowhere else, and a copy of either here would stay green the day the library
+    moved the line. Imported in here, so that if the module goes, this test goes
+    red and the rest stand. The engine's floor for a declared record, the failure
+    record it writes itself, is far below this one, so none is passed."""
+    from little_sister.limits import AMBER_SHARE, RECORD_LIMIT, Limits, capacity
 
-    assert _check().expected_record() < AMBER_SHARE * RECORD_LIMIT
+    declared = _check().expected_record()
+    assert AMBER_SHARE * RECORD_LIMIT <= declared < RECORD_LIMIT
+
+    def start(record_limit):
+        return capacity([_check()], max_workers=8,
+                        limits=Limits(record_limit=record_limit), record_floor=0)
+
+    at_the_default = start(RECORD_LIMIT)
+    assert at_the_default.refusals() == ()
+    (said,) = [text for limit, text in at_the_default.warnings() if limit == "record"]
+    assert "1,773 bytes" in said
+    assert "record" in [limit for limit, _ in start(2216).warnings()]
+    assert "record" not in [limit for limit, _ in start(2217).warnings()]
 
 
-def test_a_run_reading_at_its_heaviest_stays_under_the_declaration():
-    """The reading the type declared before its branch was clipped — the longest
-    owner and repository names GitHub allows, a 255-byte branch and a workflow name
-    in emoji, ten-digit repository and workflow ids, eleven-digit run ids, a
-    two-digit attempt, a six-digit run number, `startup_failure`, both run blocks
-    filled — keeps 300 bytes of its branch and weighs less than the graph the type
-    declares now."""
+def test_the_heaviest_reading_is_a_run_and_is_what_the_type_declares():
+    """A workflow run line's reading with every field at its longest — the longest
+    owner and repository names GitHub allows, ten-digit repository and workflow
+    ids, the workflow's name and its file each past their 150-byte clip, a branch
+    of 255 `"`, which git allows and the seam's JSON writes in 512 bytes,
+    `waiting`, and two run blocks with eleven-digit run ids, a two-digit attempt, a
+    six-digit run number, `startup_failure` and `in_progress`, the completed one's
+    duration from the first instant an ISO date can hold to the last, and its
+    start the record's own time — weighs exactly what the type declares for
+    startup to hold against `record_limit`: 1773 bytes (ADR-0014 §4)."""
     owner, name = "o" * 39, "r" * 100
     repo = Repo(id=9_999_999_999, name=name, full_name=f"{owner}/{name}")
-    branch = "\U0001F600" * 63 + "é" + "b"
-    assert len(branch.encode("utf-8")) == 255
 
     def run(run_id, status, conclusion):
         return {"id": run_id, "run_attempt": 99, "run_number": 999_999,
                 "html_url": f"https://github.com/{owner}/{name}/actions/runs/"
                             f"{run_id}",
                 "status": status, "conclusion": conclusion,
-                "run_started_at": _STAMP, "updated_at": _STAMP}
+                "run_started_at": "0001-01-01T00:00:00Z",
+                "updated_at": "9999-12-31T23:59:59Z"}
 
     reading = GitHubCheck._action_reading(
-        repo, 9_999_999_999, "\U0001F600" * 100, branch,
+        repo, 9_999_999_999, "n" * 300,
+        mod_github._workflow_file(".github/workflows/" + "f" * 300, 9_999_999_999),
+        '"' * 255,
         run(99_999_999_999, "completed", "startup_failure"),
         run(99_999_999_998, "in_progress", None),
         (StatusCode.WARN, "waiting"))
-    assert len(json.dumps(reading.record["branch"])) <= 300
-    weight = len(json.dumps(reading.record).encode("utf-8"))
-    assert weight < _check().expected_record()
+    record = reading.record
+    assert [len(json.dumps(record[key])) for key in ("workflow", "file", "branch")] \
+        == [150, 150, 300]
+    assert record["completed"]["duration_s"] == 315_537_897_599
+    assert record["running"]["duration_s"] is None
+    weight = len(json.dumps(record).encode("utf-8"))
+    assert weight == _check().expected_record() == 1773
+
+
+def test_a_run_stands_in_its_series_at_its_start_and_a_switch_off_at_its_time():
+    """"A run's mark stands at its start, and a disabled workflow's at its
+    switch-off": the record's own time, `at`, is the start of the run its reading
+    names — the completed one's, which a run in flight rides on, or the run in
+    flight's while none has completed — and a disabled workflow's is when GitHub
+    switched it off, so the library places each in its series there and not where
+    the check first saw it; where GitHub sent no start, `at` is `null` and the
+    record stands where it was first seen (little-sister ADR-0087 decision 6;
+    ADR-0012 §3, ADR-0013 §5).
+
+    This leans, on purpose, on `little_sister.series`, a module the library does
+    not promise to keep: where a series places a record is the library's rule and
+    nowhere else's, and a copy of it here would stay green the day it moved."""
+    from little_sister.series import SeriesRecord
+
+    fake = FakeClient(
+        [_repo("platform-a")],
+        runs=_runs([
+            _wf_run(name="ci", wf_id=1, run_id=11, attempt=1,
+                    started="2025-09-18T11:27:30Z", updated="2025-09-18T11:28:30Z"),
+            _wf_run(name="ci", wf_id=1, run_id=12, attempt=1, run_number=2,
+                    status="in_progress", conclusion=None,
+                    started="2026-10-09T20:40:00Z"),
+            _wf_run(name="deploy", wf_id=3, run_id=13, attempt=1,
+                    status="in_progress", conclusion=None,
+                    started="2026-10-09T20:41:00Z"),
+            _wf_run(name="lint", wf_id=4, run_id=14, attempt=1)], 4),
+        workflows=_listed((1, "ci", "active"), (3, "deploy", "active"),
+                          (4, "lint", "active"),
+                          (2, "nightly", "disabled_manually",
+                           "2026-09-01T08:15:00Z")))
+    result = run_aspect(_check(), "actions", fake, _repos("platform-a"))
+    seen = datetime(2026, 10, 9, 20, 44, 2, tzinfo=UTC)
+    placed = {}
+    for file in ("ci.yml", "deploy.yml", "lint.yml", "nightly.yml"):
+        line, = _node(result, "platform-a", file).reason_entries
+        placed[file] = SeriesRecord(data=line.data, observed_at=seen).at
+    assert placed == {
+        "ci.yml": datetime(2025, 9, 18, 11, 27, 30, tzinfo=UTC),
+        "deploy.yml": datetime(2026, 10, 9, 20, 41, tzinfo=UTC),
+        "lint.yml": None,
+        "nightly.yml": datetime(2026, 9, 1, 8, 15, tzinfo=UTC)}
 
 
 #: A branch past the clip: 49 Cyrillic letters are 294 bytes of the seam's JSON
@@ -6482,7 +7147,7 @@ def test_a_branch_is_clipped_at_its_end_in_the_record_and_kept_whole_in_the_subj
     kept = runs[subject_of[_PAST_THE_CLIP]]["branch"]
     assert kept == "ж" * 49 + "-rel"
     assert len(json.dumps(kept)) == 300
-    texts = run_aspect(check, "actions", fake, _repos("platform-a")).reason_texts
+    texts = _tree_texts(run_aspect(check, "actions", fake, _repos("platform-a")))
     assert any(f"platform-a ({kept}) / ci" in text for text in texts)
     assert not any(_PAST_THE_CLIP in text for text in texts)
 
@@ -6510,10 +7175,14 @@ def test_a_line_on_a_clipped_branch_keeps_the_slug_its_whole_branch_gives():
     digests = [mod_github._workflow_subject(repo_id, 5, branch).split(":", 2)[2]
                for branch in (one, other)]
     assert all(digest.startswith("sha256:") for digest in digests)
-    lines = run_aspect(check, "actions", fake, _repos("platform-a")).reason_entries
-    assert sorted(line.slug for line in lines) == sorted(
+    result = run_aspect(check, "actions", fake, _repos("platform-a"))
+    assert sorted(line.slug for line in _tree_lines(result)) == sorted(
         slug(repo_id, "workflow", 5, branch)
         for branch in (_PAST_THE_CLIP, *digests))
+    # and each branch's node is named as its subject spells the branch, so the
+    # two alike up to the clip stand on two nodes (ADR-0016 §19)
+    assert sorted(node.name for node in _node(result, "platform-a", "ci.yml")
+                  .children) == sorted((_PAST_THE_CLIP, *digests))
 
 
 def test_a_default_branch_on_the_unmatched_line_is_clipped_like_any_branch():
@@ -6641,7 +7310,8 @@ class _RecordedGitHub:
         actions = f"/repos/{_HELD_REPO}/actions"
         if path == f"{actions}/workflows":
             listed = {"total_count": len(self.workflows),
-                      "workflows": [{"id": i, "name": n, "state": "active"}
+                      "workflows": [{"id": i, "name": n, "state": "active",
+                                     "path": f".github/workflows/{n}.yml"}
                                     for i, n in self.workflows]}
             return _Answer(200, json.dumps(listed).encode(), self.budget or {})
         if path.startswith(f"{actions}/workflows/") and path.endswith("/runs"):
@@ -6696,7 +7366,7 @@ def _held_line(result, branch="main", workflow_id=_HELD_WF):
     """The line about the watched workflow on ``branch``, or ``None``."""
     subject = mod_github._workflow_subject(_repo_id("platform-a"), workflow_id,
                                            branch)
-    lines = [line for line in result.reason_entries if line.subject == subject]
+    lines = [line for line in _tree_lines(result) if line.subject == subject]
     return lines[0] if lines else None
 
 
@@ -6712,8 +7382,9 @@ def _contradictions(caplog):
 
 
 def _holding(**over):
-    """A check that shows passing lines too, so a held pass is a line to read."""
-    return _check(actions_show_healthy=True, **over)
+    """The check these tests poll: a held pass is a line to read like any other
+    (ADR-0016 §21)."""
+    return _check(**over)
 
 
 def test_an_answer_out_of_order_is_sorted_by_run_id_and_is_no_contradiction(caplog):
@@ -7165,3 +7836,1031 @@ def test_a_reset_no_clock_can_write_costs_a_run_its_clock_time_and_nothing_else(
     clause = "resetting now" if reset < 0 else "resets in "
     assert [line for line in named
             if clause not in line or _CLOCK_TIME.search(line)] == []
+
+
+# --- sbom_check: a repository GitHub did not answer for keeps its last answer
+# (ADR-0008, decision 7) -----------------------------------------------------------
+
+#: When GitHub answered, on the wall clock the measuring half reads — and the same
+#: instant as the library writes it in this suite's zone and its default format.
+_ANSWERED = datetime(2026, 10, 10, 6, 0, 0, tzinfo=UTC)
+_AS_OF = "2026-10-10 11:45:00"
+_MINUTE = 60.0
+_HOUR = 3600.0
+
+#: The line of a repository with no dependency graph, as a run that read it writes it.
+_NO_GRAPH = ("[platform-a: no dependency graph (0 manifests)]"
+             "(https://github.com/example-org/platform-a/network/dependencies)")
+
+_A, _B, _C = (f"example-org/platform-{letter}" for letter in "abc")
+
+
+def _wall(moment=_ANSWERED):
+    """The wall clock, hand-wound and standing at ``moment``: what `time.time`
+    answers while a pass runs under it."""
+    return _Clock(moment.timestamp())
+
+
+def _sbom_pass(check, wall, graphs=None, *, repos=("platform-a", "platform-b"),
+               **fake):
+    """One pass of the aspect with the wall clock where ``wall`` stands, through a
+    client of its own — a run builds a fresh one, so nothing a pass remembers can be
+    the client's — and the grading of what it handed back, done after the clock is
+    let go. Answers ``(result, readings, read)``."""
+    client = FakeClient([_repo(name) for name in repos], graphs=graphs, **fake)
+    with mock.patch.object(mod_github.time, "time", wall):
+        discovered = check._discover(client)
+        readings, read = aspect_readings(check, "sbom_check", client, discovered)
+    return check._grade_sbom_check(readings, read, discovered), readings, read
+
+
+def _graph_estate(names, graphs, took=None):
+    """An answer for `_Opener` that serves whole runs of a check whose one aspect
+    is `sbom_check`: discovery of ``names`` through the team's list, the budget,
+    and each dependency-graph query out of ``graphs`` as `FakeClient` reads it — a
+    connection, an error type, `_TIMED_OUT`, an `HTTPError` the request ends in,
+    or a list of them, one per asking — looked up when the query arrives, so a
+    test changes what GitHub says between two runs. ``took`` is called with the
+    repository's short name and what was answered, as each query is; ``asked`` on
+    what is handed back is the short names in the order the queries came."""
+    bodies = {
+        "/users/example-org": {"type": "Organization"},
+        "/orgs/example-org/teams": [{"slug": "platform", "name": "platform"}],
+        "/orgs/example-org/teams/platform/repos": [_repo(name) for name in names],
+        "/rate_limit": {"resources": {"core": {
+            "limit": 5000, "remaining": 4900, "reset": _AHEAD}}},
+    }
+    asked = []
+
+    def answer(request, _timeout):
+        path = urllib.parse.urlsplit(request.full_url).path
+        if path != "/graphql":
+            return _Answer(body=json.dumps(bodies.get(path, [])).encode())
+        ((alias, owner, name),) = re.findall(
+            r'(\w+): repository\(owner: "([^"]+)", name: "([^"]+)"\)',
+            json.loads(request.data)["query"])
+        value = graphs.get(f"{owner}/{name}", _GRAPH_PRESENT)
+        if isinstance(value, list):
+            value = value.pop(0) if len(value) > 1 else value[0]
+        asked.append(name)
+        if took is not None:
+            took(name, value)
+        if isinstance(value, BaseException):
+            raise value
+        if value is _TIMED_OUT:
+            body = {"data": {alias: None},
+                    "errors": [{"message": "timedout", "path": [alias]}]}
+        elif isinstance(value, str):
+            body = {"data": {alias: None},
+                    "errors": [{"type": value, "path": [alias],
+                                "message": f"{value} for {owner}/{name}"}]}
+        else:
+            body = {"data": {alias: {"dependencyGraphManifests": value}}}
+        return _Answer(body=json.dumps(body).encode())
+
+    answer.asked = asked
+    return answer
+
+
+def _only_sbom(**over):
+    """A check whose one aspect is `sbom_check`."""
+    return _check(disabled_aspects=tuple(
+        aspect for aspect in GitHubCheck.ASPECTS if aspect != "sbom_check"), **over)
+
+
+def test_a_repository_with_no_graph_stands_red_on_the_run_github_did_not_answer():
+    """"A failed read forgot a finding": a repository without a dependency graph was
+    red on a run that read it and was not on a run GitHub did not answer for it. It
+    "is graded on that answer": "its line … is the line it had — the same slug, so a
+    pin holds, and the same code — ending *as of* that time", and "it counts as
+    read: no *could not ask* line, nothing in the coverage line"."""
+    check, wall = _check(), _wall()
+    first, _, _ = _sbom_pass(check, wall, {_A: _graph(0)})
+    (line,) = first.reason_entries
+    assert (line.slug, line.code) == (_slug("platform-a", "sbom"), StatusCode.ERROR)
+    assert line.text == _NO_GRAPH
+    assert first.stored_code is StatusCode.ERROR
+
+    wall.advance(7 * _MINUTE)
+    second, _, read = _sbom_pass(check, wall, {_A: _TIMED_OUT})
+    (stood,) = second.reason_entries
+    assert (stood.slug, stood.code) == (line.slug, StatusCode.ERROR)
+    assert stood.text == f"{_NO_GRAPH} — as of {_AS_OF}"
+    assert second.stored_code is StatusCode.ERROR
+    assert read == 2 and unreachable() == 0
+
+    # and on the run GitHub answers again, the line is the reading of that run
+    wall.advance(7 * _MINUTE)
+    third, _, _ = _sbom_pass(check, wall, {_A: _graph(0)})
+    assert third.reason_entries == first.reason_entries
+
+
+def test_a_repository_with_a_graph_keeps_its_silence_on_the_run_github_did_not_answer():
+    """The line a repository whose manifests parse has is none, and that is the
+    line it keeps: a run GitHub did not answer for it says nothing about it — no
+    *could not ask*, no coverage line — and the aspect stays green."""
+    check, wall = _check(), _wall()
+    first, _, _ = _sbom_pass(check, wall)
+    wall.advance(7 * _MINUTE)
+    second, _, read = _sbom_pass(check, wall, {_A: _TIMED_OUT})
+    assert not first.reason_entries and not second.reason_entries
+    assert second.stored_code is StatusCode.OK
+    assert read == 2 and unreachable() == 0
+
+
+@pytest.mark.parametrize("age, stands", [
+    (_HOUR - 1, True), (_HOUR, False), (_HOUR + 1, False)])
+def test_an_answer_stands_while_it_is_younger_than_an_hour(age, stands):
+    """"… is graded on that answer while it is younger than
+    `sbom_check.max_answer_age` …, an hour where a deployment does not say", and
+    "a repository whose last answer is that old or older … is *could not ask* as
+    decision 4 has it": a second short of the hour the red line stands; at the hour
+    and past it the repository has a line that grades nothing and the coverage line
+    counts it."""
+    check, wall = _check(), _wall()
+    _sbom_pass(check, wall, {_A: _graph(0)})
+    wall.advance(age)
+    result, _, read = _sbom_pass(check, wall, {_A: _TIMED_OUT})
+    codes = {entry.slug: entry.code for entry in result.reason_entries}
+    if stands:
+        assert codes == {_slug("platform-a", "sbom"): StatusCode.ERROR}
+        assert read == 2 and unreachable() == 0
+        return
+    assert codes == {_slug("platform-a", "unreadable"): StatusCode.UNDEFINED,
+                     "read": StatusCode.WARN}
+    note, gap = result.reason_entries
+    assert note.text == "platform-a: could not ask GitHub (error: timedout)"
+    assert gap.text == "GitHub did not answer for 1 of 2 repositories"
+    assert read == 1 and unreachable() == 1
+
+
+def test_a_deployment_says_how_long_an_answer_stands():
+    """`sbom_check.max_answer_age` is the deployment's: at half an hour, an answer
+    twenty-nine minutes old stands and one thirty minutes old does not."""
+    for age, lines in ((29 * _MINUTE, {_slug("platform-a", "sbom")}),
+                       (30 * _MINUTE, {_slug("platform-a", "unreadable"), "read"})):
+        check, wall = _check(sbom_max_answer_age=30 * _MINUTE), _wall()
+        _sbom_pass(check, wall, {_A: _graph(0)})
+        wall.advance(age)
+        result, _, _ = _sbom_pass(check, wall, {_A: _TIMED_OUT})
+        assert {entry.slug for entry in result.reason_entries} == lines
+
+
+def test_standing_does_not_renew_an_answer():
+    """"The time is the answer's own, so an hour after GitHub last answered for a
+    repository its line gives way, however often it stood in between": the line
+    stands at twenty and at forty minutes, saying the same time both times, and
+    gives way at sixty."""
+    check, wall = _check(), _wall()
+    _sbom_pass(check, wall, {_A: _graph(0)})
+    for _ in range(2):
+        wall.advance(20 * _MINUTE)
+        result, _, _ = _sbom_pass(check, wall, {_A: _TIMED_OUT})
+        (stood,) = result.reason_entries
+        assert stood.text == f"{_NO_GRAPH} — as of {_AS_OF}"
+    wall.advance(20 * _MINUTE)
+    result, _, _ = _sbom_pass(check, wall, {_A: _TIMED_OUT})
+    assert {entry.slug for entry in result.reason_entries} == {
+        _slug("platform-a", "unreadable"), "read"}
+
+
+def test_an_answer_that_arrives_is_the_last_answer_from_then_on():
+    """"Every dependency graph that arrives is the repository's last answer": a
+    repository that had no graph and has one now stands on the graph it has — no
+    line — and one that lost its graph stands on that, with the later time."""
+    check, wall = _check(), _wall()
+    _sbom_pass(check, wall, {_A: _graph(0), _B: _GRAPH_PRESENT})
+    wall.advance(7 * _MINUTE)
+    _sbom_pass(check, wall, {_A: _GRAPH_PRESENT, _B: _graph(0)})
+    wall.advance(7 * _MINUTE)
+    result, _, _ = _sbom_pass(check, wall, {_A: _TIMED_OUT, _B: _TIMED_OUT})
+    (stood,) = result.reason_entries
+    assert stood.slug == _slug("platform-b", "sbom")
+    assert stood.text == (
+        "[platform-b: no dependency graph (0 manifests)]"
+        "(https://github.com/example-org/platform-b/network/dependencies)"
+        " — as of 2026-10-10 11:52:00")
+
+
+#: The four ways a query fails as *could not ask*, each as the keywords a fake
+#: client is built with: GitHub's own time limit on the one alias (decision 4), a
+#: 5xx the client's own second attempt met again, a throttle, and a query answered
+#: with errors and no `data`.
+_COULD_NOT_ASK = {
+    "the alias error timedout": {"graph_answer": {
+        "data": {"r0": None},
+        "errors": [{"message": "timedout", "path": ["r0"]}]}},
+    "a 5xx": {"graph_error": GitHubError(
+        "HTTP 502 for https://api.github.com/graphql: Bad Gateway", status=502,
+        fault=Fault.TRANSIENT)},
+    "a throttle": {"graph_error": GitHubError(
+        "HTTP 403 for https://api.github.com/graphql — GitHub asked us to wait "
+        "60s: secondary rate limit", status=403, fault=Fault.TRANSIENT,
+        retry_after=60.0)},
+    "errors and no data": {"graph_answer": {"errors": [
+        {"type": "RATE_LIMITED", "message": "API rate limit exceeded"}]}},
+}
+
+
+@pytest.mark.parametrize("failure", list(_COULD_NOT_ASK))
+def test_every_kind_of_could_not_ask_stands_on_the_last_answer(failure):
+    """"A repository whose query fails as *could not ask* on a run — the cut
+    above, a 5xx, a throttle, a query answered with errors and no `data` — is
+    graded on that answer": whichever of them it is, both repositories stand on
+    what GitHub last said, the one without a graph red and the other silent."""
+    check, wall = _check(), _wall()
+    _sbom_pass(check, wall, {_A: _graph(0)})
+    wall.advance(7 * _MINUTE)
+    result, _, read = _sbom_pass(check, wall, **_COULD_NOT_ASK[failure])
+    (stood,) = result.reason_entries
+    assert (stood.slug, stood.code) == (_slug("platform-a", "sbom"),
+                                        StatusCode.ERROR)
+    assert stood.text == f"{_NO_GRAPH} — as of {_AS_OF}"
+    assert read == 2 and unreachable() == 0
+
+
+def test_the_coverage_line_counts_only_the_repositories_with_no_last_answer():
+    """"A repository … that has none, is *could not ask*": of three repositories
+    GitHub does not answer for on a run, the two it answered for before stand on
+    that — one red, one silent — and the one that came into the scope since has a
+    line that grades nothing and is the one the coverage line counts."""
+    check, wall = _check(), _wall()
+    _sbom_pass(check, wall, {_A: _graph(0)})
+    wall.advance(7 * _MINUTE)
+    names = ("platform-a", "platform-b", "platform-c")
+    result, _, read = _sbom_pass(
+        check, wall, {_A: _TIMED_OUT, _B: _TIMED_OUT, _C: _TIMED_OUT}, repos=names)
+    codes = {entry.slug: entry.code for entry in result.reason_entries}
+    assert codes == {_slug("platform-a", "sbom"): StatusCode.ERROR,
+                     _slug("platform-c", "unreadable"): StatusCode.UNDEFINED,
+                     "read": StatusCode.WARN}
+    gap = next(e for e in result.reason_entries if e.slug == "read")
+    assert gap.text == "GitHub did not answer for 1 of 3 repositories"
+    assert read == 2 and unreachable() == 1
+
+
+def test_a_reading_that_stands_is_the_held_graph_with_its_own_time():
+    """"Its reading is the held graph, with the time it was read as the record's
+    own, `at` — which is `null` on a reading of this run." The record is otherwise
+    the one the run that read it handed back, and the line carries it whole."""
+    check, wall = _check(), _wall()
+    _, read_then, _ = _sbom_pass(check, wall, {_A: _graph(1, _UNPARSEABLE)})
+    then = _reading_of(read_then, "dependency_graph", "platform-a")
+    assert then.record["at"] is None
+    assert _reading_of(read_then, "dependency_graph",
+                       "platform-b").record["at"] is None
+
+    wall.advance(7 * _MINUTE)
+    result, read_now, _ = _sbom_pass(check, wall, {_A: _TIMED_OUT})
+    now = _reading_of(read_now, "dependency_graph", "platform-a")
+    assert now.record == {**then.record, "at": "2026-10-10T06:00:00Z"}
+    assert now.subject == ""
+    assert _reading_of(read_now, "dependency_graph",
+                       "platform-b").record["at"] is None
+    assert not [r for r in read_now if r.record["kind"] == "unreadable"]
+    (stood,) = result.reason_entries
+    assert stood.data == dict(now.record)
+    assert stood.text == (
+        "[platform-a: 1 manifest, not parseable (package-lock.json exceeds the "
+        "size limit)]"
+        "(https://github.com/example-org/platform-a/network/dependencies)"
+        f" — as of {_AS_OF}")
+
+
+def test_the_time_of_an_answer_is_kept_to_the_second():
+    """"A held graph at its heaviest carries its time, to the second": the record
+    is weighed with a time of that length, so an answer that arrived three
+    quarters of a second past the second is kept at the second."""
+    check, wall = _check(), _wall()
+    wall.advance(0.75)
+    _sbom_pass(check, wall, {_A: _graph(0)})
+    wall.advance(7 * _MINUTE)
+    _, readings, _ = _sbom_pass(check, wall, {_A: _TIMED_OUT})
+    stood = _reading_of(readings, "dependency_graph", "platform-a")
+    assert stood.record["at"] == "2026-10-10T06:00:00Z"
+
+
+def test_the_library_writes_as_of_from_the_time_in_the_record(monkeypatch):
+    """"… ending *as of* that time, written by the library in the configured zone
+    and format": the grading hands `local_time` the record's time as an instant
+    and names no format of its own, and the line ends with what came back."""
+    check, wall = _check(), _wall()
+    _sbom_pass(check, wall, {_A: _graph(0)})
+    wall.advance(7 * _MINUTE)
+    client = FakeClient([_repo("platform-a")], graphs={_A: _TIMED_OUT})
+    with mock.patch.object(mod_github.time, "time", wall):
+        repos = check._discover(client)
+        readings, read = aspect_readings(check, "sbom_check", client, repos)
+    handed = []
+
+    def written(moment, fmt=None):
+        handed.append((moment, fmt))
+        return "WHEN THE LIBRARY SAYS"
+
+    monkeypatch.setattr(mod_github, "local_time", written)
+    (stood,) = check._grade_sbom_check(readings, read, repos).reason_entries
+    assert stood.text == f"{_NO_GRAPH} — as of WHEN THE LIBRARY SAYS"
+    assert handed == [(_ANSWERED, None)]
+
+
+def test_the_grading_of_a_standing_answer_reads_the_reading_and_nothing_else():
+    """"The grading stays pure: the measuring half reads the hold and the clock
+    and hands over a reading, and the grading writes *as of* from the time in the
+    record and reads nothing else." The readings of a run that stood on an answer,
+    graded by a check that never measured — nothing held, no client, a clock a day
+    on — say what they said."""
+    check, wall = _check(), _wall()
+    _sbom_pass(check, wall, {_A: _graph(0)})
+    wall.advance(7 * _MINUTE)
+    result, readings, read = _sbom_pass(check, wall, {_A: _TIMED_OUT})
+    other = _check()
+
+    def no_world(*_args, **_kw):
+        raise AssertionError("the grading asked the world")
+
+    other._make_client = no_world  # type: ignore[method-assign]
+    assert len(other._graphs) == 0
+    wall.advance(24 * _HOUR)
+    with mock.patch.object(mod_github.time, "time", wall):
+        again = other._grade_sbom_check(readings, read, _repos("platform-a",
+                                                               "platform-b"))
+    assert again == result
+    assert [entry.text for entry in again.reason_entries] == [
+        f"{_NO_GRAPH} — as of {_AS_OF}"]
+
+
+def test_a_graph_read_before_a_reading_carried_a_time_grades_as_it_did():
+    """A dependency graph's record written before it had `at` — one an instance
+    kept, graded again — has no time of its own, and its line is the line of a
+    graph read on its own run."""
+    (repo,) = _repos("platform-a")
+    old = Measurement(record={
+        "aspect": "sbom_check", "kind": "dependency_graph",
+        "repository": repo.full_name, "repository_id": repo.id,
+        "total": 0, "manifests": []})
+    (line,) = _check()._grade_sbom_check([old], 1, [repo]).reason_entries
+    assert (line.slug, line.code, line.text) == (
+        _slug("platform-a", "sbom"), StatusCode.ERROR, _NO_GRAPH)
+
+
+@pytest.mark.parametrize("answer, line", [
+    ("FORBIDDEN",
+     "could not read (FORBIDDEN: FORBIDDEN for example-org/platform-a)"),
+    ("INSUFFICIENT_SCOPES",
+     "could not read (INSUFFICIENT_SCOPES: INSUFFICIENT_SCOPES for "
+     "example-org/platform-a)"),
+    ("NOT_FOUND",
+     "not found — gone since discovery (NOT_FOUND for example-org/platform-a)"),
+    (GitHubError("HTTP 401 for the query: Bad credentials", status=401,
+                 fault=Fault.ANSWERED),
+     "could not read (HTTP 401 for the query: Bad credentials)"),
+], ids=["FORBIDDEN", "INSUFFICIENT_SCOPES", "NOT_FOUND", "a 401 for the query"])
+def test_an_answer_that_is_not_a_graph_lets_the_held_one_go(answer, line):
+    """"An answer that is not a graph — `NOT_FOUND`, `FORBIDDEN` or the scope error
+    on the repository's alias, a `401` or a `403` without a throttle for the query
+    itself — lets the held one go: the last answer is then that one, and it is on
+    its own line." So on the run after it, a repository GitHub does not answer for
+    has no last graph to stand on."""
+    check, wall = _check(), _wall()
+    _sbom_pass(check, wall, {_A: _graph(0)})
+    wall.advance(7 * _MINUTE)
+    said, _, _ = _sbom_pass(check, wall, {_A: answer})
+    (note,) = said.reason_entries
+    assert note.text == f"platform-a: {line}"
+    wall.advance(7 * _MINUTE)
+    result, _, _ = _sbom_pass(check, wall, {_A: _TIMED_OUT})
+    assert {entry.slug for entry in result.reason_entries} == {
+        _slug("platform-a", "unreadable"), "read"}
+
+
+def test_an_answer_this_check_cannot_read_leaves_the_held_one_where_it_was():
+    """"An answer this check cannot read leaves it where it was": the run that
+    cannot read the answer says so on the repository's line, amber, as it did —
+    it does not stand on the last answer — and the run after it, which GitHub does
+    not answer, stands on the graph read two runs before."""
+    check, wall = _check(), _wall()
+    _sbom_pass(check, wall, {_A: _graph(0)})
+    wall.advance(7 * _MINUTE)
+    unread, _, _ = _sbom_pass(check, wall, {_A: "SERVICE_UNAVAILABLE"})
+    (note,) = unread.reason_entries
+    assert (note.slug, note.code) == (_slug("platform-a", "unreadable"),
+                                      StatusCode.WARN)
+    assert note.text == ("platform-a: could not read (SERVICE_UNAVAILABLE: "
+                         "SERVICE_UNAVAILABLE for example-org/platform-a)")
+    wall.advance(7 * _MINUTE)
+    result, _, _ = _sbom_pass(check, wall, {_A: _TIMED_OUT})
+    (stood,) = result.reason_entries
+    assert stood.text == f"{_NO_GRAPH} — as of {_AS_OF}"
+
+
+@pytest.mark.parametrize("left_out", ["the scope", "the ignore list"])
+def test_a_repository_a_finished_pass_did_not_ask_is_forgotten(left_out):
+    """"A repository the aspect did not ask on a pass that finished — gone from
+    the scope, or named under `sbom_check.ignore` — is forgotten with that pass":
+    back in the scope, or asked again, on a run GitHub does not answer, it has no
+    last answer and is *could not ask*."""
+    check, wall = _check(), _wall()
+    _sbom_pass(check, wall, {_A: _graph(0)})
+    assert len(check._graphs) == 2
+    wall.advance(7 * _MINUTE)
+    if left_out == "the scope":
+        _sbom_pass(check, wall, repos=("platform-b",))
+    else:
+        check.sbom_ignore = ("platform-a",)
+        _sbom_pass(check, wall)
+        check.sbom_ignore = ()
+    assert len(check._graphs) == 1
+    wall.advance(7 * _MINUTE)
+    result, _, _ = _sbom_pass(check, wall, {_A: _TIMED_OUT})
+    assert {entry.slug for entry in result.reason_entries} == {
+        _slug("platform-a", "unreadable"), "read"}
+
+
+def test_the_last_answer_is_held_by_the_repositorys_id_and_follows_a_rename():
+    """The hold is "keyed by the repository's id", the one field a rename does not
+    move: a repository renamed between the run that read it and a run GitHub does
+    not answer stands on its last answer under its new name, on the slug it had."""
+    check, wall = _check(), _wall()
+    first, _, _ = _sbom_pass(check, wall, {_A: _graph(0)}, repos=("platform-a",))
+    (line,) = first.reason_entries
+    wall.advance(7 * _MINUTE)
+    renamed = {**_repo("platform-renamed"), "id": _repo_id("platform-a")}
+    client = FakeClient([renamed],
+                        graphs={"example-org/platform-renamed": _TIMED_OUT})
+    with mock.patch.object(mod_github.time, "time", wall):
+        repos = check._discover(client)
+        readings, read = aspect_readings(check, "sbom_check", client, repos)
+    (stood,) = check._grade_sbom_check(readings, read, repos).reason_entries
+    assert (stood.slug, stood.code) == (line.slug, StatusCode.ERROR)
+    assert stood.text == (
+        "[platform-renamed: no dependency graph (0 manifests)]"
+        "(https://github.com/example-org/platform-renamed/network/dependencies)"
+        f" — as of {_AS_OF}")
+    assert read == 1 and unreachable() == 0
+
+
+def test_the_aspects_own_text_says_what_as_of_means():
+    """The text shipped for the aspect "says what *as of* means where the line is
+    read", and names the key that says for how long."""
+    about = _about(_check(), "sbom_check")
+    assert ("A line ending *as of* a time is what GitHub last said: it did not "
+            "answer for that\nrepository on this run") in about
+    assert "`sbom_check.max_answer_age`" in about
+
+
+def test_an_answer_too_old_to_stand_is_forgotten_where_it_is_met():
+    """"… and an answer too old to stand is forgotten where it is met": the pass
+    that finds a repository's last answer an hour old lets it go, and holds the
+    other repository's, which it has just read."""
+    check, wall = _check(), _wall()
+    _sbom_pass(check, wall, {_A: _graph(0)})
+    assert len(check._graphs) == 2
+    wall.advance(_HOUR)
+    _sbom_pass(check, wall, {_A: _TIMED_OUT})
+    assert len(check._graphs) == 1
+
+
+def test_a_pass_the_deadline_cut_keeps_what_arrived():
+    """"Every dependency graph that arrives is the repository's last answer", at
+    once: a pass the deadline ends after one repository has answered and before
+    the other is asked hands back nothing — and what the one said is its last
+    answer from then on, while the other keeps the answer of the run before. On
+    the next run, cut for both, each stands on its own, with its own time."""
+    check, wall = _check(), _wall()
+    _sbom_pass(check, wall, {_B: _graph(0)})
+
+    class _CutOff(FakeClient):
+        def graphql(self, query, variables=None, **how):
+            if "platform-b" in query:
+                raise DeadlineExceeded("sbom_check")
+            return super().graphql(query, variables, **how)
+
+    wall.advance(7 * _MINUTE)
+    with mock.patch.object(mod_github.time, "time", wall):
+        client = _CutOff([_repo("platform-a"), _repo("platform-b")],
+                         graphs={_A: _graph(0)})
+        with pytest.raises(DeadlineExceeded):
+            check._read_sbom_check(client, check._discover(client))
+    wall.advance(7 * _MINUTE)
+    result, _, _ = _sbom_pass(check, wall, {_A: _TIMED_OUT, _B: _TIMED_OUT})
+    texts = {entry.slug: entry.text for entry in result.reason_entries}
+    assert texts == {
+        _slug("platform-a", "sbom"): f"{_NO_GRAPH} — as of 2026-10-10 11:52:00",
+        _slug("platform-b", "sbom"): (
+            "[platform-b: no dependency graph (0 manifests)]"
+            "(https://github.com/example-org/platform-b/network/dependencies)"
+            f" — as of {_AS_OF}")}
+
+
+def test_the_checks_own_node_counts_no_repository_that_stands_on_its_answer(
+        monkeypatch):
+    """"It counts as read: … nothing in the count on the check's own node." Two
+    whole runs of a check whose only aspect is this one: on the second GitHub does
+    not answer for either repository, and the node says what it said on the first
+    — its scope, and no read that could not be completed — over an aspect that is
+    as red as it was."""
+    monkeypatch.setenv("GITHUB_TOKEN", "x")
+    check = _check(disabled_aspects=tuple(
+        aspect for aspect in GitHubCheck.ASPECTS if aspect != "sbom_check"))
+    wall, repos = _wall(), [_repo("platform-a"), _repo("platform-b")]
+    results = []
+    for graphs in ({_A: _graph(0)}, {_A: _TIMED_OUT, _B: _TIMED_OUT}):
+        fake = FakeClient(repos, graphs=graphs)
+        check._make_client = (  # type: ignore[method-assign]
+            lambda token, deadline=None, fake=fake: fake)
+        with mock.patch.object(mod_github.time, "time", wall):
+            readings = measured(check)
+        results.append((run_check(check, measurements=readings), readings[0]))
+        wall.advance(7 * _MINUTE)
+    (first, _), (second, estate) = results
+    assert second.code is first.code is StatusCode.OK
+    assert second.reason_texts == first.reason_texts == ["2 repositories in scope"]
+    assert estate.record["unreachable"] == 0
+    assert estate.record["aspects"] == [{"name": "sbom_check", "read": 2}]
+    (aspect,) = second.children
+    assert aspect.stored_code is StatusCode.ERROR
+    assert [entry.text for entry in aspect.reason_entries] == [
+        f"{_NO_GRAPH} — as of {_AS_OF}"]
+
+
+def test_the_hold_is_the_checks_memory_and_empty_at_every_start(
+        tmp_path, monkeypatch):
+    """"The hold is the check's memory …: on the check, in this process, and empty
+    at every start — the first run after one has no last answer, and a repository
+    GitHub does not answer for on it is *could not ask*." A check started from its
+    configuration, as an instance starts one, through its own client: its second
+    run stands on what its first read; stopped and started again from the same
+    file, its first run has nothing to stand on."""
+    from little_sister.checks import load_checks
+    monkeypatch.setenv("GITHUB_TOKEN", "x")
+    (tmp_path / "checks").mkdir()
+    (tmp_path / "checks" / "github.yaml").write_text(
+        "type: github\npath: /github\ntimeout: 300s\n"
+        "secrets:\n  token: env://GITHUB_TOKEN\n"
+        "owner: example-org\nkind: organization\nteam: platform\n"
+        + "".join(f"{GitHubCheck.ASPECT_CONFIG_KEY[aspect]}:\n  enabled: false\n"
+                  for aspect in GitHubCheck.ASPECTS if aspect != "sbom_check"))
+    graphs = {}
+    opener = _Opener(_graph_estate(["platform-a", "platform-b"], graphs))
+
+    def run(check):
+        with mock.patch.object(ls_fetch, "_FOLLOWING", opener):
+            (aspect,) = run_check(check).children
+        return {entry.slug: entry.code for entry in aspect.reason_entries}
+
+    (started,) = load_checks(str(tmp_path))
+    graphs.update({_A: _graph(0)})
+    assert run(started) == {_slug("platform-a", "sbom"): StatusCode.ERROR}
+    graphs.update({_A: _TIMED_OUT})
+    assert run(started) == {_slug("platform-a", "sbom"): StatusCode.ERROR}
+
+    (restarted,) = load_checks(str(tmp_path))
+    assert run(restarted) == {
+        _slug("platform-a", "unreadable"): StatusCode.UNDEFINED,
+        "read": StatusCode.WARN}
+
+
+def test_a_pass_github_did_not_answer_everything_on_says_who_stands_on_what(
+        caplog):
+    """"A pass GitHub did not answer everything on writes a [line], with the
+    phrase *on the last answer*: each repository that stands on one and since
+    when, and how many had none to stand on" — at `INFO`, the times on the clock
+    of the log's own stamp, and no such line from a pass GitHub answered whole."""
+    caplog.set_level(logging.INFO, logger=_LOGGER)
+
+    def said():
+        lines = [record for record in caplog.records
+                 if "on the last answer" in record.getMessage()]
+        caplog.clear()
+        return lines
+
+    check, wall = _check(), _wall()
+    # GitHub answered for every repository — with a graph, a refusal, an answer
+    # this check cannot read: each of them is an answer, and there is no line
+    _sbom_pass(check, wall, {_A: _graph(0)})
+    _sbom_pass(_check(), wall, {_A: "FORBIDDEN", _B: "SERVICE_UNAVAILABLE"})
+    assert said() == []
+    wall.advance(7 * _MINUTE)
+    names = ("platform-a", "platform-b", "platform-c")
+    _sbom_pass(check, wall, {_A: _TIMED_OUT, _B: _TIMED_OUT, _C: _TIMED_OUT},
+               repos=names)
+    (line,) = said()
+    assert line.levelno == logging.INFO
+    assert line.getMessage() == (
+        "/github: sbom_check: GitHub did not answer for 3 repositories — 2 on the "
+        f"last answer (platform-a since {_AS_OF}, platform-b since {_AS_OF}), "
+        "1 with none")
+    # every repository GitHub did not answer for stands on its last answer
+    _sbom_pass(check, wall, {_A: _TIMED_OUT, _B: _TIMED_OUT})
+    (line,) = said()
+    assert line.getMessage() == (
+        "/github: sbom_check: GitHub did not answer for 2 repositories — 2 on the "
+        f"last answer (platform-a since {_AS_OF}, platform-b since {_AS_OF}), "
+        "0 with none")
+    # a check with nothing held, as after a start
+    _sbom_pass(_check(), wall, {_A: _TIMED_OUT})
+    (line,) = said()
+    assert line.getMessage() == (
+        "/github: sbom_check: GitHub did not answer for 1 repository — 0 on the "
+        "last answer, 1 with none")
+
+
+# --- sbom_check.max_answer_age, the key ------------------------------------------
+
+_MINIMAL = {"owner": "example-org", "kind": "organization",
+            "secrets": {"token": "env://GITHUB_TOKEN"}}
+
+
+def test_an_answer_stands_for_an_hour_where_a_deployment_does_not_say():
+    """"`sbom_check.max_answer_age`, a duration in the aspect's block, an hour
+    where a deployment does not say" — from a configuration that has no such
+    block, and from one whose block names only its other key."""
+    assert mod_github.DEFAULT_MAX_ANSWER_AGE == _HOUR
+    for config in (_MINIMAL, {**_MINIMAL, "sbom_check": {"ignore": ["x"]}}):
+        extra = GitHubCheck._extra_from_config(dict(config), tmp_path_stub())
+        assert extra["sbom_max_answer_age"] == _HOUR
+    assert _check().sbom_max_answer_age == _HOUR
+
+
+@pytest.mark.parametrize("written, seconds", [
+    ("90m", 5400.0), ("2h", 7200.0), ("45s", 45.0), (600, 600.0), ("1d", 86400.0)])
+def test_max_answer_age_is_a_duration_as_timeout_spells_one(written, seconds):
+    """The key takes a duration "in the same spelling `timeout:` and `frequency:`
+    take" — a unit, or a bare number of seconds."""
+    extra = GitHubCheck._extra_from_config(
+        {**_MINIMAL, "sbom_check": {"max_answer_age": written}}, tmp_path_stub())
+    assert extra["sbom_max_answer_age"] == seconds
+    assert GitHubCheck(path="/github", **extra).sbom_max_answer_age == seconds
+
+
+@pytest.mark.parametrize("written", [0, -60, "0s", "soon", True, False, [], {}])
+def test_a_max_answer_age_that_is_not_a_positive_duration_is_refused_by_name(
+        written):
+    """A value that is not a positive duration is refused at load, naming the key
+    as the deployment wrote it."""
+    with pytest.raises(CheckError) as caught:
+        GitHubCheck._extra_from_config(
+            {**_MINIMAL, "sbom_check": {"max_answer_age": written}},
+            tmp_path_stub())
+    assert "'sbom_check.max_answer_age' must be a positive duration" in str(
+        caught.value)
+
+
+def test_the_shipped_example_names_the_key_at_its_default():
+    """The example is the annotated shape — every key, with its default where it
+    has one — and it loads as written: the answer's age it names is the hour the
+    type defaults to."""
+    from pathlib import Path
+
+    import yaml
+
+    raw = Path(__file__).resolve().parents[1].joinpath(
+        "examples", "github.yaml").read_text()
+    written = yaml.safe_load(raw)
+    assert written["sbom_check"]["max_answer_age"] == "1h"
+    extra = GitHubCheck._extra_from_config(written, Path("."))
+    assert extra["sbom_max_answer_age"] == mod_github.DEFAULT_MAX_ANSWER_AGE
+
+
+# --- sbom_check: a repository cut once is asked once more (ADR-0008, decision 8) ---
+
+def _asked(client):
+    """The repositories a fake client was asked about, in the order of the
+    queries — each query names one."""
+    return [re.search(r'name: "([^"]+)"', query).group(1)
+            for query in client.graphql_queries]
+
+
+def _one_pass(check, graphs, repos=("platform-a", "platform-b", "platform-c")):
+    """One pass of the aspect through a fake client, and that client beside what
+    the pass graded to."""
+    client = FakeClient([_repo(name) for name in repos], graphs=graphs)
+    return _sbom(check, client), client
+
+
+def test_a_repository_cut_once_is_asked_once_more_at_the_end_of_the_aspect():
+    """"At the end of the aspect, when every repository has been asked, each one
+    whose query came back with the alias error of decision 4 is asked again — one
+    query each, in the order they were asked", and "what the second asking says is
+    the repository's reading for the run": the two that were cut answer the second
+    time, one without a graph and red, and nothing on the run says GitHub did not
+    answer."""
+    result, client = _one_pass(_check(), {
+        _A: [_TIMED_OUT, _graph(0)], _B: [_TIMED_OUT, _GRAPH_PRESENT], _C: _graph(0)})
+    assert _asked(client) == ["platform-a", "platform-b", "platform-c",
+                              "platform-a", "platform-b"]
+    assert all(query.count("repository(owner:") == 1
+               for query in client.graphql_queries)
+    # "a second asking is one request": the client is told so, and only then
+    assert client.graphql_once == [False, False, False, True, True]
+    # the lines stand in the roster's order, whichever asking each came from
+    first, last = result.reason_entries
+    assert [(line.slug, line.code) for line in (first, last)] == [
+        (_slug("platform-a", "sbom"), StatusCode.ERROR),
+        (_slug("platform-c", "sbom"), StatusCode.ERROR)]
+    assert first.text == _NO_GRAPH
+    assert first.data["at"] is None
+    assert unreachable() == 0
+
+
+def test_a_repository_cut_twice_is_not_asked_a_third_time():
+    """"Asked once more": a repository the second asking finds cut again has been
+    asked twice and is *could not ask*, counted in the coverage line."""
+    result, client = _one_pass(_check(), {_A: _TIMED_OUT})
+    assert _asked(client) == ["platform-a", "platform-b", "platform-c",
+                              "platform-a"]
+    codes = {entry.slug: entry.code for entry in result.reason_entries}
+    assert codes == {_slug("platform-a", "unreadable"): StatusCode.UNDEFINED,
+                     "read": StatusCode.WARN}
+    assert unreachable() == 1
+
+
+@pytest.mark.parametrize("failure", [
+    _transient(),
+    GitHubError("HTTP 403 for https://api.github.com/graphql — GitHub asked us "
+                "to wait 60s: secondary rate limit", status=403,
+                fault=Fault.TRANSIENT, retry_after=60.0),
+    "SERVICE_UNAVAILABLE", "FORBIDDEN", "NOT_FOUND", _graph(0),
+], ids=["a 5xx", "a throttle", "an unreadable error", "a refusal", "gone",
+        "a graph"])
+def test_only_the_cut_is_asked_again(failure):
+    """"Only that error is asked again. A 5xx or a connection failure has had its
+    second attempt, from the client; a throttle … is GitHub asking for less" — and
+    an answer, readable or not, is an answer: each of them is asked once."""
+    _result, client = _one_pass(_check(), {_A: failure})
+    assert _asked(client) == ["platform-a", "platform-b", "platform-c"]
+
+
+def test_a_query_answered_with_errors_and_no_data_is_not_asked_again():
+    """"… or errors about the query whole, is GitHub asking for less": every
+    repository is *could not ask*, and each was asked once."""
+    client = FakeClient([_repo("platform-a"), _repo("platform-b")], graph_answer={
+        "errors": [{"type": "RATE_LIMITED", "message": "API rate limit exceeded"}]})
+    result = _sbom(_check(), client)
+    assert _asked(client) == ["platform-a", "platform-b"]
+    assert unreachable() == 2
+    assert next(e for e in result.reason_entries if e.slug == "read").text == (
+        "GitHub did not answer for 2 of 2 repositories")
+
+
+#: The coverage line of a pass of three in which GitHub did not answer for one.
+_ONE_OF_THREE = (StatusCode.WARN, "GitHub did not answer for 1 of 3 repositories")
+
+
+@pytest.mark.parametrize("second, lines", [
+    (_graph(0), {"sbom": (StatusCode.ERROR, _NO_GRAPH)}),
+    (_GRAPH_PRESENT, {}),
+    ("NOT_FOUND", {"unreadable": (
+        StatusCode.UNDEFINED,
+        "platform-a: not found — gone since discovery "
+        "(NOT_FOUND for example-org/platform-a)")}),
+    ("FORBIDDEN", {"unreadable": (
+        StatusCode.WARN,
+        "platform-a: could not read "
+        "(FORBIDDEN: FORBIDDEN for example-org/platform-a)")}),
+    ("SERVICE_UNAVAILABLE", {"unreadable": (
+        StatusCode.WARN,
+        "platform-a: could not read (SERVICE_UNAVAILABLE: "
+        "SERVICE_UNAVAILABLE for example-org/platform-a)")}),
+    (_TIMED_OUT, {"read": _ONE_OF_THREE, "unreadable": (
+        StatusCode.UNDEFINED,
+        "platform-a: could not ask GitHub (error: timedout)")}),
+    (_transient(), {"read": _ONE_OF_THREE, "unreadable": (
+        StatusCode.UNDEFINED,
+        "platform-a: could not ask GitHub (502 Bad Gateway)")}),
+], ids=["no graph", "a graph", "gone", "a refusal", "an unreadable error",
+        "cut again", "a 5xx"])
+def test_what_the_second_asking_says_is_the_repositorys_reading(second, lines):
+    """"What the second asking says is the repository's reading for the run: a
+    graph, another of decision 4's answers, or *could not ask* again" — and the
+    first asking's cut leaves nothing behind where the second was answered: one
+    line for the repository at most, in the second answer's own words, and a
+    coverage line only where GitHub did not answer the second time either."""
+    result, client = _one_pass(_check(), {_A: [_TIMED_OUT, second]})
+    assert _asked(client) == ["platform-a", "platform-b", "platform-c",
+                              "platform-a"]
+    said = {entry.slug: (entry.code, entry.text)
+            for entry in result.reason_entries}
+    assert said == {(kind if kind == "read" else _slug("platform-a", kind)): line
+                    for kind, line in lines.items()}
+    assert unreachable() == (1 if "read" in lines else 0)
+
+
+def test_a_repository_still_cut_on_the_second_asking_stands_on_its_last_answer():
+    """"… or *could not ask* again, where decision 7 takes over": cut on both
+    askings of a run, the repository GitHub answered for on the run before stands
+    on that answer."""
+    check, wall = _check(), _wall()
+    _sbom_pass(check, wall, {_A: _graph(0)})
+    wall.advance(7 * _MINUTE)
+    result, _, read = _sbom_pass(check, wall, {_A: [_TIMED_OUT, _TIMED_OUT]})
+    (stood,) = result.reason_entries
+    assert stood.text == f"{_NO_GRAPH} — as of {_AS_OF}"
+    assert read == 2 and unreachable() == 0
+
+
+def test_a_graph_the_second_asking_brings_is_the_last_answer():
+    """"Every dependency graph that arrives is the repository's last answer, on
+    the first asking or the second": the graph a second asking brought is what the
+    repository stands on when the next run is cut on both, at the time it came."""
+    check, wall = _check(), _wall()
+    _sbom_pass(check, wall, {_A: [_TIMED_OUT, _graph(0)]})
+    wall.advance(7 * _MINUTE)
+    result, _, _ = _sbom_pass(check, wall, {_A: _TIMED_OUT})
+    (stood,) = result.reason_entries
+    assert stood.text == f"{_NO_GRAPH} — as of {_AS_OF}"
+
+
+#: A `403` with `retry-after`, as the client reads GitHub asking it to wait.
+_ASKED_TO_WAIT = GitHubError(
+    "HTTP 403 for the query — GitHub asked us to wait 60s: secondary rate limit",
+    status=403, fault=Fault.TRANSIENT, retry_after=60.0)
+
+
+def test_a_throttle_on_a_second_asking_is_the_last_asking_of_the_pass():
+    """A throttle is GitHub asking for less, "and so a second asking that GitHub
+    answers with a throttle is the last of the pass: the repositories behind it
+    are left unasked". Two were cut; the first is asked again and told to wait, so
+    the second is not asked, and both are *could not ask* — one on the throttle,
+    one on the cut."""
+    result, client = _one_pass(_check(), {
+        _A: [_TIMED_OUT, _ASKED_TO_WAIT], _B: [_TIMED_OUT, _graph(0)]})
+    assert _asked(client) == ["platform-a", "platform-b", "platform-c",
+                              "platform-a"]
+    texts = {entry.slug: entry.text for entry in result.reason_entries}
+    assert texts == {
+        _slug("platform-a", "unreadable"): (
+            "platform-a: could not ask GitHub (HTTP 403 for the query — GitHub "
+            "asked us to wait 60s: secondary rate limit)"),
+        _slug("platform-b", "unreadable"): (
+            "platform-b: could not ask GitHub (error: timedout)"),
+        "read": "GitHub did not answer for 2 of 3 repositories"}
+
+
+def test_a_failure_that_is_no_throttle_does_not_end_the_second_askings():
+    """Only a throttle is "GitHub asking for less": a second asking that ends in a
+    5xx, or is cut again, is *could not ask* for its repository, and the next
+    repository that was cut is asked all the same."""
+    for again in (_transient(), _TIMED_OUT):
+        result, client = _one_pass(_check(), {
+            _A: [_TIMED_OUT, again], _B: [_TIMED_OUT, _graph(0)]})
+        assert _asked(client) == ["platform-a", "platform-b", "platform-c",
+                                  "platform-a", "platform-b"]
+        assert {entry.slug for entry in result.reason_entries} == {
+            _slug("platform-a", "unreadable"), _slug("platform-b", "sbom"), "read"}
+
+
+def test_a_second_asking_is_one_request_and_no_wait(monkeypatch, caplog):
+    """"A second asking is one request: it is not retried, and no wait is taken
+    for it — so it costs at most a request's timeout." A whole run through the
+    check's own client: three repositories are cut; asked again, the first ends
+    in a 502, which a first asking would have had a second attempt after, and the
+    second in a throttle, which would have been waited out. Each is one request,
+    nothing is slept, and the third is left unasked behind the throttle."""
+    monkeypatch.setenv("GITHUB_TOKEN", "x")
+    caplog.set_level(logging.INFO, logger=_LOGGER)
+    check = _only_sbom()
+    slept = []
+    check._make_client = lambda token, deadline=None: GitHubClient(  # type: ignore[method-assign]
+        token, cache=check._conditional, timeout=check.request_timeout,
+        deadline=deadline, max_pause=check.max_pause_seconds, sleep=slept.append)
+    names = ["platform-a", "platform-b", "platform-c"]
+    estate = _graph_estate(names, {
+        _A: [_TIMED_OUT, _http_error(502, b"{}")],
+        _B: [_TIMED_OUT, _http_error(403, b'{"message":"secondary rate limit"}',
+                                     {"retry-after": "60"})],
+        _C: [_TIMED_OUT, _graph(0)]})
+    with mock.patch.object(ls_fetch, "_FOLLOWING", _Opener(estate)):
+        readings = measured(check)
+    assert estate.asked == [*names, "platform-a", "platform-b"]
+    assert slept == []
+    estate_reading = readings[0].record
+    assert (estate_reading["throttled_seconds"],
+            estate_reading["retried_seconds"]) == (0.0, 0.0)
+    assert estate_reading["unreachable"] == 3
+    (line,) = [line for line in _lines(caplog) if "asked once more" in line]
+    assert line == ("/github: sbom_check: GitHub's time limit cut 3 repositories — "
+                    "2 asked once more, 0 answered, 1 left unasked")
+
+
+class _EndsOnTheSecondAsking(FakeClient):
+    """A client whose second query about a repository ends the run: ``ending`` is
+    raised in place of the answer."""
+
+    def __init__(self, *args, ending, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._ending = ending
+
+    def graphql(self, query, variables=None, **how):
+        if query in self.graphql_queries:
+            raise self._ending
+        return super().graphql(query, variables, **how)
+
+
+@pytest.mark.parametrize("ending", [
+    DeadlineExceeded("sbom_check"), mod_github._PauseBudgetSpent(60.0)],
+    ids=["the deadline", "the pause budget"])
+def test_the_trace_has_its_line_whatever_ends_the_second_askings(ending, caplog):
+    """The guard keeps a second asking inside the run and it waits for nothing, so
+    neither the deadline nor the pause budget should end the aspect on one. If
+    either does all the same, it ends the aspect as on any read — it is not turned
+    into a line about the repository — and the trace's line "is written whatever
+    ends the asking"."""
+    caplog.set_level(logging.INFO, logger=_LOGGER)
+    check = _check()
+    client = _EndsOnTheSecondAsking(
+        [_repo("platform-a"), _repo("platform-b")], graphs={_A: _TIMED_OUT},
+        ending=ending)
+    with pytest.raises(type(ending)):
+        check._read_sbom_check(client, check._discover(client))
+    (line,) = [line for line in _lines(caplog) if "asked once more" in line]
+    assert line == ("/github: sbom_check: GitHub's time limit cut 1 repository — "
+                    "1 asked once more, 0 answered, 0 left unasked")
+
+
+@pytest.mark.parametrize("timeout, again", [
+    (36.0, []),
+    (37.0, ["platform-a"]),
+    (37.5, ["platform-a", "platform-b"]),
+])
+def test_the_second_asking_is_made_only_while_the_run_has_a_requests_timeout_left(
+        timeout, again, monkeypatch, caplog):
+    """A second asking "is made only while the run has more than one request's
+    timeout left". A whole run through the check's own client, on a clock on which
+    a cut takes ten seconds and an answer one: two repositories are cut and a
+    third answers, twenty-one seconds in, and a request may take fifteen. With
+    thirty-six seconds for the run fifteen are left, which is not
+    more than a request's timeout, and neither is asked again. With thirty-seven
+    the first is asked, answers a second later and leaves fifteen, so the second
+    is not. With half a second more, both are. The trace says how many of each."""
+    monkeypatch.setenv("GITHUB_TOKEN", "x")
+    caplog.set_level(logging.INFO, logger=_LOGGER)
+    clock = _Clock()
+    check = _only_sbom()
+    assert check.request_timeout == 15.0
+    check._new_deadline = lambda: Deadline(timeout, clock=clock)  # type: ignore[method-assign]
+    names = ["platform-a", "platform-b", "platform-c"]
+    estate = _graph_estate(
+        names, {_A: [_TIMED_OUT, _graph(0)], _B: [_TIMED_OUT, _graph(0)]},
+        took=lambda _name, value: clock.advance(
+            10.0 if value is _TIMED_OUT else 1.0))
+    with mock.patch.object(ls_fetch, "_FOLLOWING", _Opener(estate)):
+        (aspect,) = run_check(check).children
+    assert estate.asked == [*names, *again]
+    left = 2 - len(again)
+    assert {entry.slug for entry in aspect.reason_entries} == {
+        *(_slug(name, "sbom" if name in again else "unreadable")
+          for name in ("platform-a", "platform-b")),
+        *(["read"] if left else [])}
+    (line,) = [line for line in _lines(caplog) if "asked once more" in line]
+    assert line == (
+        "/github: sbom_check: GitHub's time limit cut 2 repositories — "
+        f"{len(again)} asked once more, {len(again)} answered, {left} left "
+        "unasked")
+
+
+def test_a_client_affords_a_request_while_more_than_its_timeout_is_left():
+    """What the aspect asks its client before a second asking: "whether the run
+    has more than `seconds` left — always, for a client that has no deadline"."""
+    clock = _Clock()
+    client = GitHubClient("t", deadline=Deadline(30.0, clock=clock))
+    assert client.affords(15.0)
+    clock.advance(15.0)
+    assert not client.affords(15.0)       # fifteen left is not more than fifteen
+    assert client.affords(14.5)
+    assert GitHubClient("t").affords(10.0**9)
+
+
+def test_the_trace_counts_how_often_the_second_asking_answered(caplog):
+    """"The trace counts it: a pass that met a cut writes one `INFO` line with the
+    fixed phrase *asked once more* — how many repositories were cut, how many were
+    asked again, how many of those GitHub answered — with a graph or with any
+    other answer of decision 4's — and how many were left unasked." Four cut, of
+    which the second asking brings one a graph, one a refusal and one an answer
+    this check cannot read — three answers — and leaves one cut; and a pass that
+    met no cut writes no such line."""
+    caplog.set_level(logging.INFO, logger=_LOGGER)
+    check = _check()
+    _one_pass(check, {_A: "FORBIDDEN"})
+    assert not [line for line in _lines(caplog) if "asked once more" in line]
+    _one_pass(check, {_A: [_TIMED_OUT, _graph(0)], _B: [_TIMED_OUT, "FORBIDDEN"],
+                      _C: _TIMED_OUT,
+                      "example-org/platform-d": [_TIMED_OUT, "SERVICE_UNAVAILABLE"]},
+              repos=("platform-a", "platform-b", "platform-c", "platform-d"))
+    (line,) = [record for record in caplog.records
+               if "asked once more" in record.getMessage()]
+    assert line.levelno == logging.INFO
+    assert line.getMessage() == (
+        "/github: sbom_check: GitHub's time limit cut 4 repositories — 4 asked "
+        "once more, 3 answered, 0 left unasked")
+
+
+def test_one_cut_repository_is_one_repository_in_the_trace(caplog):
+    """The line counts in words a reader can read: one repository is not *1
+    repositories*."""
+    caplog.set_level(logging.INFO, logger=_LOGGER)
+    _one_pass(_check(), {_B: _TIMED_OUT})
+    (line,) = [line for line in _lines(caplog) if "asked once more" in line]
+    assert line == (
+        "/github: sbom_check: GitHub's time limit cut 1 repository — 1 asked once "
+        "more, 0 answered, 0 left unasked")

@@ -169,13 +169,31 @@ secret_scanning:
 # Asks GitHub's GraphQL API whether each repository has dependency manifests
 # Dependabot can read — one GraphQL query per repository, one point of the `graphql`
 # budget each, in place of the REST export (ADR-0008). A repository named under
-# `ignore` is not asked.
+# `ignore` is not asked. One whose query GitHub's own time limit cut is asked once
+# more, with one request, before the aspect ends.
 sbom_check:
   ignore:                 # repositories exempt from the SBOM requirement
     - platform-docs
     - platform-templates
+  # **How long a repository's last answer stands for it** on the runs GitHub does
+  # not answer — its own time limit, a 5xx, a rate limit. For that long the
+  # repository keeps the line it had, with the same code, ending "as of" the time
+  # GitHub last answered for it; past it the line is "could not ask GitHub", and
+  # the aspect is amber on how many repositories GitHub did not answer for. A
+  # positive duration, spelled as `timeout:` is. Keep it longer than `frequency:`
+  # — by the next run an answer is about that old, and one too old does not
+  # stand, which leaves the aspect reading as it did without the key. The
+  # default is an hour whatever `frequency:` says, so a check that runs hourly
+  # or slower writes this key. What is held is the check's memory, so the first
+  # run after a start has no last answer.
+  max_answer_age: 1h      # the default
 
 # --- Aspect: workflow runs -----------------------------------------------------
+# Each repository with a workflow that has run here is a node beneath the aspect,
+# and each such workflow a node beneath it, named by its file (`ci.yml`) and titled
+# by its name; its line stands on it, a passing one's too, and it draws the
+# workflow's runs. With several branches named, or all of them, each branch is a
+# node beneath its workflow, `/` in its name written `:`.
 actions:
   # all_branches: false   # true watches every branch, not just the default one
   # **The branches to watch instead of the repository's default one.** Each watched
@@ -183,18 +201,17 @@ actions:
   # prices it that way; write your trunk in the list if you want it watched too, as
   # the names replace the default branch rather than adding to it. Setting this and
   # `all_branches` together is refused at startup: they ask different questions. Where
-  # none of these branches matched a repository at all, the leaf says so on one line
-  # and names the default branch it saw — usually a `main` against a `master`.
+  # none of these branches matched a repository at all, the aspect says so on one
+  # line and names the default branch it saw — usually a `main` against a `master`.
   # branches: [release, staging]
-  # show_healthy: false   # true also lists workflows that passed and are idle
   # **A switched-off workflow is a line, and its runs are not read** — the newest one
   # is frozen at whatever it was when somebody, or GitHub, switched the workflow off.
   # The line names the cause. `disabled_manually` is somebody's decision;
   # `disabled_inactivity` is GitHub's, after 60 days without activity **in a public
   # repository**; `disabled_fork` is GitHub's too and is the common one, because
-  # scheduled workflows are off by default on a fork — which is why it ships OK, and
-  # why an OK line here is hidden unless `show_healthy` is on. A state not named
-  # below is WARN.
+  # scheduled workflows are off by default on a fork — which is why it ships OK. The
+  # line stands on the workflow's own node while it is off. A state not named below
+  # is WARN.
   # disabled_severity_map:
   #   disabled_fork: warn       # …if you do want to hear about your forks
   ignore_workflow_name_patterns: []    # regexes, case-insensitive

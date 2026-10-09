@@ -113,6 +113,14 @@ RETRY_BACKOFF_SECONDS = 1.0
 #: library's 30-second default and far too loose at ten minutes.
 DEFAULT_MAX_PAUSE_FRACTION = 0.5
 
+#: How long a repository's last dependency graph stands for it on the runs GitHub
+#: does not answer, when a config does not say (`sbom_check.max_answer_age`), in
+#: seconds. An hour: whether a repository has a dependency graph changes rarely and
+#: is asked every few minutes, so an hour outlasts GitHub's ordinary bad stretches
+#: and still ends — a line nothing has confirmed for that long gives way to *could
+#: not ask* (ADR-0008, decision 7).
+DEFAULT_MAX_ANSWER_AGE = 3600.0
+
 
 class _PauseBudgetSpent(Exception):
     """A throttle wait this run cannot afford — raised instead of taking it.
@@ -406,6 +414,10 @@ can be checked for known issues. A repository listed here has none, or none of
 its manifests could be parsed, so Dependabot has nothing to check. Some repos
 are exempt — see `sbom_check.ignore` in this check's config.
 
+A line ending *as of* a time is what GitHub last said: it did not answer for that
+repository on this run, and its last answer stands for as long as this check's
+`sbom_check.max_answer_age` says — an hour where its config does not say.
+
 {pin_note}
 """,
     },
@@ -423,26 +435,43 @@ Repositories listed under `issues.ignore` are skipped.
     "actions": {
         "title": "Workflow runs",
         "about": """\
-The last completed GitHub Actions verdict per workflow (default branch unless
+The last completed GitHub Actions verdict of each workflow (default branch unless
 configured otherwise), with a newer in-flight run shown on the same line: a failed
-run → ERROR, a run awaiting approval → WARN. Workflows matching
+run → ERROR, a run awaiting approval → WARN, a run that passed → OK. Each repository
+with a workflow that has run here is a node, and each such workflow is a node beneath
+it, named by its file and titled by its name, which draws the workflow's runs. Where
+`actions.branches` names several branches, or `actions.all_branches` watches every
+branch, each branch is a node beneath its workflow. Workflows matching
 `actions.ignore_workflow_name_patterns` are skipped.
 
-Each workflow is asked about on its own, so a workflow with nothing here does not
-run on this branch — that is an answer rather than a gap (ADR-0005). `actions.branches`
+Each workflow is asked about on its own, so a workflow with no node does not run on
+this branch — that is an answer rather than a gap (ADR-0005). `actions.branches`
 replaces the default branch with the branches you name and asks each workflow about
 each of them, exactly as it asks about the default one (ADR-0009); where none of them
-matched a repository at all, one WARN line says so and names the default branch it saw.
-Cases that still read one shared page of runs and cannot be exact:
+matched a repository at all, one WARN line here says so and names the default branch
+it saw. Cases that still read one shared page of runs and cannot be exact:
 `actions.all_branches`, a repository with more workflows than one page of the workflow
 list, a budget too thin to pay for a read per workflow, and more than one named branch
-once the budget has made it fall back. One WARN line then names those repositories,
-because a workflow whose newest run falls outside a shared page has no state here and
-would otherwise be indistinguishable from a passing one.
+once the budget has made it fall back. One WARN line here then names those
+repositories, because a workflow whose newest run falls outside a shared page has no
+state and would otherwise be indistinguishable from one that does not run here.
 
-{pin_note}
+Each workflow's node can be put into maintenance on its own — pin the workflow you
+are working on and the rest keeps reporting.
 """,
     },
+}
+
+
+#: The measures this type declares for what its readings keep (little-sister
+#: ADR-0092 decisions 1 and 2): how long a completed run took, which a workflow's
+#: node draws each of its runs as a stem to (ADR-0012 §3, little-sister ADR-0111).
+#: Declared by the field's dotted name as the record list spells it — the run the
+#: reading is of is its `completed` block — so a deployment takes it away by that
+#: name, `completed.duration_s: null` in its `measures:` block, and its runs are
+#: ticks again.
+MEASURES: dict[str, dict[str, str]] = {
+    "completed.duration_s": {"unit": "s", "label": "Duration"},
 }
 
 
@@ -618,21 +647,35 @@ _MANIFEST_NAME_BYTES = 70
 #: name past 148 ASCII characters, or 12 emoji; a line's slug is keyed on ids, so
 #: no pin moves with it.
 _NAME_BYTES = 150
+#: A workflow's file, as its record keeps it and its node is named (ADR-0016 §18):
+#: the last segment of GitHub's `path` for it, beside the name in the same record
+#: and clipped at the same budget. Felt by a file name past 148 ASCII characters,
+#: which no repository the family reads has; where it is felt the node's name is
+#: the clipped one, the same on every run.
+_FILE_BYTES = 150
 
 #: What the heaviest record this type writes weighs, in the JSON the seam weighs
 #: it in — declared for startup to hold against `record_limit` (little-sister
 #: ADR-0075), so a deployment that set the limit lower is refused by name at
 #: startup rather than on some run's heaviest reading (ADR-0014 §4). It is a
-#: dependency graph's: the longest owner and repository names GitHub allows, a
-#: ten-digit repository id, a manifest count at a GraphQL `Int`'s largest, and ten
-#: manifests with neither flag set, each path at its 70 bytes; a workflow line with
-#: its branch at the clip comes next. A ceiling for every field GitHub bounds or
-#: this module clips, but one: a disabled workflow's link, which GitHub writes
-#: with the default branch and the workflow file's name in it and which nothing
-#: here shortens. The ids and counters are as long as GitHub's are today, and
-#: `test_the_heaviest_reading_is_what_the_type_declares` rebuilds the reading and
-#: holds this number to it.
-RECORD_BYTES = 1605
+#: workflow run line's: the longest owner and repository names GitHub allows,
+#: ten-digit repository and workflow ids, the workflow's name and its file each at
+#: their 150 bytes, a branch of 255 `"` at its 300, `waiting`, and two run blocks
+#: with eleven-digit run ids, a two-digit attempt, a six-digit run number,
+#: `startup_failure` and `in_progress`, the completed one's duration across every
+#: instant an ISO date can hold, and its start the record's own time. A dependency
+#: graph that stands on its last answer comes next, at 1635. **It stands past the
+#: share of the library's default `record_limit` at which every start says a
+#: declared record is close** — 87 % of 2048 — and on purpose: the start says so
+#: in the log and on the engine's report, never as a line (little-sister ADR-0075
+#: decision 5), and a deployment quiets it with a `record_limit` of 2217 or more,
+#: which is its own to set (little-sister ADR-0082). A ceiling for every field
+#: GitHub bounds or this module clips, but one: a disabled workflow's link, which
+#: GitHub writes with the default branch and the workflow file's name in it and
+#: which nothing here shortens. The ids and counters are as long as GitHub's are
+#: today, and `test_the_heaviest_reading_is_a_run_and_is_what_the_type_declares`
+#: rebuilds the reading and holds this number to it.
+RECORD_BYTES = 1773
 
 
 def _kept(text: str, budget: int = _TEXT_BYTES) -> str:
@@ -691,6 +734,46 @@ def _instant(text: str) -> str | None:
     except (ValueError, OverflowError):
         return None
     return text
+
+
+def _span(start: str | None, end: str | None) -> int | None:
+    """The whole seconds from ``start`` to ``end``, two instants as a record keeps
+    them (:func:`_instant`): the seconds that were completed, so a second that was
+    begun is not counted and less than one is ``0``. ``None`` where either is
+    missing, and where ``end`` lies before ``start`` — that is no span, and not one
+    of no length, which would draw a run that took no time (ADR-0012 §3;
+    little-sister-aws ADR-0008 §3 and §4)."""
+    if start is None or end is None:
+        return None
+    seconds = (datetime.fromisoformat(end)
+               - datetime.fromisoformat(start)).total_seconds()
+    return None if seconds < 0 else int(seconds)
+
+
+def _workflow_file(path: str, workflow_id: int) -> str:
+    """The name a workflow's node takes: the last segment of the ``path`` GitHub
+    gives the workflow — ``deploy.yml`` for ``.github/workflows/deploy.yml``, and
+    for a workflow GitHub runs itself, such as Dependabot's, the last segment of
+    its ``dynamic/…`` path (ADR-0016 §18).
+
+    It is unique within a repository, since workflow files sit directly in
+    ``.github/workflows``, it holds no ``/``, which a node's name may not, and it
+    is how GitHub addresses a workflow — in the workflow page's URL, and as the
+    API's ``workflow_id``. An edit to the workflow's ``name:`` moves nothing; a
+    renamed file is a new node. Where GitHub sent no path the workflow's id stands
+    in, which no rename moves either.
+    """
+    segment = path.rstrip("/").rpartition("/")[2].strip()
+    return _kept(segment, budget=_FILE_BYTES) if segment else str(workflow_id)
+
+
+def _branch_node(branch: str) -> str:
+    """The name of a branch's node beneath its workflow's, where the configuration
+    names several branches (ADR-0016 §19): the branch as the line's subject spells
+    it, with each ``/`` written ``:``. A node's name holds no ``/``, and git
+    refuses ``:`` in a branch's name, so no two branches meet in one name — and
+    ``:`` is the character the subject already joins its parts with."""
+    return branch.replace("/", ":")
 
 
 def _workflow_subject(repository_id: int, workflow_id: int,
@@ -911,19 +994,28 @@ class _Coverage:
     unreadable answer is a defect in this check or in the API and not something to
     wait out.
 
-    The `read` count is what keeps :meth:`lines` honest: it is the denominator of
-    the one line here that **grades**, the aspect's own coverage gap.
+    The `read` count is what keeps :meth:`lines` honest: with `missed` it is the
+    denominator of the one line here that **grades**, the aspect's own coverage
+    gap — every repository the aspect tried, each once (ADR-0002 §5).
     """
 
     #: Repositories whose payload actually arrived (a 404 counts: "not enabled" is
-    #: an answer). Only ever compared against `missed`, never displayed alone.
+    #: an answer, and so is `NOT_FOUND` about a repository that is gone). Only
+    #: ever added to `missed`, never displayed alone.
     read: int = 0
-    #: One line per repository that could not be read, coded by kind.
+    #: One line per repository the aspect has something to say about its read of:
+    #: one it could not read, coded by kind, and one that is gone.
     notes: list[Entry] = field(default_factory=list)
     #: How many of those were the *we could not ask* kind. The check's own node
     #: reports the run's total, which the estate reading carries; the graded kind
     #: is already amber where it happened.
     unreachable: int = 0
+    #: How many of the notes are of a repository that is gone. GitHub answered
+    #: about each, so it is in `read` already and is no part of `missed`.
+    gone: int = 0
+    #: The repository each note is about, in the notes' order — what puts an
+    #: `actions` note on that repository's own node (ADR-0016 §17).
+    about: list[Repo] = field(default_factory=list)
 
     @classmethod
     def of(cls, read: int, readings: Iterable[Measurement]) -> _Coverage:
@@ -950,6 +1042,7 @@ class _Coverage:
         """
         record = reading.record
         repo = _repo_of(record)
+        self.about.append(repo)
         name = plain(repo.name)
         part = record["part"]
         kind = f"{part}-unreadable" if part else "unreadable"
@@ -974,6 +1067,8 @@ class _Coverage:
         counted as read, because it *was* answered: it is not a coverage gap."""
         record = reading.record
         repo = _repo_of(record)
+        self.about.append(repo)
+        self.gone += 1
         self.notes.append(_carrying(Entry(
             _entry_slug(repo, "unreadable"),
             f"{plain(repo.name)}: not found — gone since discovery "
@@ -982,7 +1077,11 @@ class _Coverage:
 
     @property
     def missed(self) -> int:
-        return len(self.notes)
+        """Repositories the aspect tried and could not read: one for each note,
+        but for the notes of a repository that is gone — that one was answered
+        and is counted in `read`, so `read` and this add up to the repositories
+        tried, each once."""
+        return len(self.notes) - self.gone
 
     def lines(self) -> tuple[Entry, ...]:
         """The notes, and — whenever anything could not be asked about — one
@@ -999,16 +1098,50 @@ class _Coverage:
         The count is the **could-not-ask** kind only, and the sentence names the
         cause so it cannot be read as a total. A repository GitHub *refused* is
         already amber on its own line; counting it here would grade one condition
-        twice.
+        twice. The number it is counted against is every repository the aspect
+        tried: the ones it read, a repository that is gone among them, and the
+        ones it missed.
         """
+        return (*self.notes, *self.gap())
+
+    def gap(self) -> tuple[Entry, ...]:
+        """The one `WARN` line stating the gap, whenever anything could not be
+        asked about, and none otherwise: :meth:`lines` without the notes, for an
+        aspect whose notes stand on the repositories they concern (ADR-0016 §17)."""
         if not self.unreachable:
-            return tuple(self.notes)
+            return ()
         total = self.read + self.missed
-        return (*self.notes, Entry(
+        return (Entry(
             "read",
             f"GitHub did not answer for {self.unreachable} of "
             f"{total} repositories",
-            code=StatusCode.WARN))
+            code=StatusCode.WARN),)
+
+
+@dataclass
+class _WorkflowLines:
+    """What one workflow's node is built from, as the grading reads it out of the
+    readings (ADR-0016 §18–§20): the workflow's file, which names the node, its
+    name, which titles it, and its lines — the disabled one, or one for each branch
+    it has a reading on, each with the branch as the line's subject spells it and as
+    the record says it."""
+
+    file: str
+    title: str
+    disabled: Entry | None = None
+    runs: list[tuple[str, str, Entry]] = field(default_factory=list)
+
+
+def _by_concern(entries: Iterable[Entry]) -> list[Entry]:
+    """Lines in the order a reader acts on them: a failure or a wait first, then a
+    run in flight, then the rest, each kind in the order it was read. A workflow's
+    node holds more than one line only where the configuration watches one branch
+    and GitHub named no default branch, so the wide page was read unfiltered."""
+    def concern(entry: Entry) -> int:
+        if entry.code in (StatusCode.ERROR, StatusCode.WARN):
+            return 0
+        return 1 if entry.running else 2
+    return sorted(entries, key=concern)
 
 
 #: The disabled workflow states GitHub's own schema names today
@@ -1019,7 +1152,7 @@ class _Coverage:
 #: grades and nothing more — whether a workflow *is* disabled is the `disabled_`
 #: prefix (`_Workflow.disabled`), so a state added later is graded rather than
 #: missed. `deleted` is handled where it always was: such a workflow is dropped, and
-#: its last failure is not a fact about the repository today (ADR-0004 §9).
+#: its last failure is not a fact about the repository today (ADR-0016 §16).
 DISABLED_STATES = ("disabled_manually", "disabled_inactivity", "disabled_fork")
 
 #: What a disabled workflow grades, before a deployment's `severity_map` (ADR-0010).
@@ -1031,11 +1164,11 @@ DISABLED_STATES = ("disabled_manually", "disabled_inactivity", "disabled_fork")
 #: repository**, so on a private estate it is rare, and the line is worth its amber
 #: where it does appear. **`disabled_fork` is OK**: GitHub disables scheduled
 #: workflows on a fork by default, `include_forks` is true unless a deployment says
-#: otherwise (ADR-0003 §3), so grading it would put one standing amber on the leaf
+#: otherwise (ADR-0016 §3), so grading it would put one standing amber on the leaf
 #: per fork — a state nobody chose, on repositories nobody is going to act on.
 #:
 #: A state this map does not name grades WARN, as an undeclared severity does
-#: (ADR-0004 §6) — a state GitHub adds later is seen rather than silently green.
+#: (ADR-0016 §13) — a state GitHub adds later is seen rather than silently green.
 DEFAULT_ACTIONS_DISABLED_MAP: dict[str, StatusCode] = {
     "disabled_manually": StatusCode.WARN,
     "disabled_inactivity": StatusCode.WARN,
@@ -1228,6 +1361,94 @@ class _RunHold:
 
 
 @dataclass(frozen=True)
+class _Graph:
+    """One dependency graph as GitHub answered with it: what a reading keeps of it
+    — the count, and the manifests read, each path already cut to its end — and
+    when the answer arrived."""
+
+    total: int
+    manifests: tuple[dict[str, Any], ...]
+    at: datetime
+
+
+@dataclass(frozen=True)
+class _Gone:
+    """GitHub's `NOT_FOUND` about a repository, with what it said (ADR-0008,
+    decision 4)."""
+
+    message: str
+
+
+@dataclass(frozen=True)
+class _Unread:
+    """An asking that brought no graph and no `NOT_FOUND`: the failure, by its
+    fault — and whether it was GitHub's own time limit reaching this repository's
+    part of the query (ADR-0008, decision 4), the one failure that is asked once
+    more (decision 8)."""
+
+    error: GitHubError
+    timed_out: bool = False
+
+
+#: What one asking said about one repository's dependency graph.
+_GraphSaid = _Graph | _Gone | _Unread
+
+
+class _GraphHold:
+    """The last dependency graph GitHub answered with for each repository
+    `sbom_check` asks, and when — held on the **check**, so that a repository
+    GitHub does not answer for on a run is graded on it (ADR-0008, decision 7).
+
+    The third memory of its kind, beside the conditional cache (ADR-0011) and the
+    held runs (ADR-0015), and on the check for their reason: across runs, in this
+    process only, belonging to this check's one credential — and **empty at every
+    start**, so the first run after one has no last answer. Keyed by the
+    repository's id, the one field a rename does not move. It holds what a reading
+    keeps of a graph and nothing else of the answer, and only the measuring half
+    reads it: an answer that stands reaches the grading as a reading
+    (little-sister ADR-0086 decision 6).
+    """
+
+    def __init__(self) -> None:
+        self._held: dict[int, _Graph] = {}
+
+    def keep(self, repository_id: int, graph: _Graph) -> None:
+        """GitHub answered with this graph: it is the repository's last answer."""
+        self._held[repository_id] = graph
+
+    def release(self, repository_id: int) -> None:
+        """GitHub answered about the repository with something that is not a
+        graph: the held one is no longer its last answer."""
+        self._held.pop(repository_id, None)
+
+    def standing(self, repository_id: int, now: datetime,
+                 max_age: float) -> _Graph | None:
+        """The answer a repository GitHub did not answer for stands on at ``now``:
+        its last one, while that is **younger** than ``max_age`` seconds. One that
+        old or older is forgotten here, where it is met, and answers ``None`` as a
+        repository with no last answer does. The age is counted from the answer's
+        own time, which standing does not move."""
+        held = self._held.get(repository_id)
+        if held is None:
+            return None
+        if (now - held.at).total_seconds() < max_age:
+            return held
+        del self._held[repository_id]
+        return None
+
+    def keep_only(self, asked: Iterable[int]) -> None:
+        """A pass finished: forget every repository it did not ask — one gone from
+        the scope, or named under `sbom_check.ignore`."""
+        for repository_id in set(self._held) - set(asked):
+            del self._held[repository_id]
+
+    def __len__(self) -> int:
+        """How many repositories have a last answer held — a level, as the cache
+        and the run hold answer theirs."""
+        return len(self._held)
+
+
+@dataclass(frozen=True)
 class _RunsAnswer:
     """What one runs read answered, as the contradiction line reports it: GitHub's
     ``total_count`` (``None`` where it sent none), the rows it returned, and whether
@@ -1267,13 +1488,15 @@ class _Workflow:
     read it would pay for. ``updated`` is GitHub's ``updated_at`` for the workflow,
     as sent — when anything about it last changed — and the instant it names, as
     the record keeps it, is the event a disabled workflow's reading is of
-    (:func:`_disabled_names`).
+    (:func:`_disabled_names`). ``path`` is GitHub's ``path`` for it, whose last
+    segment names the workflow's node (:func:`_workflow_file`).
     """
 
     name: str
     state: str
     url: str
     updated: str
+    path: str = ""
 
     @property
     def disabled(self) -> bool:
@@ -1283,7 +1506,7 @@ class _Workflow:
         GitHub names every such state `disabled_…`, and the three in
         `DISABLED_STATES` are the ones the shipped map grades. Matching the prefix
         rather than that tuple is what makes a state GitHub adds later arrive as an
-        amber line naming it — an undeclared state grades WARN (ADR-0004 §6) — where
+        amber line naming it — an undeclared state grades WARN (ADR-0016 §13) — where
         an exact list would quietly treat it as active and spend a request reading
         the runs of a workflow that cannot run.
         """
@@ -1381,7 +1604,11 @@ class GitHubError(RemoteError):
     take by accident (little-sister ADR-0058).
 
     :class:`~little_sister.transport.Fault` says which of three things happened, and
-    it is set **by status and by header, never by message text** (ADR-0002):
+    it is set **by status and by header, never by message text** (ADR-0002) — with
+    the one exception a GraphQL answer forces: an error about one repository inside
+    a `200` has neither, so its `type` is read in their place, and the one error
+    that has no type either is known by its one-word message, compared whole
+    (ADR-0008, decision 4).
     `TRANSIENT` means *we could not ask* — a 5xx, a transport failure, or GitHub
     throttling us; `ANSWERED` means GitHub answered and the answer was no —
     ``404`` that the thing is absent, ``401``/``403`` that this token may not see it;
@@ -1773,6 +2000,14 @@ class GitHubClient:
         and what the run's receipt states; the node states the two apart."""
         return self.throttled_seconds + self.retried_seconds
 
+    def affords(self, seconds: float) -> bool:
+        """Whether the run has **more than** ``seconds`` left — always, for a
+        client that has no deadline. What a reader asks before a request it may
+        choose not to make: `sbom_check`'s second asking of a repository GitHub's
+        own time limit reached is one request, and is made only while the run has
+        more than a request's timeout left (ADR-0008, decision 8)."""
+        return self._deadline is None or self._deadline.remaining() > seconds
+
     def _now(self) -> float:
         """The clock this run measures with.
 
@@ -1952,12 +2187,15 @@ class GitHubClient:
             url = f"{url}?{urllib.parse.urlencode(params)}"
         return self._ask(url)
 
-    def _ask(self, url: str, *, method: str = "GET",
-             body: bytes | None = None) -> tuple[Any, str]:
+    def _ask(self, url: str, *, method: str = "GET", body: bytes | None = None,
+             once: bool = False) -> tuple[Any, str]:
         """`ask`, with this client's policy — the one place the retry, the
-        deadline and the counted sleep are wired, for both dialects."""
+        deadline and the counted sleep are wired, for both dialects. ``once`` asks
+        a single time: no second attempt and no wait, whatever the failure, so
+        the request costs what one request costs and the failure is the caller's
+        to read."""
         return ask(lambda: self._attempt(url, method=method, body=body),
-                   deadline=self._deadline, retries=self._retries,
+                   deadline=self._deadline, retries=0 if once else self._retries,
                    backoff=self._backoff, sleep=self._slept)
 
     def _graphql_url(self) -> str:
@@ -1967,7 +2205,8 @@ class GitHubClient:
             return f"{self._api[:-len('/v3')]}/graphql"
         return f"{self._api}/graphql"
 
-    def graphql(self, query: str, variables: dict[str, Any] | None = None) -> Any:
+    def graphql(self, query: str, variables: dict[str, Any] | None = None, *,
+                once: bool = False) -> Any:
         """One GraphQL query, answered as the JSON body GitHub sent — `data` and
         `errors` both, because a `200` carries either or both and the caller
         reads them the way ADR-0002 reads a status (ADR-0008, decision 4).
@@ -1976,10 +2215,16 @@ class GitHubClient:
         the deadline, the retry, the throttle reading and the ledger's feed are
         the client's and not the dialect's, which is why this is a method here and
         not a second client (ADR-0008, decision 3; ADR-0001's own argument).
+
+        ``once`` makes it **one request**: not retried, and no wait taken for a
+        throttle. A query that is itself a second asking is made that way
+        (ADR-0008, decision 8), so that it cannot cost more than the one request
+        its caller found the run could afford.
         """
         payload = json.dumps({"query": query,
                               "variables": variables or {}}).encode("utf-8")
-        data, _ = self._ask(self._graphql_url(), method="POST", body=payload)
+        data, _ = self._ask(self._graphql_url(), method="POST", body=payload,
+                            once=once)
         return data
 
     def _slept(self, wait: float) -> None:
@@ -2136,6 +2381,14 @@ class GitHubCheck(Check):
     #: decision 5): a point a repository, some eighty an hour on a budget of
     #: five thousand for a scope of nineteen.
     _GRAPH_QUERY_POINTS: ClassVar[int] = 1
+    #: The message of the alias error GitHub answers with where it did not
+    #: answer in time for one repository's part of the query: a `200` with an
+    #: error carrying this message, **no `type`**, and a `path` that begins with
+    #: the alias (ADR-0008, decision 4). It is the one error this check knows by
+    #: its message, because it carries nothing else to know it by, and it is
+    #: matched whole and only where there is no type: the word stands in for the
+    #: code GitHub did not send, and is not searched for in prose.
+    _GRAPH_TIMED_OUT: ClassVar[str] = "timedout"
 
     def __init__(self, *, owner: str, kind: str = "organization",
                  advanced_security_on_private: bool = True,
@@ -2153,11 +2406,11 @@ class GitHubCheck(Check):
                  code_scanning_quality_map: dict[str, StatusCode] | None = None,
                  secret_scanning_require_enabled: bool = True,
                  sbom_ignore: tuple[str, ...] = (),
+                 sbom_max_answer_age: float = DEFAULT_MAX_ANSWER_AGE,
                  actions_ignore_patterns: tuple[re.Pattern[str], ...] = (),
                  actions_all_branches: bool = False,
                  actions_branches: tuple[str, ...] = (),
                  actions_disabled_map: dict[str, StatusCode] | None = None,
-                 actions_show_healthy: bool = False,
                  issues_ignore: tuple[str, ...] = (),
                  disabled_aspects: tuple[str, ...] = (),
                  token_ref: str, **kwargs: Any) -> None:
@@ -2179,6 +2432,10 @@ class GitHubCheck(Check):
                         **(actions_disabled_map or {})}
         super().__init__(
             subnode_defaults=SUBNODES,
+            # What a field of a record means, and in which unit, is this type's
+            # knowledge; whether it is drawn is the deployment's (little-sister
+            # ADR-0092 decision 1).
+            measure_defaults=MEASURES,
             label_tokens=_subnode_tokens(
                 owner=owner, team=team, is_org=kind == "organization",
                 advisory_severity_map=advisories,
@@ -2245,6 +2502,9 @@ class GitHubCheck(Check):
         self.code_scanning_quality_map = scanning_quality
         self.secret_scanning_require_enabled = secret_scanning_require_enabled
         self.sbom_ignore = sbom_ignore
+        #: How long a repository's last dependency graph stands for it on the runs
+        #: GitHub does not answer, in seconds (ADR-0008, decision 7).
+        self.sbom_max_answer_age = sbom_max_answer_age
         self.actions_ignore_patterns = actions_ignore_patterns
         self.actions_all_branches = actions_all_branches
         #: The branches `actions` asks about by name, in the order the config gave
@@ -2266,7 +2526,6 @@ class GitHubCheck(Check):
                 "watches every branch and reports where that answer is short, "
                 "'branches' asks exactly the branches you name and is exact. "
                 "Keep one of them")
-        self.actions_show_healthy = actions_show_healthy
         self.issues_ignore = issues_ignore
         # Aspects this check does **not** run, by name. Stored as what is switched
         # off rather than what is on, so an aspect a later release adds is on by
@@ -2312,6 +2571,12 @@ class GitHubCheck(Check):
         #: same kind of memory as the cache beside it, and for the same reason on the
         #: check: a hold on the client would be empty every run.
         self._hold = _RunHold()
+        #: The last dependency graph GitHub answered with for each repository
+        #: `sbom_check` asks, and when (ADR-0008, decision 7) — the same kind of
+        #: memory again, and on the check for the same reason. Read by the
+        #: measuring half alone: a graph that stands for a repository GitHub did
+        #: not answer for is handed to the grading as that repository's reading.
+        self._graphs = _GraphHold()
         #: What the pre-run guard priced this run at, for the report line that puts
         #: it beside what the run actually spent. The guard is **not** changed to
         #: account for conditional requests in this slice: it would be tuned
@@ -2399,7 +2664,29 @@ class GitHubCheck(Check):
         sbom_ignore = sbom.get("ignore") or []
         if not isinstance(sbom_ignore, list):
             raise CheckError("sbom_check.ignore must be a list")
+        # How long a repository's last answer stands for it while GitHub does not
+        # answer (ADR-0008, decision 7): a duration in the spelling `timeout:`
+        # takes, and positive — at zero no answer would ever be young enough,
+        # which is a hold that is configured and does nothing.
+        sbom_max_answer_age = _positive_seconds(
+            sbom.get("max_answer_age"), "sbom_check.max_answer_age",
+            int(DEFAULT_MAX_ANSWER_AGE))
         actions = _block(config, "actions")
+        if "show_healthy" in actions:
+            # **Retired, and refused rather than ignored** (`architecture.md`
+            # §3.6). Every workflow with a run on a watched branch is a node now,
+            # and its line is what makes the node stand for the workflow and draw
+            # its runs (ADR-0016 §21): a line left out for being green would leave
+            # the node standing for nothing. Read as a key, whatever its value —
+            # `false` asked for what every workflow now gets, and is a key that
+            # does nothing.
+            raise CheckError(
+                "github 'actions.show_healthy' is retired: every workflow with a "
+                "run on a watched branch is a node of its own now, and its line "
+                "stands on it whatever it says — a passing idle workflow's too, "
+                "because the line is what makes the node draw the workflow's runs. "
+                "Which quiet nodes a viewer sees is the dashboard's: its 'hide ok' "
+                "and its chips. Remove the key")
         patterns = actions.get("ignore_workflow_name_patterns") or []
         if not isinstance(patterns, list):
             raise CheckError(
@@ -2528,11 +2815,11 @@ class GitHubCheck(Check):
             "secret_scanning_require_enabled": bool(
                 secret_scanning.get("require_enabled", True)),
             "sbom_ignore": tuple(str(r) for r in sbom_ignore),
+            "sbom_max_answer_age": sbom_max_answer_age,
             "actions_ignore_patterns": action_patterns,
             "actions_all_branches": bool(actions.get("all_branches", False)),
             "actions_branches": tuple(named_branches),
             "actions_disabled_map": actions_disabled_map,
-            "actions_show_healthy": bool(actions.get("show_healthy", False)),
             "issues_ignore": tuple(str(r) for r in issues_ignore),
             "disabled_aspects": disabled,
             # `secrets: {token: …}` — required, so two checks of this type can
@@ -2549,7 +2836,6 @@ class GitHubCheck(Check):
             "include archived": "yes" if self.include_archived else "no",
             "expected repositories": str(self.expect_min_repos),
             "pause budget": f"{self.max_pause_seconds:.0f}s",
-            "show healthy Actions": "yes" if self.actions_show_healthy else "no",
             # Only when the default-branch mode was replaced: the branches a check
             # asks about are what decides whether an empty Actions leaf is an
             # estate with nothing to say or a list that matches no repository, and
@@ -2566,9 +2852,9 @@ class GitHubCheck(Check):
         })
 
     def expected_record(self) -> int:
-        """The heaviest record this type writes, :data:`RECORD_BYTES` — a
-        dependency graph's, whatever this check's configuration: everything that
-        could make it heavier comes from GitHub or is clipped here (ADR-0014 §4)."""
+        """The heaviest record this type writes, :data:`RECORD_BYTES` — a workflow
+        run line's, whatever this check's configuration: everything that could
+        make it heavier comes from GitHub or is clipped here (ADR-0014 §4)."""
         return RECORD_BYTES
 
     def active_aspects(self) -> tuple[str, ...]:
@@ -3216,7 +3502,7 @@ class GitHubCheck(Check):
         an empty SBOM did. Manifests that exist but none of them parseable grade
         **ERROR** too, and the line names the cause — Dependabot cannot alert from
         a manifest it could not parse, which is why this aspect is red at all
-        (ADR-0004 §4). More manifests than were read is a graph with content,
+        (ADR-0016 §11). More manifests than were read is a graph with content,
         whatever the first ten say. At most one line per repository, so the
         repository and the aspect are the whole identity: the slug `sbom` a pin
         was held against before this record holds (decision 6).
@@ -3244,13 +3530,25 @@ class GitHubCheck(Check):
                      _link(f"{name}: {count} ({causes})", network),
                      code=StatusCode.ERROR)
 
+    @staticmethod
+    def _answered_at() -> datetime:
+        """The wall clock as the time of an answer: an instant in UTC, **to the
+        second**. A graph that stands for a repository carries this as its
+        record's own time, and the heaviest record is weighed with a time of this
+        length (:data:`RECORD_BYTES`). The wall clock, and not the monotonic one
+        a run's deadline reads: how old an answer is is a fact about the world,
+        and a machine that slept through an hour has an answer an hour older."""
+        return datetime.fromtimestamp(int(time.time()), UTC)
+
     def _read_graph_answer(self, chunk: list[Repo], answer: object,
-                           readings: list[Measurement], reach: _Reach) -> None:
+                           at: datetime) -> dict[int, _GraphSaid]:
         """One query's answer, read as ADR-0002 reads a REST one (ADR-0008,
-        decision 4): a `200` whose `errors` name one alias is about that
+        decision 4) — what it said about each repository the query carried, by the
+        repository's id. A `200` whose `errors` name one alias is about that
         repository alone; a `200` with `errors` and no `data` is the query failing
         whole, which is *could not ask* for every repository it carried; an
-        answer with neither is one this check cannot read."""
+        answer with neither is one this check cannot read. ``at`` is when the
+        answer arrived, which is when every graph in it was read."""
         try:
             by_alias, whole = self._graph_errors(answer)
         except CheckError as error:
@@ -3258,9 +3556,7 @@ class GitHubCheck(Check):
                 f"GitHub answered the dependency-graph query with something "
                 f"this check cannot read ({plain(str(error))})",
                 fault=Fault.MALFORMED)
-            for repo in chunk:
-                reach.failed(repo, unreadable)
-            return
+            return {repo.id: _Unread(unreadable) for repo in chunk}
         data = answer.get("data") if isinstance(answer, dict) else None
         if not isinstance(data, dict):
             if whole or by_alias:
@@ -3273,22 +3569,28 @@ class GitHubCheck(Check):
                 failed = GitHubError(
                     "GitHub answered the dependency-graph query with neither "
                     "data nor errors", fault=Fault.MALFORMED)
-            for repo in chunk:
-                reach.failed(repo, failed)
-            return
+            return {repo.id: _Unread(failed) for repo in chunk}
+        said: dict[int, _GraphSaid] = {}
         for position, repo in enumerate(chunk):
             alias = f"r{position}"
             if alias in by_alias:
                 kind, message = by_alias[alias]
                 if kind == "NOT_FOUND":
-                    reach.gone(repo, message)
+                    said[repo.id] = _Gone(message)
                 elif kind in ("FORBIDDEN", "INSUFFICIENT_SCOPES"):
                     # The token being told no about this repository: an answer,
                     # and it grades, as a 403 on the export did.
-                    reach.failed(repo, GitHubError(
+                    said[repo.id] = _Unread(GitHubError(
                         f"{kind}: {message}", status=403, fault=Fault.ANSWERED))
+                elif not kind and message == self._GRAPH_TIMED_OUT:
+                    # GitHub did not answer for this repository in time: *could
+                    # not ask*, which grades nothing and is counted as a gap —
+                    # never the amber line an unreadable answer gets — and the
+                    # one failure that is asked once more (decision 8).
+                    said[repo.id] = _Unread(GitHubError(
+                        f"error: {message}", fault=Fault.TRANSIENT), timed_out=True)
                 else:
-                    reach.failed(repo, GitHubError(
+                    said[repo.id] = _Unread(GitHubError(
                         f"{kind or 'error'}: {message}", fault=Fault.MALFORMED))
                 continue
             node = data.get(alias)
@@ -3302,49 +3604,181 @@ class GitHubCheck(Check):
                 manifests = values.rows(node, "dependencyGraphManifests",
                                         "nodes", where=repo.full_name)
             except CheckError as error:
-                reach.failed(repo, GitHubError(plain(str(error)),
-                                               fault=Fault.MALFORMED))
+                said[repo.id] = _Unread(GitHubError(plain(str(error)),
+                                                    fault=Fault.MALFORMED))
                 continue
-            reach.read_one()
             # The graph as it was read, however it grades: a repository whose
             # manifests parse is a reading too, and the grading says it has no
             # line. At most ten manifests, each path cut to its end, so ten of
             # them fit one record beside the repository.
-            readings.append(_reading(
-                "sbom_check", "dependency_graph", repo, total=total,
-                manifests=[{
-                    "filename": (_path_end(values.text(manifest, "filename"))
-                                 or None),
-                    "parseable": values.flag(manifest, "parseable"),
-                    "exceeds_max_size": values.flag(manifest, "exceedsMaxSize"),
-                } for manifest in manifests[:self._GRAPH_MANIFESTS]]))
+            said[repo.id] = _Graph(total=total, at=at, manifests=tuple({
+                "filename": (_path_end(values.text(manifest, "filename"))
+                             or None),
+                "parseable": values.flag(manifest, "parseable"),
+                "exceeds_max_size": values.flag(manifest, "exceedsMaxSize"),
+            } for manifest in manifests[:self._GRAPH_MANIFESTS]))
+        return said
+
+    def _ask_graphs(self, client: GitHubClient, chunk: list[Repo], *,
+                    once: bool = False) -> dict[int, _GraphSaid]:
+        """One query asked, and what came of it for each repository it carried.
+        A query that fails as a request — a 5xx, a throttle, a 401 — is one fault
+        for every repository in it (ADR-0002); what a `200` says is read per
+        alias. ``once`` asks with a single request (:meth:`GitHubClient.graphql`).
+
+        **What arrives is the hold's at once** (ADR-0008, decision 7): a graph is
+        that repository's last answer from here on, whatever becomes of the pass,
+        and an answer that is not a graph — `NOT_FOUND`, or a refusal, of the
+        repository on its alias or of the query itself — lets the held one go. An
+        answer this check cannot read, and no answer at all, leave the hold as it
+        was."""
+        said: dict[int, _GraphSaid]
+        try:
+            answer = client.graphql(self._graph_query(chunk), once=once)
+        except GitHubError as error:
+            said = {repo.id: _Unread(error) for repo in chunk}
+        else:
+            said = self._read_graph_answer(chunk, answer, self._answered_at())
+        for repository_id, each in said.items():
+            if isinstance(each, _Graph):
+                self._graphs.keep(repository_id, each)
+            elif isinstance(each, _Gone) or each.error.fault is Fault.ANSWERED:
+                self._graphs.release(repository_id)
+        return said
+
+    @staticmethod
+    def _graph_reading(repo: Repo, graph: _Graph, *,
+                       standing: bool = False) -> Measurement:
+        """A dependency graph as a reading: the count and the manifests read, and
+        `at` — the record's own time, which is `null` for a graph read on this
+        run and, for one that **stands** for a repository GitHub did not answer
+        for, when GitHub answered with it (ADR-0008, decision 7). No subject:
+        nothing keeps a history of it."""
+        return _reading(
+            "sbom_check", "dependency_graph", repo, total=graph.total,
+            manifests=[dict(manifest) for manifest in graph.manifests],
+            at=graph.at.isoformat() if standing else None)
+
+    def _ask_once_more(self, client: GitHubClient, asked: list[Repo],
+                       said: dict[int, _GraphSaid]) -> None:
+        """**A repository cut once is asked once more** (ADR-0008, decision 8).
+
+        When every repository has been asked, each one whose query came back with
+        GitHub's own time limit on its alias is asked again, in the order they
+        were asked. **A second asking is one request**: not retried, and no wait
+        taken — so it costs at most a request's timeout, and it is made only
+        while the run has more than that left. What it says replaces the first in
+        ``said``: it is the repository's reading for the run. **Only the cut is
+        asked again**: a 5xx or a connection failure has had its second attempt,
+        from the client, and a throttle, or errors about the query whole, is
+        GitHub asking for less — which is also why a second asking that is
+        answered with a throttle is the last of the pass.
+
+        A pass that met a cut says so in one line of the log, at `INFO`, with a
+        fixed phrase to count by — *asked once more* — so that whether the second
+        asking earns its requests is a number somebody can read off a day's log.
+        It is written whatever ends the loop.
+        """
+        cut: list[Repo] = []
+        for repo in asked:
+            first = said[repo.id]
+            if isinstance(first, _Unread) and first.timed_out:
+                cut.append(repo)
+        if not cut:
+            return
+        again = answered = 0
+        try:
+            for repo in cut:
+                if not client.affords(self.request_timeout):
+                    break
+                again += 1
+                second = self._ask_graphs(client, [repo], once=True)[repo.id]
+                said[repo.id] = second
+                if (isinstance(second, _Unread)
+                        and second.error.fault is Fault.TRANSIENT):
+                    if second.error.retry_after is not None:
+                        break       # a throttle: GitHub is asking for less
+                    continue
+                # A graph, or any other answer — a refusal, *not found*, one
+                # this check cannot read: GitHub answered the second time.
+                answered += 1
+        finally:
+            logger.info(
+                "%s: sbom_check: GitHub's time limit cut %d repositor%s — %d asked "
+                "once more, %d answered, %d left unasked", self.path, len(cut),
+                "y" if len(cut) == 1 else "ies", again, answered, len(cut) - again)
 
     def _read_sbom_check(self, client: GitHubClient, repos: list[Repo]
                          ) -> tuple[list[Measurement], _Reach]:
         """Each asked repository's dependency graph, one reading each, asked of the
         graph itself rather than read off an SBOM export (ADR-0008): one GraphQL
         query per repository. Repositories in ``sbom_ignore`` are not asked — the
-        configuration spares the request, not merely the line. A query that fails
-        as a request — a 5xx, a throttle, a 401 — is one fault for every
-        repository it carried (ADR-0002); what a `200` says is read per alias."""
+        configuration spares the request, not merely the line.
+
+        **A repository GitHub did not answer for keeps its last answer**
+        (decision 7). Where the query failed as *could not ask* and the check
+        holds a graph GitHub answered with less than `sbom_check.max_answer_age`
+        ago, that graph is the repository's reading, carrying its own time, and
+        the repository counts as read: no note, nothing in the coverage count.
+        With no such answer it is *could not ask*, as it was.
+
+        The readings and the notes are handed back in the roster's order,
+        whichever asking each came from.
+        """
         readings: list[Measurement] = []
         reach = _Reach("sbom_check")
         asked = [repo for repo in repos if repo.name not in self.sbom_ignore]
+        said: dict[int, _GraphSaid] = {}
         for start in range(0, len(asked), self._GRAPH_REPOS_PER_QUERY):
-            chunk = asked[start:start + self._GRAPH_REPOS_PER_QUERY]
-            try:
-                answer = client.graphql(self._graph_query(chunk))
-            except GitHubError as error:
-                for repo in chunk:
-                    reach.failed(repo, error)
+            said.update(self._ask_graphs(
+                client, asked[start:start + self._GRAPH_REPOS_PER_QUERY]))
+        self._ask_once_more(client, asked, said)
+        stood: list[tuple[Repo, _Graph]] = []
+        without = 0
+        for repo in asked:
+            answer = said[repo.id]
+            if isinstance(answer, _Graph):
+                reach.read_one()
+                readings.append(self._graph_reading(repo, answer))
                 continue
-            self._read_graph_answer(chunk, answer, readings, reach)
+            if isinstance(answer, _Gone):
+                reach.gone(repo, answer.message)
+                continue
+            if answer.error.fault is Fault.TRANSIENT:
+                held = self._graphs.standing(repo.id, self._answered_at(),
+                                             self.sbom_max_answer_age)
+                if held is not None:
+                    reach.read_one()
+                    readings.append(self._graph_reading(repo, held, standing=True))
+                    stood.append((repo, held))
+                    continue
+                without += 1
+            reach.failed(repo, answer.error)
+        # A repository this pass did not ask — gone from the scope, or named
+        # under `sbom_check.ignore` — is forgotten with the pass.
+        self._graphs.keep_only(repo.id for repo in asked)
+        if stood or without:
+            unanswered = len(stood) + without
+            # `INFO`, with a fixed phrase to count by — *on the last answer*:
+            # nothing in it is an operator's to act on. The times are the
+            # library's, in the configured zone, as the stamp of this line is.
+            logger.info(
+                "%s: sbom_check: GitHub did not answer for %d repositor%s — %d on "
+                "the last answer%s, %d with none", self.path, unanswered,
+                "y" if unanswered == 1 else "ies", len(stood),
+                (" (" + ", ".join(f"{repo.name} since {local_time(held.at)}"
+                                  for repo, held in stood) + ")") if stood else "",
+                without)
         return readings, reach
 
     def _grade_sbom_check(self, measurements: Sequence[Measurement],
                           read: int, roster: list[Repo]) -> CheckResult:
         """A repository with code but no dependency graph Dependabot can read →
-        ERROR (ADR-0004 §4)."""
+        ERROR (ADR-0016 §11). A graph that carries a time of its own is the
+        repository's last answer, standing on a run GitHub did not answer for it
+        (ADR-0008, decision 7): its line is the line that graph has, on the same
+        slug and with the same code, ending *as of* that time — which the library
+        writes, in the configured zone and format."""
         entries: list[Entry] = []
         for measurement in measurements:
             record = measurement.record
@@ -3352,8 +3786,15 @@ class GitHubCheck(Check):
                 continue
             line = self._graph_verdict(_repo_of(record), int(record["total"]),
                                        record["manifests"])
-            if line is not None:
-                entries.append(_carrying(line, measurement))
+            if line is None:
+                continue
+            # `.get`: a graph read before a reading carried its time has none.
+            answered = record.get("at")
+            if answered:
+                line = replace(line, text=(
+                    f"{line.text} — as of "
+                    f"{plain(local_time(datetime.fromisoformat(answered)))}"))
+            entries.append(_carrying(line, measurement))
         return self._finalize(
             "sbom_check",
             "Repositories without a dependency graph Dependabot can read",
@@ -3434,7 +3875,19 @@ class GitHubCheck(Check):
         this block shows. A re-run keeps the id and the run number, so only the two
         together name one execution — which is what the reading's identity is made
         of (:func:`_run_identity`), and why the record carries both.
+
+        ``duration_s`` is how long the run took, in whole seconds from
+        ``run_started_at`` to ``updated_at`` — and only once GitHub says the run is
+        ``completed``. Of a finished run the last change is taken for its end in
+        this one number, as GitHub's own CLI takes it when it says how long a run
+        took; of a run in flight it is only the last step it took, so a run that
+        has not completed has no duration yet, and the record holds ``None`` in its
+        place (ADR-0012 §3). It is the number a workflow's node draws each run's
+        stem to, which the type declares (:data:`MEASURES`).
         """
+        started = _instant(values.text(run, "run_started_at"))
+        updated = _instant(values.text(run, "updated_at"))
+        completed = values.text(run, "status").lower() == "completed"
         return {
             "id": values.number(run, "id") or None,
             "attempt": values.number(run, "run_attempt") or None,
@@ -3442,13 +3895,14 @@ class GitHubCheck(Check):
             "url": values.text(run, "html_url") or None,
             "status": values.text(run, "status") or None,
             "conclusion": values.text(run, "conclusion") or None,
-            "started": _instant(values.text(run, "run_started_at")),
-            "updated": {"at": _instant(values.text(run, "updated_at"))},
+            "started": started,
+            "updated": {"at": updated},
+            "duration_s": _span(started, updated) if completed else None,
         }
 
     @classmethod
     def _action_reading(cls, repo: Repo, workflow_id: int, workflow: str,
-                        branch: str, completed: object | None,
+                        file: str, branch: str, completed: object | None,
                         running: object | None,
                         verdict: tuple[StatusCode, str] | None) -> Measurement:
         """What this run read about one workflow on one branch — one measurement,
@@ -3478,19 +3932,35 @@ class GitHubCheck(Check):
         GitHub named it, or past 200 characters as its digest — and the record's
         copy, what the line says, is clipped at `_BRANCH_BYTES` like any free text
         (ADR-0014 §4).
+
+        **And the workflow's file**, which names the workflow's node
+        (:func:`_workflow_file`, ADR-0016 §18): the grading builds the tree out of
+        the readings alone (little-sister ADR-0086 decision 6), so what names a
+        node is in the record.
+
+        **The record's own time, `at`, is the start of the run it names** — the
+        `started` of the run block its identity is read from — so its series places
+        it where the run began and not where this check first saw it (little-sister
+        ADR-0087 decision 6), and the mark a workflow's node draws for it stands at
+        its own time: the run is the instant the record is of (ADR-0012 §3). A run
+        in flight rides on the record before it and keeps that record's place; where
+        GitHub sent no start, `at` is ``None``, and the record stands where it was
+        first seen.
         """
         blocks: dict[str, Any] = {}
         if completed is not None:
             blocks["completed"] = cls._run_record(completed)
         if running is not None:
             blocks["running"] = cls._run_record(running)
+        named = blocks.get("completed") or blocks.get("running")
         return _reading(
             "actions", "run", repo,
             subject=_workflow_subject(repo.id, workflow_id, branch),
-            identity=_run_identity(blocks.get("completed")
-                                   or blocks.get("running")),
+            identity=_run_identity(named),
+            at=named["started"] if named is not None else None,
             workflow=_kept(workflow, budget=_NAME_BYTES),
             workflow_id=workflow_id,
+            file=file,
             branch=_kept(branch, budget=_BRANCH_BYTES),
             verdict=verdict[1] if verdict is not None else None,
             **blocks)
@@ -3539,9 +4009,9 @@ class GitHubCheck(Check):
         this workflow does not run on this branch, which is a fact rather than a gap.
         The repository-wide `/actions/runs` it replaced returned the newest 100 runs
         across *all* workflows, so a workflow whose newest run fell below that cut
-        contributed nothing and — with `show_healthy: false` — rendered exactly as
-        one that passed. Nothing could tell those apart from that read, which is why
-        the aspect briefly reported which workflows it had missed and was wrong to.
+        contributed nothing, exactly as one that does not run there. Nothing could
+        tell those apart from that read, which is why the aspect briefly reported
+        which workflows it had missed and was wrong to.
 
         **And it holds the newest run it has read** (ADR-0015). The per-workflow read
         is a search, and GitHub has answered it out of order and without its newest
@@ -3563,8 +4033,8 @@ class GitHubCheck(Check):
         unfiltered and cut to the named branches, which is a cut by construction and
         is reported as one.
 
-        A healthy idle workflow is measured like any other: whether it earns a line
-        is `show_healthy`, which is the grading's to apply.
+        A healthy idle workflow is measured like any other, and its line is written
+        like any other (ADR-0016 §21).
         """
         readings: list[Measurement] = []
         reach = _Reach("actions")
@@ -3598,6 +4068,9 @@ class GitHubCheck(Check):
                 for workflow_id, workflow in workflows.by_id.items()
                 if not any(p.search(workflow.name or str(workflow_id))
                            for p in self.actions_ignore_patterns)}
+            # The name each workflow's node takes: its file (ADR-0016 §18).
+            files = {workflow_id: _workflow_file(workflow.path, workflow_id)
+                     for workflow_id, workflow in kept.items()}
             # **A disabled workflow's runs are not read** (ADR-0010). Its newest run
             # is frozen at whatever it was when somebody switched the workflow off,
             # so the request buys a verdict that cannot change and says nothing the
@@ -3674,13 +4147,18 @@ class GitHubCheck(Check):
                 # so the library builds the record first and the identity is read
                 # back out of it — or the state it is in where GitHub did not say,
                 # so a workflow that stays off is one record in its series rather
-                # than one per poll (ADR-0013 §5).
+                # than one per poll (ADR-0013 §5). That instant is the record's
+                # own time, `at`, too: its switch-off as a rule, which is what the
+                # record is of, so its series places it there and not where this
+                # check first saw it (ADR-0013 §5).
                 word = _kept(switched_off.state)
                 reading = _reading(
                     "actions", "disabled", repo,
                     subject=_workflow_subject(repo.id, workflow_id),
+                    at=_instant(switched_off.updated),
                     workflow=_kept(switched_off.name, budget=_NAME_BYTES),
                     workflow_id=workflow_id,
+                    file=files[workflow_id],
                     url=switched_off.url or None,
                     state=word,
                     updated={"at": _instant(switched_off.updated)})
@@ -3711,8 +4189,8 @@ class GitHubCheck(Check):
                 if verdict is None and running is None:
                     continue            # only neutral runs: nothing was learned
                 readings.append(self._action_reading(
-                    repo, workflow_id, workflow, branch, completed, running,
-                    verdict))
+                    repo, workflow_id, workflow, files[workflow_id], branch,
+                    completed, running, verdict))
             # **Only an exact read may claim this.** Nothing back from a read that
             # asked per workflow per named branch means no run on any of them — the
             # construction ADR-0005 rests on — unless the check holds a run GitHub
@@ -3740,23 +4218,36 @@ class GitHubCheck(Check):
 
     def _grade_actions(self, measurements: Sequence[Measurement], read: int,
                        roster: list[Repo]) -> CheckResult:
-        """One coded entry per workflow/branch that has something to say.
+        """The aspect's node, a node beneath it for each repository it has
+        something to say about, and beneath each a node for each workflow with a
+        line (ADR-0016 §17–§22).
 
-        The entry code is the newest useful completed verdict. A newer in-flight
-        run is an additional flag and words on that same stable entry, so a retry
-        cannot hide the failure it is trying to fix. Healthy idle workflows are
-        optional; a run in flight is always emitted. Only runs of a currently
-        existing workflow count.
+        **A workflow's line stands on the workflow's node.** It is the newest
+        useful completed verdict, with a newer run in flight as a flag and words on
+        that same line, so a retry cannot hide the failure it is trying to fix
+        (ADR-0016 §16). Its subject is the workflow on its branch, so the node
+        stands for that and shows its series, and draws its runs (little-sister
+        ADR-0106). A passing idle workflow's line is written as any other's, since
+        without it the node would stand for nothing (§21). Where the configuration
+        names several branches, or every branch, each branch is a node beneath the
+        workflow's and holds the line (§19); a disabled workflow's line is on the
+        workflow's own node in every mode (§20). Only runs of a workflow that
+        still exists count.
+
+        **A repository's node is the box its workflows stand in** (§17): it grades
+        nothing of its own unless the repository could not be read, and then its
+        read line stands on it. What is the same everywhere it is true — how many
+        repositories GitHub did not answer for, the answers that were short, the
+        named branches that matched nothing — is said once, on the aspect's node.
 
         **Each reading is one line, and the line carries it** (little-sister
-        ADR-0086 decision 2): the measurement's record is
-        the entry's `data` and its subject the entry's `subject`.
+        ADR-0086 decision 2): the measurement's record is the entry's `data` and
+        its subject the entry's `subject`.
         """
-        problem_entries: list[Entry] = []
-        running_entries: list[Entry] = []
-        healthy_entries: list[Entry] = []
         partial: list[Repo] = []
         unmatched: list[Repo] = []
+        repos: dict[int, Repo] = {}
+        workflows: dict[int, dict[str, _WorkflowLines]] = {}
         for measurement in measurements:
             record = measurement.record
             kind = record["kind"]
@@ -3768,56 +4259,43 @@ class GitHubCheck(Check):
                     _repo_of(record),
                     default_branch=str(record["default_branch"] or "")))
                 continue
-            if kind == "disabled":
-                repo = _repo_of(record)
-                code = self.actions_disabled_map.get(str(record["state"]),
-                                                     StatusCode.WARN)
-                # An `OK` disabled line follows `show_healthy`, exactly as a
-                # passing idle workflow does (ADR-0004 §9): with `disabled_fork`
-                # graded `OK` by default and forks discovered by default, a leaf
-                # that showed them all would fill with green lines nobody chose.
-                if code is StatusCode.OK and not self.actions_show_healthy:
-                    continue
-                # Keyed without a branch — a different slug from the frozen
-                # verdict this line replaces, so a pin held on that line stops
-                # matching and has to be made again (PL10, ADR-0010).
-                entry = _carrying(Entry(
-                    slug(repo.id, "workflow", record["workflow_id"]),
-                    self._disabled_text(repo, record), code=code), measurement)
-                if code in (StatusCode.ERROR, StatusCode.WARN):
-                    problem_entries.append(entry)
-                else:
-                    healthy_entries.append(entry)
-                continue
-            if kind != "run":
+            if kind not in ("disabled", "run"):
                 continue
             repo = _repo_of(record)
-            verdict = record["verdict"]
-            running = "running" in record
-            entry_code = (self._VERDICT_CODES.get(str(verdict), StatusCode.UNDEFINED)
-                          if verdict is not None else StatusCode.UNDEFINED)
-            if (entry_code is StatusCode.OK and not running
-                    and not self.actions_show_healthy):
+            repos[repo.id] = repo
+            # The node a line stands on is named by the workflow's file, which the
+            # record carries because the tree is built from the readings alone
+            # (ADR-0016 §18).
+            file = str(record.get("file") or record["workflow_id"])
+            lines = workflows.setdefault(repo.id, {}).setdefault(
+                file, _WorkflowLines(file, str(record["workflow"] or "")))
+            if kind == "disabled":
+                # Keyed without a branch — a different slug from the frozen
+                # verdict this line replaces, so a pin held on that line stops
+                # matching and has to be made again (PL10, ADR-0010). Written
+                # whatever its code, an `OK` one too (ADR-0016 §21).
+                lines.disabled = _carrying(Entry(
+                    slug(repo.id, "workflow", record["workflow_id"]),
+                    self._disabled_text(repo, record),
+                    code=self.actions_disabled_map.get(str(record["state"]),
+                                                       StatusCode.WARN)),
+                    measurement)
                 continue
-            entry = _carrying(Entry(
-                slug(repo.id, "workflow", record["workflow_id"],
-                     _line_branch(repo.id, record, measurement.subject)),
+            verdict = record["verdict"]
+            branch = _line_branch(repo.id, record, measurement.subject)
+            lines.runs.append((branch, str(record["branch"]), _carrying(Entry(
+                slug(repo.id, "workflow", record["workflow_id"], branch),
                 self._action_text(repo, record),
-                code=entry_code,
-                running=running,
-            ), measurement)
-            if entry_code in (StatusCode.ERROR, StatusCode.WARN):
-                problem_entries.append(entry)
-            elif running:
-                running_entries.append(entry)
-            else:
-                healthy_entries.append(entry)
+                code=(self._VERDICT_CODES.get(str(verdict), StatusCode.UNDEFINED)
+                      if verdict is not None else StatusCode.UNDEFINED),
+                running="running" in record,
+            ), measurement)))
         total = len(roster)
-        # **One line for the whole leaf, and it grades.** Not one per repository and
+        # **One line for the whole aspect, and it grades.** Not one per repository and
         # emphatically not one per workflow: what it reports is the same fact
         # everywhere it is true — this answer is short — and repeating a fact an
         # operator cannot act on differently is how a leaf teaches its reader to
-        # skip the color. It is `WARN` rather than `UNDEFINED` because a leaf that
+        # skip the color. It is `WARN` rather than `UNDEFINED` because an aspect that
         # *knows* it is incomplete and renders green is the defect this whole item
         # exists to remove; `UNDEFINED` is for a repository GitHub would not answer
         # about, which is a wait-and-see, and this is not one.
@@ -3828,17 +4306,17 @@ class GitHubCheck(Check):
                 f"not all runs read in {len(partial)} of {total} "
                 + ("repository" if total == 1 else "repositories")
                 + " — a workflow whose newest run falls outside the window has no "
-                "state here and is not reported above: "
+                "state here and is not reported: "
                 + ", ".join(plain(repo.name) for repo in partial),
                 code=StatusCode.WARN))
         # **The branches this config names matched nothing here.** A configuration
-        # line rather than a coverage line, and the only thing the per-entry
-        # rendering cannot show: a branch that produced no entry produces no line
-        # either, so an estate asked about a branch none of its repositories runs
-        # renders exactly like one with nothing to report. It names the default
-        # branch it *did* see, because `main` against `master` is what this nearly
-        # always is, and it says *no run on* rather than *no such branch*, which is
-        # the half of it the read cannot support (ADR-0009).
+        # line rather than a coverage line, and the only thing the nodes cannot
+        # show: a branch that produced no line produces no node either, so an
+        # estate asked about a branch none of its repositories runs renders exactly
+        # like one with nothing to report. It names the default branch it *did*
+        # see, because `main` against `master` is what this nearly always is, and it
+        # says *no run on* rather than *no such branch*, which is the half of it the
+        # read cannot support (ADR-0009).
         branch_entries: list[Entry] = []
         if unmatched:
             named = ", ".join(plain(branch) for branch in self.actions_branches)
@@ -3855,16 +4333,104 @@ class GitHubCheck(Check):
                        else "not named by GitHub") + ")"
                     for repo in unmatched),
                 code=StatusCode.WARN))
-        # The unreadable lines go **last**, after the healthy ones: they are the
-        # least actionable thing on the leaf, and one of them is not news. The
-        # window line sits with them and above them, for the same reason in the
-        # other direction: it is about this check's own reach rather than about
-        # anybody's repository, but unlike them it is a standing defect.
-        return self._finalize(
-            "actions", "Latest completed and in-flight workflow-run state",
-            [*problem_entries, *running_entries, *healthy_entries,
-             *branch_entries, *window_entries],
-            _Coverage.of(read, measurements))
+        coverage = _Coverage.of(read, measurements)
+        # A read failure stands on the repository it concerns (ADR-0016 §17), as the
+        # line it always was, under the slug it always had.
+        notes: dict[int, list[Entry]] = {}
+        for about, note in zip(coverage.about, coverage.notes, strict=True):
+            repos.setdefault(about.id, about)
+            notes.setdefault(about.id, []).append(note)
+        short = {repo.id for repo in partial}
+        level = self.actions_all_branches or len(self.actions_branches) > 1
+        children = tuple(
+            self._actions_repository_node(
+                repos[repo_id], notes.get(repo_id, []),
+                tuple(workflows.get(repo_id, {}).values()), level,
+                # **Its workflows are all of them where its answer was whole**
+                # (ADR-0016 §22): read, and not short — a wide page that was a
+                # cut, or a workflow list longer than one page, has no line for
+                # a workflow that exists, and its node must not go for that.
+                whole=repo_id not in notes and repo_id not in short)
+            for repo_id in sorted(repos, key=lambda repo_id: repos[repo_id].name))
+        # The unreadable count goes **last**, after the other two: it is about this
+        # check's own reach rather than about anybody's repository. The window line
+        # sits above it, since unlike it the window is a standing defect.
+        return CheckResult(
+            reason=(*branch_entries, *window_entries, *coverage.gap()),
+            entries=True,
+            name="actions",
+            description="Latest completed and in-flight workflow-run state",
+            children=children,
+            # **Its repositories are all of them** (little-sister ADR-0109): an
+            # aspect is graded only where it read every repository discovery
+            # named, which names the scope whole, so a repository that left the
+            # scope, or whose Actions were switched off, leaves with this run.
+            children_complete=True)
+
+    @classmethod
+    def _actions_repository_node(cls, repo: Repo, notes: list[Entry],
+                                 workflows: tuple[_WorkflowLines, ...], level: bool,
+                                 *, whole: bool) -> CheckResult:
+        """One repository's node beneath `actions`: named by the repository's name,
+        which holds no `/` — a level inside the aspect, and the box its workflows
+        stand in (ADR-0016 §17). It grades nothing of its own, as a region's node
+        in little-sister-aws does (its ADR-0007 §3), unless the repository could not
+        be read: its read line then stands on it, and its workflows stay as they
+        were, since nothing was read that could say which of them still exist.
+
+        It says that a run names it (little-sister ADR-0118): this type declares
+        eight labels by name, `actions` and `issues` among them, and a repository
+        called like one of them would otherwise be shown under that aspect's
+        label."""
+        return CheckResult(
+            reason=notes, entries=True, name=repo.name,
+            description=f"GitHub Actions in {plain(repo.full_name)}",
+            children=tuple(cls._workflow_node(repo, lines, level, whole=whole)
+                           for lines in sorted(workflows,
+                                               key=lambda lines: lines.file)),
+            children_complete=whole, dynamic=True)
+
+    @staticmethod
+    def _workflow_node(repo: Repo, lines: _WorkflowLines, level: bool, *,
+                       whole: bool) -> CheckResult:
+        """One workflow's node, named by its file and titled by its name
+        (ADR-0016 §18), saying that a run names it (little-sister ADR-0118).
+
+        **Its line stands on it** where the configuration watches one branch, the
+        default or one it names: the node stands for the workflow on that branch
+        (§19). A disabled workflow's line stands on it in every mode, and the node
+        then stands for the workflow itself (§20). It says then that its children
+        are complete — it has none — so that a branch's node an earlier shape of the
+        configuration left beneath it goes, and in the modes with a level, a
+        disabled workflow's branch nodes go while nothing reads them and come back
+        with its next run.
+
+        **Beneath it a node for each branch** where the configuration names several,
+        or every branch: named as :func:`_branch_node` writes the branch, titled by
+        the branch where that differs, and holding the line — complete, as its
+        repository is, where the answer was whole.
+        """
+        description = f"Workflow {plain(lines.file)} in {plain(repo.full_name)}"
+        title = "" if lines.title == lines.file else lines.title
+        if lines.disabled is not None or not level:
+            return CheckResult(
+                reason=([lines.disabled] if lines.disabled is not None
+                        else _by_concern(entry for _key, _shown, entry
+                                         in lines.runs)),
+                entries=True, name=lines.file, title=title,
+                description=description, children_complete=True, dynamic=True)
+        return CheckResult(
+            reason=[], entries=True, name=lines.file, title=title,
+            description=description,
+            children=tuple(
+                CheckResult(
+                    reason=[entry], entries=True, name=_branch_node(branch),
+                    title="" if shown == _branch_node(branch) else shown,
+                    description=f"{description}, on {plain(shown)}",
+                    dynamic=True)
+                for branch, shown, entry in sorted(lines.runs,
+                                                   key=lambda run: run[0])),
+            children_complete=whole, dynamic=True)
 
     def _budget_covers(self, client: GitHubClient, reads: int) -> bool:
         """Whether the budget GitHub last stated covers this repository's exact
@@ -4096,7 +4662,8 @@ class GitHubCheck(Check):
                 name=values.text(workflow, "name"),
                 state=values.text(workflow, "state"),
                 url=values.text(workflow, "html_url"),
-                updated=values.text(workflow, "updated_at"))
+                updated=values.text(workflow, "updated_at"),
+                path=values.text(workflow, "path"))
                 for workflow in listed
                 if values.text(workflow, "state") != "deleted"},
             listed=len(listed),

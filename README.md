@@ -5,7 +5,9 @@ GitHub check types for [little-sister](https://github.com/m-31/little-sister).
 **`github`** — one node per configured account — an organization, optionally
 narrowed to one team, or a personal account — with a child per enabled aspect:
 open pull requests, Dependabot advisories, code-scanning and secret-scanning
-alerts, dependency-graph presence, workflow runs and open issues.
+alerts, dependency-graph presence, workflow runs and open issues. Under workflow
+runs, each repository is a node and each of its workflows a node beneath it, which
+draws the workflow's runs.
 
 **`github-rate-limit`** — one node per **token**, with a line per API budget.
 Cheap enough to run every minute, and it is what explains a `github` check that
@@ -29,6 +31,11 @@ is [`docs/decisions.md`](docs/decisions.md) and the records in
   one of its own.
 - **Registers** two check types: **`github`** and **`github-rate-limit`**. One
   import registers both.
+- **Declares** the heaviest record a `github` check writes, 1773 bytes — past 80 % of
+  little-sister's default `record_limit` of 2048, so every start says that a declared
+  record is close to the limit, in the log and on the engine's report, never as a line.
+  `record_limit: 2560` in your `settings.yaml` quiets it, as anything from 2217 does;
+  a limit below 1773 refuses the start, naming the check.
 
 ## Install
 
@@ -38,7 +45,7 @@ is [`docs/decisions.md`](docs/decisions.md) and the records in
 # Pin them. A deployment names exact versions so an upgrade is a deliberate edit
 # rather than drift; a plugin is the one that declares a floor, because two plugins
 # that each pinned could not be installed together.
-dependencies = ["little-sister==0.3.19", "little-sister-github==0.1.10"]
+dependencies = ["little-sister==0.3.19", "little-sister-github==0.1.11"]
 ```
 
 ```python
@@ -90,7 +97,7 @@ example file carries a comment per key; this is the same list with its defaults.
 | `include_archived` | `false` | archived repositories are ones nobody can act on |
 | `include_forks` | `true` | a fork the account holds is a repository, and its pull requests are real |
 | `api_url` | `https://api.github.com` | a GitHub Enterprise Server's `…/api/v3`; its GraphQL endpoint is found beside it |
-| `advanced_security_on_private` | `true` for an organization, `false` for a personal account | whether the code-scanning and secret-scanning aspects read **private** repositories — a question about visibility, since Advanced Security is paid there; the ones they skip are named on the aspect ([ADR-0003](docs/adr/0003-an-aspect-is-one-question-asked-of-the-whole-scope.md), decision 6) |
+| `advanced_security_on_private` | `true` for an organization, `false` for a personal account | whether the code-scanning and secret-scanning aspects read **private** repositories — a question about visibility, since Advanced Security is paid there; the ones they skip are named on the aspect ([ADR-0016](docs/adr/0016-an-aspect-asks-the-whole-scope-a-finding-grades-and-a-workflow-is-a-node.md) §6) |
 | `expect_min_repos` | `1` | fewer repositories discovered is WARN on the check's node; cannot be `0` |
 | `request_timeout` | `15s` | one request's budget; a request is also clamped to what is left of `timeout` |
 | `max_pause` | half of `timeout` | how much of the run may be spent asleep, waiting out a rate limit or on a retry's backoff; must be less than `timeout` |
@@ -103,13 +110,17 @@ example file carries a comment per key; this is the same list with its defaults.
 | `code_scanning_quality.severity_map` | `error`, `warning` → WARN; `note` → OK | everything else, by the rule's own analysis severity |
 | `secret_scanning.require_enabled` | `true` | a repository with secret scanning switched off is ERROR |
 | `sbom_check.ignore` | `[]` | repositories exempt from the dependency-graph requirement |
+| `sbom_check.max_answer_age` | `1h` | how long a repository's last dependency graph stands for it on the runs GitHub does not answer; its line then ends *as of* the time GitHub last answered. A positive duration, spelled as `timeout` is. Keep it longer than the check's `frequency`: by the next run an answer is about that old, and one too old does not stand. The default is an hour at any `frequency`, so a check that runs hourly or slower keeps no answer until it writes this key |
 | `actions.all_branches` | `false` | watch every branch rather than the default one — the one mode that stays incomplete, and says so |
 | `actions.branches` | `[]` | watch these branches **instead of** the default one, each workflow asked about each name; refused together with `all_branches` |
 | `actions.disabled_severity_map` | `disabled_manually`, `disabled_inactivity` → WARN; `disabled_fork` → OK | what a switched-off workflow means here; its runs are not read |
-| `actions.show_healthy` | `false` | also list workflows that passed and are idle |
 | `actions.ignore_workflow_name_patterns` | `[]` | regexes, case-insensitive, applied before anything is spent on a workflow |
 | `issues.ignore` | `[]` | repositories exempt from the issues check |
 | `subnodes` | — | your own display text per aspect, appended to the shipped one with `{default}` |
+
+`actions.show_healthy` is retired: every workflow that has run on a watched branch is a
+node with its line on it now, a passing one too, and a configuration that still sets
+the key is refused at load, saying why.
 
 ### `owner:` may name a person
 
@@ -143,9 +154,7 @@ rate-limit estimate shrinks with it. **No node also means no pin**: a maintenanc
 pin held against that node, or against a line under it, matches nothing while the
 aspect is off. An aspect that says nothing is on, so an aspect a later release
 adds arrives switched on in configs written before it existed. Switching every
-aspect off is a config error
-([ADR-0003](docs/adr/0003-an-aspect-is-one-question-asked-of-the-whole-scope.md),
-decisions 5 and 7).
+aspect off is a config error ([ADR-0016](docs/adr/0016-an-aspect-asks-the-whole-scope-a-finding-grades-and-a-workflow-is-a-node.md) §5 and §7).
 
 The per-aspect display text ships **with the type** and expands `{owner}` /
 `{team}` from the config, so it is not copied per team. Your deployment's own policy — a
@@ -162,8 +171,8 @@ so it works the same way for every branch check type you install.
 | `code_scanning_security` | `GET /repos/{r}/code-scanning/alerts?state=open` | the alerts GitHub gave a **security** severity: one leaf per `critical` / `high` / `medium` / `low`, graded by `code_scanning_security.severity_map` (all **ERROR** by default) |
 | `code_scanning_quality` | *(the same read)* | everything else, by the rule's own **analysis** severity: `error` / `warning` / `note`, graded by `code_scanning_quality.severity_map` (**WARN** / **WARN** / **OK** by default) |
 | `secret_scanning_alerts` | `GET /repos/{r}/secret-scanning/alerts?state=open` | any open alert → **ERROR**; scanning disabled → **ERROR** (`secret_scanning.require_enabled`) |
-| `sbom_check` | `POST /graphql` — `repository(owner:, name:) { dependencyGraphManifests(first: 10) { totalCount nodes { filename parseable exceedsMaxSize } } }`, one query per repository, one point each | no dependency graph → **ERROR** (`platform-api: no dependency graph (0 manifests)`); manifests none of which could be parsed → **ERROR**, with the cause on the line (`platform-api: 2 manifests, none parseable (package-lock.json exceeds the size limit)`); more than ten manifests is a graph whatever the first ten say (`sbom_check.ignore`; [ADR-0008](docs/adr/0008-the-dependency-graph-is-asked-not-exported.md)) |
-| `actions` | `GET /repos/{r}/actions/workflows` + `…/actions/workflows/{id}/runs` per workflow and branch, and `…/actions/runs/{id}` for a held run an answer went back on | one coded line per workflow and branch **that has something to say**: the newest useful verdict, plus a newer in-flight run (the default branch, or the branches `actions.branches` names, or every branch with `actions.all_branches`; a passing idle workflow only with `actions.show_healthy`). Asking per workflow is exact as a question, and GitHub's answer is checked: each is sorted by run id, and the newest completed run a line has read is held, so an answer that goes back on it is checked by reading that run by id — one `INFO` line in the log each time — and nothing back means that workflow does not run on that branch only where nothing is held. A line is named after its workflow, as the workflow list names it ([ADR-0015](docs/adr/0015-a-workflow-line-holds-the-newest-run-it-has-read.md)). `actions.all_branches` and a budget too thin to pay per workflow fall back to one page of `…/actions/runs`, and one WARN line then names the repositories the answer was short about; where the named branches matched no workflow in a repository, another names it and its default branch ([ADR-0005](docs/adr/0005-the-actions-aspect-asks-per-workflow.md), [ADR-0009](docs/adr/0009-named-branches-replace-the-default-branch.md)) |
+| `sbom_check` | `POST /graphql` — `repository(owner:, name:) { dependencyGraphManifests(first: 10) { totalCount nodes { filename parseable exceedsMaxSize } } }`, one query per repository, one point each | no dependency graph → **ERROR** (`platform-api: no dependency graph (0 manifests)`); manifests none of which could be parsed → **ERROR**, with the cause on the line (`platform-api: 2 manifests, none parseable (package-lock.json exceeds the size limit)`); more than ten manifests is a graph whatever the first ten say (`sbom_check.ignore`). A repository GitHub does not answer for on a run — its own time limit cutting that repository's query, after which it is asked once more, with one request, before the aspect ends; a 5xx; a rate limit — is graded on **its last answer** while that is younger than `sbom_check.max_answer_age`: it keeps the line it had, on the same slug and with the same code, ending *as of* the time GitHub last answered for it (`platform-api: no dependency graph (0 manifests) — as of 2026-10-10 14:32:10`, in the configured timezone), and is not counted as unanswered. *As of* means just that: this run did not read the repository, and what the line says was true then. With no answer that young the repository is *could not ask GitHub*, which grades nothing ([ADR-0008](docs/adr/0008-the-dependency-graph-is-asked-not-exported.md)) |
+| `actions` | `GET /repos/{r}/actions/workflows` + `…/actions/workflows/{id}/runs` per workflow and branch, and `…/actions/runs/{id}` for a held run an answer went back on | a node for each repository with a workflow that has run on the watched branch — the default branch, or the branches `actions.branches` names, or every branch with `actions.all_branches` — and beneath it a node for each such workflow, **named by its file** (`ci.yml`) and titled by its name, carrying one coded line: the newest useful verdict, plus a newer in-flight run, a passing idle workflow's too. Where `actions.branches` names several branches, or with `actions.all_branches`, the workflow's node holds a node for each branch, which carries the line (`release/1.2` is the node `release:1.2`). A workflow's node draws its runs, each at the time it started and, once it completed, as a stem to how long it took (the measure `completed.duration_s`, which `measures: {completed.duration_s: null}` takes away); a disabled workflow's line stands on its own node. A repository's node grades nothing unless the repository could not be read, and what is about many repositories stands on the aspect's own node ([ADR-0016](docs/adr/0016-an-aspect-asks-the-whole-scope-a-finding-grades-and-a-workflow-is-a-node.md) §17–§22). Asking per workflow is exact as a question, and GitHub's answer is checked: each is sorted by run id, and the newest completed run a line has read is held, so an answer that goes back on it is checked by reading that run by id — one `INFO` line in the log each time — and nothing back means that workflow does not run on that branch only where nothing is held. A line is named after its workflow, as the workflow list names it ([ADR-0015](docs/adr/0015-a-workflow-line-holds-the-newest-run-it-has-read.md)). `actions.all_branches` and a budget too thin to pay per workflow fall back to one page of `…/actions/runs`, and one WARN line then names the repositories the answer was short about; where the named branches matched no workflow in a repository, another names it and its default branch ([ADR-0005](docs/adr/0005-the-actions-aspect-asks-per-workflow.md), [ADR-0009](docs/adr/0009-named-branches-replace-the-default-branch.md)) |
 | `issues` | `GET /repos/{r}/issues?state=open` | any open issue → **WARN** (`issues.ignore`); issues disabled → **WARN** |
 
 Discovery is one call verifying the declared kind — plus, for a personal account,
@@ -179,9 +188,8 @@ package has no dependency but little-sister itself.
 
 The table says what each aspect grades. **Why** it grades that way — why the tree
 is aspect-first, why a missing dependency graph is red while an open pull request
-is amber, and what a severity band asserts while it is empty — is
-[ADR-0003](docs/adr/0003-an-aspect-is-one-question-asked-of-the-whole-scope.md) and
-[ADR-0004](docs/adr/0004-a-finding-grades-the-repository-does-not.md).
+is amber, what a severity band asserts while it is empty, and why a workflow is a
+node under its repository — is [ADR-0016](docs/adr/0016-an-aspect-asks-the-whole-scope-a-finding-grades-and-a-workflow-is-a-node.md).
 
 **Which of these you can change, and which you cannot.** The three banded aspects are
 graded by settings that exist in order to be overruled — `severity_map` says what a
@@ -229,7 +237,10 @@ are answers, and still grade. Because those quiet lines grade nothing, the cover
 does: an aspect that could not ask about a repository carries one amber line of its
 own, `GitHub did not answer for 1 of 40 repositories`, and the check's own node states
 the run's total once, with what the run slept, by cause — `paused 61s for a GitHub rate
-limit`, `paused 3s retrying after GitHub did not answer`. A wait GitHub asks for is
+limit`, `paused 3s retrying after GitHub did not answer`. `sbom_check` falls back on
+what it last knew: a repository GitHub answered for within `sbom_check.max_answer_age`
+keeps that answer, *as of* its time, and is in neither count — the last answers are
+the process's memory, so the first run after a start has none. A wait GitHub asks for is
 taken when the run and `max_pause` can afford it and refused whole when they cannot;
 when to ask again is your `frequency:`. If GitHub cannot answer *which repositories
 exist*, the check says `WARN` and reports nothing else, so every aspect keeps what the

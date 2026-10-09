@@ -1,15 +1,17 @@
 # ADR-0005 — The `actions` aspect asks per workflow
 
 - **Status:** Accepted
-- **Date:** 2026-09-27 (accepted 2026-08-30)
-- **Related:** [ADR-0003](0003-an-aspect-is-one-question-asked-of-the-whole-scope.md)
-  (an aspect is one question asked of the whole scope, which this changes the *asking*
-  of), [ADR-0002](0002-a-read-failure-is-not-a-finding.md) (a line that grades nothing,
-  and why the coverage line here is not one of those),
+- **Date:** 2026-10-10 (accepted 2026-08-30)
+- **Related:**
+  [ADR-0016](0016-an-aspect-asks-the-whole-scope-a-finding-grades-and-a-workflow-is-a-node.md)
+  (§2 and §3, an aspect is one question asked of the whole scope, which this changes the
+  *asking* of; §17–§19, the nodes its answers stand on),
+  [ADR-0002](0002-a-read-failure-is-not-a-finding.md) (a line that grades nothing, and
+  why the coverage line here is not one of those),
   [ADR-0001](0001-a-second-check-type-in-this-package.md) (the API budget, and the run
   this check declines to make),
-  [ADR-0015](0015-a-workflow-line-holds-the-newest-run-it-has-read.md) (the newest run
-  a line holds when an answer goes back on it)
+  [ADR-0015](0015-a-workflow-line-holds-the-newest-run-it-has-read.md) (the newest run a
+  line holds when an answer goes back on it)
 
 A bare ADR number here is this repository's; a reference to one of little-sister's
 is always written out, because the two numbering spaces overlap.
@@ -19,7 +21,7 @@ is always written out, because the two numbering spaces overlap.
 The aspect read `/repos/<repo>/actions/runs?per_page=100&branch=<default>`: one page,
 the newest hundred runs **across all of a repository's workflows**. A workflow whose
 newest run fell below that cut therefore contributed nothing at all — no entry, and
-nothing in the aspect's coverage count. With `show_healthy: false`, which is the
+nothing in the aspect's coverage count. With `show_healthy: false`, which was the
 default, a workflow nobody had read rendered exactly as one that had passed. The leaf
 reported OK with no entries while workflows on the default branch were failing, which
 is worse than an incomplete dashboard: it is a reassuring one.
@@ -51,9 +53,12 @@ newest completed run each line has read; an answer that goes back on it — an e
 included — is checked by reading that run by id
 ([ADR-0015](0015-a-workflow-line-holds-the-newest-run-it-has-read.md)). *Nothing back*
 means this workflow does not run on this branch — an answer and not a gap — where
-nothing is held. The aspect reads the workflow list once per repository as
-it already did, filters it by `ignore_workflow_name_patterns` **before** spending
-anything, and asks once per surviving workflow.
+nothing is held. A workflow the read finds a run of is a node beneath its repository's
+([ADR-0016](0016-an-aspect-asks-the-whole-scope-a-finding-grades-and-a-workflow-is-a-node.md)
+§17–§19), and one with *nothing back* has no node, as it has no line. The aspect reads
+the workflow list once per repository as it already did, filters it by
+`ignore_workflow_name_patterns` **before** spending anything, and asks once per
+surviving workflow.
 
 Ten rows rather than one, because the scan keeps the newest in-flight run and the
 newest useful completed verdict independently — one row cannot carry both, and a
@@ -87,13 +92,14 @@ and is reported as short rather than reported not at all. Absent headers mean pr
 a path to GitHub that strips them is not a reason to give every repository behind it a
 worse answer.
 
-**One coverage line for the whole leaf, and it grades `WARN`.** Where any repository
+**One coverage line for the whole aspect, and it grades `WARN`.** Where any repository
 was answered about only partly — `all_branches`, a thin budget, or a workflow list
-longer than one page — one line names those repositories. Not one per repository and
-never one per workflow: it reports the same fact everywhere it is true, and repeating
-a fact an operator cannot act on differently is how a leaf teaches its reader to skip
-the color. `WARN` rather than `UNDEFINED` because a leaf that *knows* it is incomplete
-and renders green is the defect this record exists to remove; `UNDEFINED` is for a
+longer than one page — one line names those repositories, on the aspect's own node,
+above every repository's and every workflow's. Not one per repository and never one per
+workflow: it reports the same fact everywhere it is true, and repeating a fact an
+operator cannot act on differently is how a node teaches its reader to skip the color.
+`WARN` rather than `UNDEFINED` because an aspect that *knows* it is incomplete and
+renders green is the defect this record exists to remove; `UNDEFINED` is for a
 repository GitHub would not answer about, which is a wait-and-see, and this is not one.
 
 ## Consequences

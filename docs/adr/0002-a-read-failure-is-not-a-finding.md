@@ -4,7 +4,7 @@
   `code_scanning_alerts` having become `code_scanning_security` and
   `code_scanning_quality` ([ADR-0006](0006-code-scanning-has-two-scales.md)), and
   every count below reads accordingly
-- **Date:** 2026-09-27 (accepted 2026-08-15)
+- **Date:** 2026-10-10 (accepted 2026-08-15)
 - **Related:** [ADR-0001](0001-a-second-check-type-in-this-package.md) (which
   applied the *wording* half of this — "could not ask" — to `github-rate-limit`,
   and named this type's grading half as the question this record answers),
@@ -13,7 +13,9 @@
   all-or-nothing — the shape this record works around), little-sister ADR-0050
   (a slug is an identifier, never a position), little-sister **ADR-0058** (one
   transport policy, and any client — the vocabulary this record's machinery moved
-  into)
+  into),
+  [ADR-0016](0016-an-aspect-asks-the-whole-scope-a-finding-grades-and-a-workflow-is-a-node.md)
+  (§17, where `actions` puts a repository's read line)
 
 ## Context
 
@@ -206,6 +208,15 @@ empty, so that a band's silence stays visible. `security_advisories` and
 The coverage line grades the container instead, so the bands never have to tell
 *empty* from *unread* — a question this record deliberately does not open.
 
+**In `actions` this line is the aspect's own, and a repository's read line is on the
+repository's node.** There a repository is a node beneath the aspect
+([ADR-0016](0016-an-aspect-asks-the-whole-scope-a-finding-grades-and-a-workflow-is-a-node.md)
+§17), and one the aspect could not read is such a node too: its line —
+`<id>-workflows-unreadable` or `<id>-runs-unreadable`, `UNDEFINED` where GitHub could
+not be asked — stands there under the slug it has, and the one `WARN` line that counts
+what could not be asked about is said once, on the aspect's node, as in every other
+aspect.
+
 ### 6. The outage is visible on the check's own node, once
 
 If the repository lines grade nothing, something must, or an hour of 5xx reads
@@ -307,12 +318,12 @@ so it is one implementation for every check in the family instead of one per pac
   `request_timeout:` is new and optional. `timeout:` is not new, and it now bounds
   the run rather than each request — so a value chosen for a single request will cut
   runs short, and a deployment should re-read it against its scope.
-- **No node path moves**, and the per-repository slugs are unchanged — including the
-  `…-unreadable` lines, which keep their key and change only their code and wording.
-  One slug *does* change: `pull_requests`' failure line was prose, so its slug was
-  derived from the wording; it is the keyed `<repo>-unreadable` now, like every other
-  aspect's. A pin held against that derived slug does not carry over, and none could
-  — a derived slug invalidates itself on a re-wording by design.
+- **No node path moves by this decision**, and the per-repository slugs are unchanged —
+  including the `…-unreadable` lines, which keep their key and change only their code
+  and wording. One slug *does* change: `pull_requests`' failure line was prose, so its
+  slug was derived from the wording; it is the keyed `<repo>-unreadable` now, like every
+  other aspect's. A pin held against that derived slug does not carry over, and none
+  could — a derived slug invalidates itself on a re-wording by design.
 - **A dashboard gets quieter, deliberately.** A repository that GitHub could not be
   asked about is no longer amber. The compensating alarm is on the check's node, and
   it fires on a failure that survived a retry.

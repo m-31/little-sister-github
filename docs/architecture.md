@@ -57,7 +57,9 @@ GraphQL (ADR-0008 §3).
 | `max_pause:` (half of `timeout:`) | how much of the run is spent asleep | in the client's sleep: a wait that would pass it is refused whole, never trimmed, and ends the run the way the deadline does, with what finished kept |
 
 **Three faults**, set on `GitHubError` from the status and the headers and never from
-the body (ADR-0002 §2, §3):
+the body (ADR-0002 §2, §3) — but for an error about one repository inside a GraphQL
+`200`, which has neither and is read by its `type`, and by its one-word message where it
+has no type (§3.5):
 
 | What came back | Fault | Retried |
 |---|---|---|
@@ -83,27 +85,30 @@ than as the previous response's numbers (ADR-0007 §5).
 ## 3. The `github` check
 
 One node per configured account, a child per enabled aspect, a keyed line per finding
-(ADR-0003 §1). A run is discovery, the guard, the aspects in roster order, the node's
-own reading — in that order, all inside `timeout:`.
+(ADR-0016 §1) — and beneath `actions` a node per repository and per workflow (ADR-0016
+§17–§19). A run is discovery, the guard, the aspects in roster order, the node's own
+reading — in that order, all inside `timeout:`.
 
 A run is also **two halves** (ADR-0014, little-sister ADR-0086). `measure()` does the
-reading: it hands back the **estate** reading first, then one reading per repository
-in scope, then each finished aspect's readings in the order it read them — one per
-finding, workflow and repository it could not read — every record naming its `aspect`
-and `kind`. `grade()` builds the node, the aspect children and every line out of those
-records and nothing else: not the client, not the clock, not the run state the
-measuring half keeps for the next run (the resume point, the workflow counts, the last
-run's length, the conditional cache). An aspect the deadline cut off hands back
-nothing, so its child is absent. Free text is clipped once, in the measuring half —
-300 characters and 600 bytes, a workflow's name 150 bytes, every copy of a branch 300,
-and a manifest's path 70, cut from the front behind a `…` — and the line says the text
-the reading kept, and a run line's slug is built from what its subject spells. Every
-time a record carries is typed, under `at`, `started` or `ended`, and read as a time
-or `null` (ADR-0014 §8). The heaviest record is a dependency graph's, 1605 bytes, and
-`expected_record()` declares it for startup to hold against `record_limit`, under the
-share of it at which the library says a declared record is close (ADR-0014 §4). A
-filter that spares a request is applied while measuring; one that only chooses what is
-said, while grading.
+reading: it hands back the **estate** reading first, then one reading per repository in
+scope, then each finished aspect's readings in the order it read them — one per finding,
+workflow and repository it could not read — every record naming its `aspect` and `kind`.
+`grade()` builds the node, the aspect children and every line out of those records and
+nothing else: not the client, not the clock, not the run state the measuring half keeps
+for the next run (the resume point, the workflow counts, the last run's length, the
+conditional cache, the held runs and the last answers of §4.1b and §4.1c). An aspect the
+deadline cut off hands back nothing, so its child is absent. Free text is clipped once,
+in the measuring half — 300 characters and 600 bytes, a workflow's name and its file 150
+bytes each, every copy of a branch 300, and a manifest's path 70, cut from the front
+behind a `…` — and the line says the text the reading kept, and a run line's slug is
+built from what its subject spells. Every time a record carries is typed, under `at`,
+`started` or `ended`, and read as a time or `null` (ADR-0014 §8). The heaviest record is
+a workflow run's, 1773 bytes, and `expected_record()` declares it for startup to hold
+against `record_limit` — past the share of the library's default at which every start
+says that a declared record is close, on purpose: a deployment quiets that with a
+`record_limit` of 2217 or more (ADR-0014 §4). A dependency graph that stands on its last
+answer (§4.1c) comes next, at 1635. A filter that spares a request is applied while
+measuring; one that only chooses what is said, while grading.
 
 Only two kinds of reading carry a **subject**, because a subject is what gives a
 reading a history (little-sister ADR-0085 decision 2): the
@@ -123,7 +128,7 @@ otherwise `/users/{login}/repos`, which is public repositories only, and the nod
 `(public only)`. Filtered by `name_prefix`, `include_archived` (false) and
 `include_forks` (true) into typed `Repo` values — the seam where the API's `Any` stops
 — and every aspect starts from that one set, narrowing it only where it says so
-(ADR-0003 §3). A transient discovery failure is WARN with **no children**, so every
+(ADR-0016 §3). A transient discovery failure is WARN with **no children**, so every
 aspect keeps its last reading; a discovery failure GitHub answered, or a malformed
 listing, is ERROR (ADR-0002 §9).
 
@@ -177,7 +182,7 @@ wait `max_pause` cannot afford ends the run the same way, naming the wait it ref
 
 ### 3.4 The node's own reading
 
-Everything the container says about itself is **coverage** (ADR-0003 §4): the scope
+Everything the container says about itself is **coverage** (ADR-0016 §4): the scope
 line — `14 repositories in scope`, WARN under `expect_min_repos`, `no repositories in
 scope (…)` naming the filters it looked with; the run's could-not-ask total, once —
 `3 repository reads could not be completed this run — GitHub did not answer`; what the
@@ -204,7 +209,7 @@ aspect adds one WARN line of its own, `GitHub did not answer for 1 of 40 reposit
 | `secret_scanning_alerts` | `secret_scanning:` | `secret-scanning/alerts` | flat; an open alert is ERROR, a 404 is *scanning not enabled* and ERROR unless `require_enabled: false` |
 | `security_advisories` | `security_advisories:` | `dependabot/alerts` | banded: `severities` selects, `severity_map` grades |
 | `code_scanning_security` | `code_scanning_security:` | `code-scanning/alerts` | banded on the security severity, `critical` / `high` / `medium` / `low` |
-| `actions` | `actions:` | `actions/workflows`, then a page of runs per workflow and branch; `actions/runs` in `all_branches` mode | flat; one line per workflow and branch that has something to say |
+| `actions` | `actions:` | `actions/workflows`, then a page of runs per workflow and branch; `actions/runs` in `all_branches` mode | a node per repository and per workflow beneath it, and per branch beneath that where several are configured; a line per workflow and branch that has a run |
 | `sbom_check` | `sbom_check:` | `graphql` — one query per repository, one point | flat; at most one line per repository |
 | `code_scanning_quality` | `code_scanning_quality:` | *the same read as `code_scanning_security`* | banded on the analysis severity, `error` / `warning` / `note` |
 | `pull_requests` | `pull_requests:` | `pulls` | flat; WARN per open pull request |
@@ -212,11 +217,11 @@ aspect adds one WARN line of its own, `GitHub did not answer for 1 of 40 reposit
 
 **Narrowing.** Three aspects read the Advanced Security scope: with
 `advanced_security_on_private` off, private repositories drop out of both code-scanning
-aspects and secret scanning, and are named on the aspect's node (ADR-0003 §6).
+aspects and secret scanning, and are named on the aspect's node (ADR-0016 §6).
 `sbom_check.ignore` and `issues.ignore` skip their repositories; a code-scanning or
 Dependabot 404 is *not enabled* and skipped quietly.
 
-**Banded aspects** (ADR-0004 §5–§8). The findings sit under one uncoded leaf per
+**Banded aspects** (ADR-0016 §12–§15). The findings sit under one uncoded leaf per
 severity band; the band carries the code for the lines beneath it, so one `severity_map`
 entry regrades every finding at that severity. A band named in the map or present in
 the data renders — empty and OK while it is watched; a severity nothing declared gets a
@@ -224,38 +229,57 @@ WARN band. Read failures stay on the aspect container, having no honest severity
 band's title is a colored circle by severity name (`BAND_GLYPHS`), the same across
 aspects and deployments.
 
-**`actions`** (ADR-0004 §9, ADR-0005, ADR-0009, ADR-0010, ADR-0015). Per repository the
+**`actions`** (ADR-0005, ADR-0009, ADR-0010, ADR-0015, ADR-0016 §16). Per repository the
 workflow list, filtered by `ignore_workflow_name_patterns` before anything is spent. A
 workflow whose `state` begins `disabled_` is **not read**: its newest run is frozen at
 whatever it was when it was switched off, so it gets one line keyed `<repo
 id>-workflow-<id>`, with no branch, naming the cause in GitHub's words and ending `no
 runs read` — `disabled_manually` and `disabled_inactivity` WARN, `disabled_fork` OK
 because forks are discovered by default, `actions.disabled_severity_map` overriding any
-of them, an unnamed state WARN, and an OK line following `show_healthy`. For the rest —
-on the default branch, or on each branch `actions.branches` names instead of it — ten
-runs per surviving workflow and branch, sorted by run id — GitHub promises no order —
-from which the newest useful verdict (a completed failure or pass, or a run held for
-approval) and the newest in-flight run are read independently; canceled and skipped runs
-erase nothing, a run in flight is an extra flag on the line, a passing idle workflow is
-shown only with `show_healthy`. The line takes its workflow's name from the list, and
-the run's only where the list gives none. The check **holds** the newest completed run
-each line has read (§4.1b): an answer that goes back on it — its newest completed run
-older, or none — is checked by reading the held run by id, which a `404` lets go and a
-`200` keeps, a completed newer attempt replacing it; a throttle or an error keeps it for
-the poll, and the budget fallback below reads nothing by id. `actions.branches` together
-with `all_branches` is refused at startup. The per-workflow read is priced against the
-budget headers already in hand, a read per workflow per named branch; when they do not
-cover it, that repository degrades to the one wide page of `…/actions/runs` that
-`all_branches` always reads — asked of the one named branch where there is one, and
-otherwise taken unfiltered and cut to the named branches, which makes that page a cut by
-construction. One WARN line (`runs-window-partial`) names the repositories answered
-about only partly: those whose wide page was a cut of the repository's runs, and those
-whose workflow list was longer than one page. A second (`branches-unmatched`) names the
-repositories where no watched workflow ran on any named branch, with each one's default
-branch; it is raised only from an exact read, because a degraded page cannot tell an
-unmatched branch from its own cut, and it says *no run on* rather than *no such branch*
-for the same reason; nor is it raised while a held run GitHub still has stands on a
-named branch. A 404 on the list is Actions switched off, and no line.
+of them, and an unnamed state WARN. For the rest — on the default branch, or on each
+branch `actions.branches` names instead of it — ten runs per surviving workflow and
+branch, sorted by run id — GitHub promises no order — from which the newest useful
+verdict (a completed failure or pass, or a run held for approval) and the newest
+in-flight run are read independently; canceled and skipped runs erase nothing, and a run
+in flight is an extra flag on the line. The line takes its workflow's name from the
+list, and the run's only where the list gives none. The check **holds** the newest
+completed run each line has read (§4.1b): an answer that goes back on it — its newest
+completed run older, or none — is checked by reading the held run by id, which a `404`
+lets go and a `200` keeps, a completed newer attempt replacing it; a throttle or an
+error keeps it for the poll, and the budget fallback below reads nothing by id.
+`actions.branches` together with `all_branches` is refused at startup. The per-workflow
+read is priced against the budget headers already in hand, a read per workflow per named
+branch; when they do not cover it, that repository degrades to the one wide page of
+`…/actions/runs` that `all_branches` always reads — asked of the one named branch where
+there is one, and otherwise taken unfiltered and cut to the named branches, which makes
+that page a cut by construction. One WARN line (`runs-window-partial`) names the
+repositories answered about only partly: those whose wide page was a cut of the
+repository's runs, and those whose workflow list was longer than one page. A second
+(`branches-unmatched`) names the repositories where no watched workflow ran on any named
+branch, with each one's default branch; it is raised only from an exact read, because a
+degraded page cannot tell an unmatched branch from its own cut, and it says *no run on*
+rather than *no such branch* for the same reason; nor is it raised while a held run
+GitHub still has stands on a named branch. A 404 on the list is Actions switched off,
+and no line.
+
+**The aspect is a tree** (ADR-0016 §17–§22). Beneath the aspect's node is a node for
+each repository with a line, named by the repository's name: it grades nothing of its
+own unless the repository could not be read, and then its read line stands on it,
+`<id>-workflows-unreadable` or `<id>-runs-unreadable`. Beneath that is a node for each
+workflow with a line, named by `_workflow_file` — the last segment of the workflow's
+`path`, `ci.yml`, or `dependabot-updates` for Dependabot's
+`dynamic/dependabot/dependabot-updates`, or the workflow's id where GitHub sent no path
+— and titled by its name. Its line stands on it, a passing idle workflow's too, and a
+disabled workflow's in every mode. With two named branches or more, or `all_branches`, a
+node for each branch beneath the workflow's holds the line instead, named by
+`_branch_node` — the branch as the line's subject spells it, each `/` written `:` — and
+titled by the branch where the two differ. The coverage line, `runs-window-partial` and
+`branches-unmatched` stand on the aspect's node. The aspect's node says its repositories
+are complete; a repository's node says its workflows are where its answer was whole — no
+read line, and not short; a workflow's node says its branches are where it has none to
+have — in a mode without a level, and while it is disabled — and otherwise where its
+repository's answer was whole. Every node beneath the aspect says that a run names it
+(`dynamic=True`, little-sister ADR-0118).
 
 **`sbom_check`** (ADR-0008). `repository(owner:, name:) { dependencyGraphManifests(first:
 10) { totalCount nodes { filename parseable exceedsMaxSize } } }`, aliased `r0`, one
@@ -263,16 +287,31 @@ repository a query. A `200` is read per alias: `totalCount` of zero is
 `no dependency graph (0 manifests)` and ERROR; manifests none of which are parseable are
 ERROR with the cause on the line; more than ten is a graph. Its `errors` are read as the
 faults are: `NOT_FOUND` is a repository gone since discovery, a line that grades
-nothing; `FORBIDDEN` or `INSUFFICIENT_SCOPES` is a permission answer, WARN; any other
-type is *could not read* with the type on the line; errors with no `data` at all are
-*could not ask* for every repository the query carried. A switched-off graph answers
-zero, and is red.
+nothing; `FORBIDDEN` or `INSUFFICIENT_SCOPES` is a permission answer, WARN; an error
+with the message `timedout` and no type is GitHub's own time limit reaching that
+repository's part of the query, *could not ask*; any other type is *could not read* with
+the type on the line; errors with no `data` at all are *could not ask* for every
+repository the query carried. A switched-off graph answers zero, and is red.
+
+A repository the time limit cut is **asked once more** when the roster is through, in
+the roster's order. A second asking is one request, `graphql(once=True)` — not retried,
+and no wait taken for a throttle — and it is made only while the run has more than one
+`request_timeout` left; one that GitHub answers with a throttle is the last of the pass.
+What the second asking says is the repository's reading (ADR-0008 §8). And a
+repository that ends the pass as *could not ask* — cut again, a 5xx, a throttle, errors
+with no `data` — is graded on **its last answer** (§4.1c) while that is younger than
+`sbom_check.max_answer_age`, an hour by default: its reading is the held graph with the
+time GitHub answered as the record's `at`, its line is the line that graph has — the
+same slug and code — ending `— as of <time>`, written by the library in the configured
+zone and format, and it counts as read, so it is on no *could not ask* line, in no
+coverage line and not in the node's count (§3.4). The readings stand in the roster's
+order, whichever asking each came from.
 
 ### 3.6 The keys nobody may rename
 
 A deployment's configuration and its maintenance pins are written against names this
-package publishes, so every one of these is a breaking change to move, whatever the
-code says (ADR-0003 §7, ADR-0004 §1):
+package publishes, so every one of these is a breaking change to move, whatever the code
+says (ADR-0016 §7 and §8):
 
 - the two `type:` names;
 - the eight aspect names, which are node-path segments;
@@ -285,6 +324,10 @@ code says (ADR-0003 §7, ADR-0004 §1):
   — `<id>-unreadable` for a repository that could not be read (`actions` keeps its two
   reads apart, `<id>-workflows-unreadable` and `<id>-runs-unreadable`), and the two
   aspect-level lines, `read` and `runs-window-partial`;
+- the names of the nodes beneath `actions` — a repository's name, a workflow's file, and
+  a branch as its line's subject spells it with each `/` written `:` — which are
+  node-path segments, and so what a pin and a `nodes.yaml` entry beneath the aspect are
+  held against (ADR-0016 §17–§19);
 - the resource names on the `github-rate-limit` node, GitHub's own (`core`, `graphql`);
 - **the field names in a line's record** (§3.7) — every line one reading became
   carries one — nothing in the code reads them, and that is exactly why they are here:
@@ -294,10 +337,11 @@ code says (ADR-0003 §7, ADR-0004 §1):
   budget's (§4.2) — which are what a series is keyed by: changing one starts every
   history it names again (ADR-0013, ADR-0014).
 
-A retired key is **refused at load**, naming its replacement, never migrated or
-ignored: `org:` (now `owner:`), `code_scanning_alerts:` (now two blocks — ADR-0006 §4),
-a `subnodes:` entry naming a retired aspect, and the `{org}` token in display text (now
-`{owner}`).
+A retired key is **refused at load**, naming its replacement or saying why there is
+none, never migrated or ignored: `org:` (now `owner:`), `code_scanning_alerts:` (now two
+blocks — ADR-0006 §4), a `subnodes:` entry naming a retired aspect, the `{org}` token in
+display text (now `{owner}`), and `actions.show_healthy`, to either value — every
+workflow's line is written now (ADR-0016 §21).
 
 ### 3.7 What a line carries beside its sentence
 
@@ -319,8 +363,10 @@ A finding names no subject (ADR-0014 §2), so its line's is empty, and its recor
 a pull request's `number`, `title`, `user` and `url`; a Dependabot alert's `number`,
 `severity`, `summary` and `url`; a code-scanning alert's `number`, `severity`, `detail`
 and `url`; a secret-scanning alert's `number`, `secret`, `created.at` and `url`; an
-issue's `number` and `title`; a dependency graph's `total` and its first ten
-`manifests`, each a `filename`, `parseable` and `exceeds_max_size`. *Scanning not
+issue's `number` and `title`; a dependency graph's `total`, its first ten
+`manifests`, each a `filename`, `parseable` and `exceeds_max_size`, and `at`, the
+record's own time — `null` on the run that read the graph, and when GitHub answered
+with it where the graph stands for a run GitHub did not answer (§4.1c). *Scanning not
 enabled* and *issues are disabled* carry the repository alone; a note carries the
 read's `fault`, `error` and `part`, or, for a repository gone, GitHub's `message`.
 
@@ -335,20 +381,32 @@ about the estate and not about one object; a view that groups by repository grou
 `repository_id`.
 
 The record of a run line is its `aspect` and `kind`, the repository and its id, the
-workflow — its name as the workflow list gives it — and its id, the branch, the verdict, and a block per run — the newest useful
-**completed** one and the **running** one where there is one — each with GitHub's `id`
-for the run and which `attempt` of it the block shows, the run number, the URL, GitHub's
-`status` and `conclusion`, and its times. `conclusion` is GitHub's word and is what a
-grading map reads; `verdict` is this check's word for the line and is what a template
-substitutes; neither stands in for the other. A block's times are `started`, GitHub's
-`run_started_at`, and `updated.at`, GitHub's `updated_at` — when anything about the
-run last changed, nested under `at` rather than claimed as `ended`, since a workflow
-run has no completion time (ADR-0012 decision 3). A time GitHub did not
-send, or sent as something that is not an instant, is `null`, never `""` — the library
-refuses a timed name whose value is not a time, and the whole result with it. A
-disabled workflow's line carries its `aspect` and `kind`, the repository and its id,
-the workflow and its id, its URL, GitHub's `state`, and `updated.at` — the workflow's
-`updated_at`, typed as a run block's is.
+workflow — its name as the workflow list gives it — and its id, its `file`, which names
+its node (ADR-0016 §18), the branch, the verdict, and a block per run — the newest
+useful **completed** one and the **running** one where there is one — each with GitHub's
+`id` for the run and which `attempt` of it the block shows, the run number, the URL,
+GitHub's `status` and `conclusion`, its times, and `duration_s`. `conclusion` is
+GitHub's word and is what a grading map reads; `verdict` is this check's word for the
+line and is what a template substitutes; neither stands in for the other. A block's
+times are `started`, GitHub's `run_started_at`, and `updated.at`, GitHub's `updated_at`
+— when anything about the run last changed, nested under `at` rather than claimed as
+`ended`, since a workflow run has no completion time (ADR-0012 decision 3). The record's
+own time, its top-level `at`, is the `started` of the block its identity names (below):
+its series places the record there, and its node draws the run there; where GitHub sent
+no start it is `null`, and the record stands where it was first seen (ADR-0012 §3).
+`duration_s` is how long the run took, in whole seconds from `started` to `updated.at`,
+once GitHub's `status` is `completed` — of a finished run the last change is taken for
+its end in this one number — and `null` while it is not, where either time is missing,
+and where the second lies before the first (ADR-0012 §3). The type declares it as the
+measure `completed.duration_s`, in `s` and labeled *Duration*, so a workflow's node
+draws each run as a stem to it; a deployment's `measures: {completed.duration_s: null}`
+takes it away. A time GitHub did not send, or sent as something that is not an instant,
+is `null`, never `""` — the library refuses a timed name whose value is not a time, and
+the whole result with it. A disabled workflow's line carries its `aspect` and `kind`,
+the repository and its id, the workflow and its id, its `file`, its URL, GitHub's
+`state`, `updated.at` — the workflow's `updated_at`, typed as a run block's is — and the
+same instant as its own `at`, so its series places it where the workflow last changed,
+its switch-off as a rule (ADR-0013 §5).
 
 A run line's reading also names the **event** it is of, its identity: `<id>/<attempt>`
 of the completed block — the run the verdict is of — or, where nothing on the branch has
@@ -474,6 +532,27 @@ report says them after the cache's line: `held runs: 12 kept; this run's answers
 contradicted them 3 time(s), 1 let go`. The guard does not price the reads by id:
 bounded by the lines held, and a repeat is a `304`.
 
+### 4.1c The last answers
+
+`sbom_check` holds, for every repository it asks, the last dependency graph GitHub
+answered with and when — keyed by the repository's id, on the **check**, beside the
+cache and the run hold and for their reasons (ADR-0008 §7). It keeps what a
+reading keeps of a graph, the count and the manifests read, and the time of the answer
+to the second. A graph that arrives is the repository's last answer at once, on the
+first asking or the second, whatever becomes of the pass; an answer that is not a graph
+— `NOT_FOUND` or a refusal on the repository's alias, a `401` or an unthrottled `403`
+for the query itself — lets the held one go; an answer the check cannot read, and no
+answer, leave it. A repository that ends a pass as *could not ask* stands on its last
+answer while that is younger than `sbom_check.max_answer_age`, counted on the wall clock
+from the answer's own time, which standing does not move; an answer that old is
+forgotten where it is met, and a pass that finished forgets every repository it did not
+ask — gone from the scope, or under `sbom_check.ignore`. It is **empty at every start**:
+the first run after one has no last answer, and a repository GitHub does not answer for
+on it is *could not ask*. Only the measuring half reads it, and what stands reaches the
+grading as a reading with a time in it (§3.5, §3.7). Neither the estate reading nor the
+report counts it; the log does (§5). The guard does not price the second asking: one
+more query for each repository cut.
+
 ### 4.2 The `github-rate-limit` node
 
 One node per token, one coded entry per watched resource — `core` and `graphql` unless
@@ -529,7 +608,9 @@ otherwise. A clock time in a line is a budget window's end, beside the minutes i
 left: the time of day in the configured timezone, written by the library
 (`little_sister.spans.local_time`), so on a machine in any zone it reads on the clock
 little-sister stamps the line in. A window's end no time can be written for has the
-minutes alone (ADR-0007 §5). A run of the `github` check reads top to bottom as:
+minutes alone (ADR-0007 §5). The one other time in a line is when GitHub last answered
+for a repository, which the library writes whole, in the configured zone and format. A
+run of the `github` check reads top to bottom as:
 
 - `run starting — timeout 60s, request timeout 15s, max pause 30s, 8 aspect(s)`: the
   budgets in force, two of them derived;
@@ -560,6 +641,15 @@ minutes alone (ADR-0007 §5). A run of the `github` check reads top to bottom as
   says whether GitHub or the cache gave it, and the end says what the read by id found
   — `replaced: a newer attempt, …`, `let go: GitHub no longer has the run`, `held: not
   asked, the budget fallback`, `held: not answered, …`;
+- `sbom_check: GitHub's time limit cut 2 repositories — 2 asked once more, 1 answered,
+  0 left unasked`, one per pass that met a cut: how often the second asking brought an
+  answer is this line's two middle numbers, summed over a day, and *left unasked* is
+  what the run's time or a throttle kept from being asked again;
+- `sbom_check: GitHub did not answer for 3 repositories — 2 on the last answer
+  (platform-a since 2026-10-10 11:45:00, platform-b since 2026-10-10 11:38:02), 1 with
+  none`, one per pass GitHub did not answer everything on, after the second asking:
+  who stands on what it last said and since when, and how many had nothing to stand on
+  and are *could not ask* (§4.1c);
 - `paused 61s before retrying (GitHub asked; 38s of the run left)` at `WARNING`, or `(our
   backoff after a failure GitHub did not explain; …)`;
 - `run cut short after …` at `WARNING`, with which aspect the budget died in, how long
@@ -587,6 +677,16 @@ nothing until it disagrees with the body beside it.
 - **The ledger forgets at a restart**: the first run prices its reads by the endpoint,
   the node's line is the endpoint's until the first `github` run refills the memory, and
   the *before this process first read this window* clause waits for the first rollover.
+- **So do the last answers**: on the first run after a start a repository GitHub does
+  not answer for has nothing to stand on, is *could not ask*, and turns `sbom_check`
+  amber for that run (§4.1c).
+- **While answers stand, GitHub's silence is quiet.** A repository `sbom_check` grades on
+  its last answer is in no count, so a stretch GitHub does not answer that aspect for
+  shows only as *as of* on the lines there are, and in the log — for at most
+  `sbom_check.max_answer_age` (§4.1c).
+- **That key's default is an hour at any cadence.** It does not grow with `frequency`,
+  so a check that runs hourly or slower has no answer young enough to stand on until
+  its config says more (§4.1c).
 - **A GitHub App's installation token is not a fit**: it expires after an hour, and
   little-sister resolves a credential once, at startup.
 - **A dribbling server** is bounded by the chunked body read against `timeout:`, and by

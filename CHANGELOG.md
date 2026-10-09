@@ -11,6 +11,169 @@ the code says so.
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-10-10
+
+**`actions` is a tree now, and every line of it moves: a pin on an `actions` line has to
+be set again.** Each repository with a workflow that has run on a watched branch is a
+node beneath `actions`, named by the repository's name, and each such workflow is a node
+beneath it, named by its file — `ci.yml`, or `dependabot-updates` for Dependabot's — and
+titled by its name. The workflow's line stands on that node, and the node draws the
+workflow's runs. Where `actions.branches` names two branches or more, or with
+`actions.all_branches`, each branch is a node beneath its workflow's, with every `/` in
+its name written `:` — `release/1.2` is the node `release:1.2`. A line keeps its slug,
+but its path is new, so a pin held on it stops matching and is set again; nothing is
+carried over, and a `nodes.yaml` entry for a path beneath `actions` is written against
+the new paths. **`actions.show_healthy` is retired** and refused at load: every
+workflow's line is written, a passing idle one's too. Remove the key. And at
+little-sister's default `record_limit` every start now says that this type's declared
+record is close to the limit; `record_limit: 2560` quiets it (see *Changed*).
+
+**`sbom_check` no longer turns amber each time GitHub times out on a repository.** A
+repository GitHub does not answer for on a run keeps its last answer for up to an hour:
+the line it had, with the same code, ending *as of* the time GitHub last answered for
+it. A repository GitHub's own time limit cut is asked once more before the aspect ends.
+The aspect still turns amber where there is no such answer to keep: on the first run
+after a start, since what is remembered is the process's, and for a repository GitHub
+has not answered for in an hour. There is one new key, `sbom_check.max_answer_age`,
+default `1h`, and nothing to configure to get any of this on a check that runs more
+often than hourly. The hour does not grow with `frequency`, so a check that runs hourly
+or slower keeps no answer until it writes the key, longer than its `frequency`. Nothing
+in `sbom_check` you configure or pin moves, and the library this release needs is still
+little-sister 0.3.19.
+
+### Removed
+
+- **`actions.show_healthy`.** Every workflow that has run on a watched branch is a node
+  with its line on it, a passing idle workflow's too — the line is what makes the node
+  stand for the workflow and draw its runs — and so is a disabled workflow's `OK` line,
+  `disabled_fork`'s by default. A configuration that still sets the key, to either
+  value, is refused at load, saying why. What a viewer sees of the quiet nodes is the
+  dashboard's *hide ok* and its chips
+  ([ADR-0016](docs/adr/0016-an-aspect-asks-the-whole-scope-a-finding-grades-and-a-workflow-is-a-node.md)
+  §21).
+- **The two records the tree and the grading were first written in.** What still stands
+  of them is
+  [ADR-0016](docs/adr/0016-an-aspect-asks-the-whole-scope-a-finding-grades-and-a-workflow-is-a-node.md)
+  §1–§16, beside the decisions that give `actions` its nodes; a link to either finds
+  nothing now.
+
+### Added
+
+- **A node for each repository and each workflow beneath `actions`**, and for each
+  branch beneath a workflow where several are configured
+  ([ADR-0016](docs/adr/0016-an-aspect-asks-the-whole-scope-a-finding-grades-and-a-workflow-is-a-node.md)
+  §17–§19). A repository's node grades nothing of its own unless the repository could
+  not be read, and then its read line — `<id>-workflows-unreadable` or
+  `<id>-runs-unreadable`, under the slug it had — stands on it. The lines about many
+  repositories — `read`, `runs-window-partial`, `branches-unmatched` — stay on the
+  aspect's node. A disabled workflow's line stands on the workflow's own node, which
+  stands for the workflow while it is off. A repository archived or out of scope, one
+  whose Actions were switched off, a workflow deleted or ignored, leaves its node with
+  the run that no longer names it; a repository GitHub did not answer for keeps its
+  workflows' nodes as they were. Every node beneath `actions` says that a run names it,
+  so a repository or a workflow called like one of the aspects is not shown under that
+  aspect's label.
+- **A workflow's node draws how long each run took.** Each run block of an `actions`
+  record gains `duration_s`: the whole seconds from GitHub's `run_started_at` to its
+  `updated_at` once the run has completed, and `null` while it has not. The type
+  declares `completed.duration_s` as a measure in `s`, labeled *Duration*, so each run
+  is a stem to it; `measures: {completed.duration_s: null}` in the check's YAML takes it
+  away, and the runs are ticks
+  ([ADR-0012](docs/adr/0012-the-actions-line-carries-what-it-read.md) §3).
+- **The record of every `actions` line carries the workflow's `file`**, which names its
+  node, **and its own time, `at`**, which places it in its series: a run line's is the
+  start of the run it names, so the node draws each run where it began and not where the
+  check first read it, and a disabled line's is when GitHub last changed the workflow,
+  its switch-off as a rule. Where GitHub sent no such time, `at` is `null` and the
+  record stands where the check first read it
+  ([ADR-0012](docs/adr/0012-the-actions-line-carries-what-it-read.md) §3,
+  [ADR-0013](docs/adr/0013-the-object-of-an-actions-line-is-the-workflow-on-its-branch.md)
+  §5).
+- **A repository GitHub does not answer for keeps its last answer.** `sbom_check`
+  remembers, for each repository it asks, the last dependency graph GitHub answered
+  with and when. On a run GitHub does not answer for a repository — its own time limit
+  on that repository's query, a 5xx, a rate limit — the repository is graded on that
+  answer while it is younger than **`sbom_check.max_answer_age`**, a new key of the
+  aspect's block, a positive duration, **`1h` by default**. It keeps the line it had,
+  on the same slug, so a pin holds, and with the same code; the line ends *as of* the
+  time GitHub last answered, in the configured timezone and format —
+  `platform-api: no dependency graph (0 manifests) — as of 2026-10-10 11:45:00`. *As
+  of* means the run did not read the repository, and what the line says was true then.
+  Such a repository counts as read: it has no *could not ask GitHub* line, and it is
+  neither in the aspect's `GitHub did not answer for …` line nor in the count on the
+  check's own node. So a repository without a dependency graph stays red through the
+  runs GitHub does not answer for it, where it used to lose its line, and one with a
+  graph stays silent. An hour after GitHub last answered — however often the answer
+  stood in between — the repository is *could not ask* again, as before. An answer
+  that is not a graph, a refusal or *not found*, ends the hold; one the check cannot
+  read does not. The last answers are the process's memory: **the first run after a
+  start has none**, and a repository GitHub does not answer for on that run is *could
+  not ask*. While answers stand, GitHub not answering this aspect shows on the node
+  only as *as of* on the lines there are — a repository with a graph has none — and
+  in the log; the key bounds how long that can be. Keep it longer than the check's
+  `frequency`: by the next run an answer is about that old, and where none is young
+  enough the aspect reads as it did before this release
+  ([ADR-0008](docs/adr/0008-the-dependency-graph-is-asked-not-exported.md), decision
+  7).
+- **A dependency graph's record carries its own time, `at`**: `null` on the run that
+  read the graph, and the time GitHub answered — in UTC, to the second — on a graph that
+  stands for a run GitHub did not answer. A graph that stands on its last answer weighs
+  1635 bytes at its heaviest, where a graph weighed 1605; the heaviest record the type
+  declares is an `actions` run's now (see *Changed*)
+  ([ADR-0014](docs/adr/0014-a-run-is-its-readings-and-the-estate-is-its-object.md)).
+- **A repository GitHub's time limit cut is asked once more**, when every repository
+  has been asked. A second asking is one request — not retried, and no wait taken for
+  it — and is made only while the run has more than one `request_timeout` left; one
+  that GitHub answers with a rate limit is the last of the run. What the second asking
+  says is the repository's reading for the run, and one cut again is graded on its
+  last answer, as above. The second askings spend the run's time, a `request_timeout`
+  each at most, and a query each of the `graphql` budget, which the guard does not
+  price
+  ([ADR-0008](docs/adr/0008-the-dependency-graph-is-asked-not-exported.md), decision
+  8).
+- **Two `INFO` lines in the log, each with a fixed phrase to count by.** A pass that
+  met a cut writes `sbom_check: GitHub's time limit cut 2 repositories — 2 asked once
+  more, 1 answered, 0 left unasked`, and a pass GitHub did not answer everything on
+  writes `sbom_check: GitHub did not answer for 3 repositories — 2 on the last answer
+  (platform-a since 2026-10-10 11:45:00, platform-b since 2026-10-10 11:38:02), 1 with
+  none`. The first says how often the second asking earns its request.
+
+### Changed
+
+- **The heaviest record a `github` check declares is an `actions` run's, 1773 bytes**,
+  where it was a dependency graph's 1605: the workflow's file, the run's start as the
+  record's own time and how long the run took add to a run's record, as a graph's own
+  time adds to a graph's (see *Added*). At little-sister's default `record_limit` of
+  2048 that is past the 80 % at which every start says that a declared record is close
+  to the limit — a warning in the log and a fact on the engine's report, never a coded
+  line. `record_limit: 2560` in `settings.yaml` quiets it, as anything from 2217 does; a
+  deployment whose `record_limit` is below 1773 is refused at startup, naming the check
+  ([ADR-0014](docs/adr/0014-a-run-is-its-readings-and-the-estate-is-its-object.md) §4).
+- **The text shipped for `sbom_check` says what *as of* means** on a line, and names
+  the key. A deployment whose `subnodes:` block extends that text with `{default}` gets
+  the sentence; one that replaces the `about` keeps its own.
+
+### Fixed
+
+- **GitHub's own time limit on one repository is *could not ask*, not an answer that
+  cannot be read.** Where GitHub does not answer in time for one repository's part of a
+  query, its answer is a `200` that carries, for that repository, an error whose message
+  is `timedout` and which has no type. `sbom_check` read that as *could not read* — an
+  amber line naming the repository — and changed its status on such lines 80 times in a
+  day and a half on one deployment of twenty repositories. It is now `could not ask
+  GitHub (error: timedout)`, a line that grades nothing, counted like any other question
+  GitHub did not answer — in the aspect's `GitHub did not answer for …` line and on the
+  check's own node — and with the first entry above, a repository GitHub answered for
+  within the hour does not show it at all. An error GitHub attaches to one repository
+  without a type, with any other message, still reads as *could not read*.
+- **The coverage line counts a repository that is gone once.** `sbom_check` could write
+  `GitHub did not answer for 1 of 4 repositories` about a scope of three. A repository
+  GitHub answers *not found* about between discovery and the query was counted among
+  the repositories read and again for its own line. The number of repositories GitHub
+  did not answer for was right; the total was one too many for each repository gone,
+  and it is now every repository the aspect tried, each once
+  ([ADR-0002](docs/adr/0002-a-read-failure-is-not-a-finding.md) §5).
+
 ## [0.1.10] - 2026-10-04
 
 **Upgrade the library first:** this release needs little-sister 0.3.19 (see
@@ -430,11 +593,12 @@ moves — no `type:` name, no other slug, no configuration key. See *Changed*.
   aspect a run resumes at. [ADR-0002](docs/adr/0002-a-read-failure-is-not-a-finding.md)
   carries it.
 
-- **The records say what changed under them.** ADR-0002, ADR-0003 and ADR-0004 were
-  written for seven aspects and the old `actions` read; each now says at its head
-  that there are eight aspects since 0.1.1 and that `actions` asks per workflow since
-  0.1.6, so a reader arriving from a code comment is not sent to a count that stopped
-  being true. `examples/github.yaml` prices a run the way 0.1.6 spends it.
+- **The records say what changed under them.** ADR-0002 and the records of the tree
+  and of the grading were written for seven aspects and the old `actions` read; each
+  now says at its head that there are eight aspects since 0.1.1 and that `actions`
+  asks per workflow since 0.1.6, so a reader arriving from a code comment is not sent
+  to a count that stopped being true. `examples/github.yaml` prices a run the way
+  0.1.6 spends it.
 
 ## [0.1.6] - 2026-08-30
 
@@ -648,9 +812,9 @@ unmatched pin is **suspended, not deleted**, and a pin with no expiry is never
 reaped while its node still exists — so it sits in the deployment's maintenance
 file doing nothing, invisibly. **Re-pin what you still want silenced, and clear the
 rest.** The reason for the break is in
-[ADR-0004](docs/adr/0004-a-finding-grades-the-repository-does-not.md) decision 1: a
-repository *name* is not something GitHub minted, so a rename used to orphan those
-same pins with no upgrade and no warning at all.
+[ADR-0016](docs/adr/0016-an-aspect-asks-the-whole-scope-a-finding-grades-and-a-workflow-is-a-node.md)
+§8: a repository *name* is not something GitHub minted, so a rename used to orphan
+those same pins with no upgrade and no warning at all.
 
 ### Added
 
@@ -830,16 +994,15 @@ same pins with no upgrade and no warning at all.
   sentences. It grades nothing on its own: waiting when a service asks is correct
   behavior. What it stops is a paused run being indistinguishable from a slow one.
 
-- **The reasoning behind the `github` type now ships, as two records.**
-  [ADR-0003](docs/adr/0003-an-aspect-is-one-question-asked-of-the-whole-scope.md)
-  is why the tree has seven children named after aspects rather than after your
-  repositories, what one aspect is, and what the check's own node claims.
-  [ADR-0004](docs/adr/0004-a-finding-grades-the-repository-does-not.md) is what a
-  finding asserts and why each grading is the code it is — why a leaked secret and
-  a missing dependency graph are both red, what a severity band means while it is
+- **The reasoning behind the `github` type now ships, as two records**, which are
+  [ADR-0016](docs/adr/0016-an-aspect-asks-the-whole-scope-a-finding-grades-and-a-workflow-is-a-node.md)
+  §1–§16 today: why the tree has seven children named after aspects rather than after
+  your repositories, what one aspect is, and what the check's own node claims; and
+  what a finding asserts and why each grading is the code it is — why a leaked secret
+  and a missing dependency graph are both red, what a severity band means while it is
   empty, and the difference between `severities` (what is looked at) and
   `severity_map` (what it means). No behavior changes. If you have ever wanted to
-  overrule one of these defaults, these are the records to overrule.
+  overrule one of these defaults, that is the record to overrule.
 
 ### Changed
 
